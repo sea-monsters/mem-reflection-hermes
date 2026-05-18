@@ -1,0 +1,14 @@
+{
+  "name": "mem-reflection-hermes",
+  "label": "Memory Graph",
+  "description": "Visualize memory network, skills, and reflection history",
+  "icon": "Database",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/memory-graph",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
