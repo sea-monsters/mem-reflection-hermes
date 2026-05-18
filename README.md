@@ -75,7 +75,7 @@ cat >> ~/.hermes/config.yaml << 'EOF'
 plugins:
   enabled:
     - mem-reflection-hermes
-  small_rust_hermes:
+  mem_reflection_hermes:
     embeddings: true          # Enable semantic search
     micro_reflection: true    # Auto-reflect per turn
     reflection_mode: embedding # Use local embeddings (not LLM)
@@ -127,14 +127,14 @@ pip install sentence-transformers
 
 ## Configuration
 
-All configuration lives in `~/.hermes/config.yaml` under the `plugins.small_rust_hermes` section:
+All configuration lives in `~/.hermes/config.yaml` under the `plugins.mem_reflection_hermes` section:
 
 ```yaml
 plugins:
   enabled:
     - mem-reflection-hermes
   
-  small_rust_hermes:
+  mem_reflection_hermes:
     # Embedding engine
     embeddings: true              # Enable semantic search (default: true)
     
