@@ -44,7 +44,7 @@ _cached_config: Optional[Dict[str, Any]] = None
 _cached_config_mtime: float = 0.0
 
 # Configuration keys (centralized for easy customization)
-_CONFIG_SECTION = "small_rust_hermes"
+_CONFIG_SECTION = "mem_reflection_hermes"
 _CONFIG_KEY_EMBEDDINGS = "embeddings"
 _CONFIG_KEY_MICRO_REFLECTION = "micro_reflection"
 _CONFIG_KEY_REFLECTION_MODE = "reflection_mode"
@@ -1174,7 +1174,7 @@ def register(ctx) -> None:
     # Register tools
     ctx.register_tool(
         name="srh_memory_search",
-        toolset="small_rust_hermes",
+        toolset="mem_reflection_hermes",
         schema={
             "name": "srh_memory_search",
             "description": "Search active memories by TF-IDF relevance (or embedding if available).",
@@ -1193,7 +1193,7 @@ def register(ctx) -> None:
     )
     ctx.register_tool(
         name="srh_memory_write",
-        toolset="small_rust_hermes",
+        toolset="mem_reflection_hermes",
         schema={
             "name": "srh_memory_write",
             "description": "Write a new structured memory with YAML frontmatter. Checks for conflicts.",
@@ -1216,7 +1216,7 @@ def register(ctx) -> None:
     )
     ctx.register_tool(
         name="srh_memory_delete",
-        toolset="small_rust_hermes",
+        toolset="mem_reflection_hermes",
         schema={
             "name": "srh_memory_delete",
             "description": "Delete a memory by id from a scope.",
@@ -1235,7 +1235,7 @@ def register(ctx) -> None:
     )
     ctx.register_tool(
         name="srh_skill_search",
-        toolset="small_rust_hermes",
+        toolset="mem_reflection_hermes",
         schema={
             "name": "srh_skill_search",
             "description": "Search skills by token overlap relevance.",
@@ -1254,7 +1254,7 @@ def register(ctx) -> None:
     )
     ctx.register_tool(
         name="srh_reflect_now",
-        toolset="small_rust_hermes",
+        toolset="mem_reflection_hermes",
         schema={
             "name": "srh_reflect_now",
             "description": "Trigger or check status of reflection pipeline.",
