@@ -1,0 +1,15 @@
+name: mem-reflection-hermes
+version: 0.1.0
+description: "Self-evolving memory & reflection system ported from small-rust-hermes. Structured Markdown+YAML frontmatter memories, TF-IDF search, supersedes chains, micro/full reflection pipelines, skill auto-matching."
+author: "ported from coder-brzhang/small-rust-hermes"
+provides_tools:
+  - srh_memory_search
+  - srh_memory_write
+  - srh_memory_delete
+  - srh_skill_search
+  - srh_reflect_now
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - pre_llm_call
+kind: standalone
