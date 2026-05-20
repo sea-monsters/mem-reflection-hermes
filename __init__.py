@@ -952,9 +952,11 @@ class MemoryStore:
                 rank=new_rank,
             )
 
-            # Write new file FIRST, then delete old only if path changed
+            # Atomic write via temp file to avoid in-place overwrite corruption
             new_path = self._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
-            _write_memory(new_path, fm, mem.body)
+            tmp_path = new_path.with_suffix(new_path.suffix + ".tmp")
+            _write_memory(tmp_path, fm, mem.body)
+            os.replace(tmp_path, new_path)  # atomic on POSIX
             if new_path != mem.source_path:
                 self.delete(mem.scope, mem_id)
 

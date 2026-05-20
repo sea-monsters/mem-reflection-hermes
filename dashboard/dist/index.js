@@ -539,12 +539,6 @@
   // Plugin registration
   // ---------------------------------------------------------------------------
 
-  SDK.registerPlugin({
-    id: "mem-reflection-hermes",
-    name: "Memory & Reflection",
-    version: "0.6.1",
-    description: "Self-evolving memory system with structured reflection",
-    page: MemoryGraphPage,
-  });
+  window.__HERMES_PLUGINS__.register("mem-reflection-hermes", MemoryGraphPage);
 
 })();
