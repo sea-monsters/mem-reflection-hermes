@@ -123,9 +123,13 @@
     };
 
     const moveItem = (index, direction) => {
-      // Reorder must operate on the full canonical list, not filtered subset
+      // Reorder must operate on the full canonical list in created-date mode
       if (searchQuery || zoneFilter !== "all") {
         alert("Please clear search and zone filters before reordering.");
+        return;
+      }
+      if (sortBy !== "created") {
+        alert("Please switch to 'Sort by Date' mode before reordering.");
         return;
       }
       const newList = [...filtered];

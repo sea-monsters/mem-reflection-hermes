@@ -45,7 +45,8 @@ if __name__ != "__main__" and __name__ not in sys.modules:
     mod_name = getattr(__spec__, "name", None) if "__spec__" in globals() else None
     if mod_name is None:
         mod_name = __name__
-    sys.modules[mod_name] = sys.modules.get(mod_name) or types.ModuleType(mod_name)
+    # Register the current executing module object, not a placeholder
+    sys.modules[mod_name] = sys.modules.get(mod_name) or sys.modules.get(__name__) or types.ModuleType(mod_name)
 
 # ---------------------------------------------------------------------------
 # Config & paths (with caching)

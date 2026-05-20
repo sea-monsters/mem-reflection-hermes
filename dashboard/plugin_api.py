@@ -286,6 +286,9 @@ async def update_memory(memory_id: str, payload: MemoryUpdate):
     store._invalidate_cache()
     store._id_to_path[fm.id] = new_path
     store._update_cache_for_put(mem.scope, fm, body, new_path)
+    # Force palace index dirty even for same-path updates (cache was invalidated)
+    store._index_dirty = True
+    store._cached_index = ""
     store._try_index(fm.id, body)
 
     return {
