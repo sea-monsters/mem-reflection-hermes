@@ -28,12 +28,13 @@
 
   function useZones() {
     const [zones, setZones] = React.useState([]);
-    React.useEffect(() => {
+    const fetchZones = React.useCallback(() => {
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/zones")
         .then(data => setZones(data.zones || []))
         .catch(console.error);
     }, []);
-    return zones;
+    React.useEffect(() => { fetchZones(); }, [fetchZones]);
+    return [zones, fetchZones];
   }
 
   // ---------------------------------------------------------------------------
@@ -438,9 +439,9 @@
     const [reflections, setReflections] = React.useState([]);
     const [activeTab, setActiveTab] = React.useState("manager");
     const { memories, refresh } = useMemories();
-    const zones = useZones();
+    const [zones, refreshZones] = useZones();
 
-    // Global refresh: re-fetches graph, stats, reflections, and memories
+    // Global refresh: re-fetches graph, stats, reflections, zones, and memories
     const refreshAll = React.useCallback(() => {
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/graph")
         .then(setGraph)
@@ -451,8 +452,9 @@
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/reflections")
         .then(r => setReflections(r.reflections || []))
         .catch(console.error);
+      refreshZones();
       refresh();
-    }, [refresh]);
+    }, [refresh, refreshZones]);
 
     React.useEffect(() => {
       refreshAll();
@@ -516,12 +518,12 @@
         // Reflections tab
         activeTab === "reflections" && React.createElement("div", { className: "mt-4 space-y-2" },
           reflections.map(r =>
-            React.createElement(Card, { key: r.id || r.at },
+            React.createElement(Card, { key: r.id || r.timestamp },
               React.createElement(CardContent, { className: "py-3" },
                 React.createElement("div", { className: "flex items-center gap-2 mb-1" },
-                  React.createElement(Badge, { variant: "outline" }, r.outcome),
+                  React.createElement(Badge, { variant: "outline" }, r.mode),
                   React.createElement("span", { className: "text-xs text-muted-foreground" },
-                    r.at ? new Date(r.at).toLocaleString() : ""
+                    r.timestamp ? new Date(r.timestamp).toLocaleString() : ""
                   )
                 ),
                 React.createElement("p", { className: "text-sm" }, r.summary || "")

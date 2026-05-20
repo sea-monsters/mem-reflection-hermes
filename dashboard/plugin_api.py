@@ -10,7 +10,7 @@ All mutation operations are delegated to MemoryStore atomic methods
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -35,7 +35,7 @@ class MemoryCreate(BaseModel):
     confidence: str = "medium"
     tags: List[str] = []
     pinned: bool = False
-    scope: str = "user"
+    scope: Literal["user", "project"] = "user"
 
 
 class MemoryUpdate(BaseModel):
