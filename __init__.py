@@ -37,6 +37,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Register module in sys.modules early to avoid dataclass resolution failure
+# when loaded via importlib.util (Python 3.11 bug workaround).
+if __name__ != "__main__" and __name__ not in sys.modules:
+    sys.modules[__name__] = sys.modules[__spec__.name] if hasattr(sys, "_getframe") and __spec__ else sys.modules.get("__main__")
+
 # ---------------------------------------------------------------------------
 # Config & paths (with caching)
 # ---------------------------------------------------------------------------
