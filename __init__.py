@@ -350,6 +350,7 @@ class MemoryFrontmatter:
     tags: List[str] = field(default_factory=list)
     supersedes: List[str] = field(default_factory=list)
     zone: str = "general"  # core | work | episode | general | project:<name>
+    rank: int = 0  # Explicit display order (higher = earlier in list). 0 = default (sorted by created desc)
 
     @staticmethod
     def new(source: str = "reflection", confidence: str = "medium", tags: Optional[List[str]] = None,
@@ -567,6 +568,7 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
             supersedes: List[str] = []
             zone: str = "general"
             always_active: bool = False
+            rank: int = 0
 
         # msgspec doesn't auto-parse datetime strings, so we pre-process
         decoded = msgspec.yaml.decode(yaml_part, type=_FrontmatterStruct)
@@ -580,6 +582,7 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
             "supersedes": decoded.supersedes,
             "zone": decoded.zone or "general",
             "always_active": decoded.always_active,
+            "rank": decoded.rank,
         }
         return data, body_part
     except Exception:
@@ -618,6 +621,7 @@ def _read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
             tags=data.get("tags", []),
             supersedes=data.get("supersedes", []),
             zone=_normalize_zone(data.get("zone", "general")),
+            rank=int(data.get("rank", 0)),
         )
         return LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
     except Exception as e:
@@ -636,6 +640,7 @@ def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
         "tags": fm.tags,
         "supersedes": fm.supersedes,
         "zone": fm.zone,
+        "rank": fm.rank,
     }
     path.write_text(_serialize_frontmatter(data, body), encoding="utf-8")
 
@@ -676,6 +681,7 @@ def _async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
         "tags": fm.tags,
         "supersedes": fm.supersedes,
         "zone": fm.zone,
+        "rank": fm.rank,
     }
     content = _serialize_frontmatter(data, body)
     _pending_writes.add(path)
@@ -863,6 +869,104 @@ class MemoryStore:
                 self._try_remove_index(mem_id)
                 return True
         return False
+
+    # -- atomic update / reorder (dashboard API) --------------------------------
+
+    def update(self, mem_id: str, body: Optional[str] = None,
+               zone: Optional[str] = None, confidence: Optional[str] = None,
+               tags: Optional[List[str]] = None, pinned: Optional[bool] = None) -> LoadedMemory:
+        """Atomically update a memory's content or metadata.
+
+        Handles file write, cache invalidation, and index updates in one
+        operation.  Preserves data on write failure (write-then-delete swap).
+        """
+        mem = self.get(mem_id)
+        if not mem:
+            raise ValueError(f"Memory not found: {mem_id}")
+
+        # Build updated frontmatter
+        fm = MemoryFrontmatter(
+            id=mem_id,
+            created=mem.frontmatter.created,
+            source=mem.frontmatter.source,
+            confidence=confidence if confidence is not None else mem.frontmatter.confidence,
+            pinned=pinned if pinned is not None else mem.frontmatter.pinned,
+            tags=tags if tags is not None else mem.frontmatter.tags,
+            supersedes=mem.frontmatter.supersedes,
+            zone=zone if zone is not None else mem.frontmatter.zone,
+            rank=mem.frontmatter.rank,
+        )
+        new_body = body if body is not None else mem.body
+
+        # Write new file FIRST (preserves data on write failure)
+        new_path = self._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+        _write_memory(new_path, fm, new_body)
+
+        # Delete old file only after successful write AND only if path changed
+        if new_path != mem.source_path:
+            self.delete(mem.scope, mem_id)
+
+        # Rebuild cache atomically: invalidate + re-add
+        self._invalidate_cache()
+        self._id_to_path[fm.id] = new_path
+        self._update_cache_for_put(mem.scope, fm, new_body, new_path)
+        # Force all derived indices dirty even for same-path updates
+        self._index_dirty = True
+        self._cached_index = ""
+        self._try_index(fm.id, new_body)
+
+        # Return updated memory
+        return LoadedMemory(frontmatter=fm, body=new_body.strip(), source_path=new_path, scope=mem.scope)
+
+    def reorder(self, memory_ids: List[str]) -> List[str]:
+        """Reorder memories by assigning explicit rank values.
+
+        The new order is determined by the provided memory_ids list.
+        Earlier items get higher rank (appear first when sorted by rank desc).
+        This avoids the timestamp-manipulation hack and is stable across
+        filtering and sorting modes.
+        """
+        updated: List[str] = []
+        for i, mem_id in enumerate(memory_ids):
+            mem = self.get(mem_id)
+            if not mem:
+                continue
+
+            # Assign rank: first item gets highest rank
+            new_rank = len(memory_ids) - i
+
+            # Only rewrite if rank actually changed
+            if mem.frontmatter.rank == new_rank:
+                updated.append(mem_id)
+                continue
+
+            fm = MemoryFrontmatter(
+                id=mem_id,
+                created=mem.frontmatter.created,
+                source=mem.frontmatter.source,
+                confidence=mem.frontmatter.confidence,
+                pinned=mem.frontmatter.pinned,
+                tags=mem.frontmatter.tags,
+                supersedes=mem.frontmatter.supersedes,
+                zone=mem.frontmatter.zone,
+                rank=new_rank,
+            )
+
+            # Write new file FIRST, then delete old only if path changed
+            new_path = self._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+            _write_memory(new_path, fm, mem.body)
+            if new_path != mem.source_path:
+                self.delete(mem.scope, mem_id)
+
+            # Update cache
+            self._id_to_path[fm.id] = new_path
+            self._update_cache_for_put(mem.scope, fm, mem.body, new_path)
+            self._try_index(fm.id, mem.body)
+            updated.append(mem_id)
+
+        # Invalidate cache to ensure fresh ordering
+        self._invalidate_cache()
+        return updated
 
     def _root_for(self, scope: str) -> Path:
         if scope == "user":
