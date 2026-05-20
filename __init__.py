@@ -37,6 +37,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Register module in sys.modules early to avoid dataclass resolution failure
+# when loaded via importlib.util (Python 3.11 bug workaround).
+if __name__ != "__main__" and __name__ not in sys.modules:
+    sys.modules[__name__] = sys.modules[__spec__.name] if hasattr(sys, "_getframe") and __spec__ else sys.modules.get("__main__")
+
 # ---------------------------------------------------------------------------
 # Config & paths (with caching)
 # ---------------------------------------------------------------------------
@@ -285,7 +290,14 @@ def _user_memories_dir() -> Path:
 def _project_memories_dir() -> Optional[Path]:
     """Project-level memories directory (only if .hermes/ exists in cwd)."""
     p = Path.cwd() / ".hermes" / "memories"
-    return p if p.exists() else None
+    if not p.exists():
+        return None
+    # Guard: if project memories dir resolves to the same path as user memories,
+    # return None to avoid duplicate scanning (happens when cwd is ~).
+    user = _user_memories_dir()
+    if p.resolve() == user.resolve():
+        return None
+    return p
 
 
 def _user_skills_dir() -> Path:

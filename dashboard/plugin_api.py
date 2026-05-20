@@ -1,7 +1,7 @@
 """Backend API for the mem-reflection-hermes dashboard plugin.
 
 Exposes endpoints for memory graph visualization, skill inventory,
-and reflection history.
+reflection history, and memory management (CRUD + reorder).
 """
 
 import json
@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 # Ensure the plugin's __init__ is importable
 plugin_dir = Path(__file__).resolve().parent.parent
@@ -20,6 +21,39 @@ import __init__ as srh
 
 router = APIRouter()
 
+
+# ---------------------------------------------------------------------------
+# Pydantic models for request validation
+# ---------------------------------------------------------------------------
+
+class MemoryCreate(BaseModel):
+    body: str
+    zone: str = "general"
+    confidence: str = "medium"
+    tags: List[str] = []
+    pinned: bool = False
+    scope: str = "user"
+
+
+class MemoryUpdate(BaseModel):
+    body: Optional[str] = None
+    zone: Optional[str] = None
+    confidence: Optional[str] = None
+    tags: Optional[List[str]] = None
+    pinned: Optional[bool] = None
+
+
+class MemoryReorder(BaseModel):
+    memory_ids: List[str]  # New ordering of memory IDs
+
+
+class MemoryDelete(BaseModel):
+    id: str
+
+
+# ---------------------------------------------------------------------------
+# Existing endpoints (graph, skills, reflections, stats)
+# ---------------------------------------------------------------------------
 
 @router.get("/memories")
 async def get_memories():
@@ -39,6 +73,7 @@ async def get_memories():
                 "supersedes": m.frontmatter.supersedes,
                 "created": m.frontmatter.created,
                 "source": m.frontmatter.source,
+                "zone": m.frontmatter.zone,
             }
             for m in memories
         ],
@@ -151,6 +186,7 @@ async def get_stats():
     mem_by_scope: Dict[str, int] = {}
     mem_by_confidence: Dict[str, int] = {}
     tag_counts: Dict[str, int] = {}
+    zone_counts: Dict[str, int] = {}
 
     for m in memories:
         mem_by_scope[m.scope] = mem_by_scope.get(m.scope, 0) + 1
@@ -158,11 +194,170 @@ async def get_stats():
         mem_by_confidence[c] = mem_by_confidence.get(c, 0) + 1
         for t in m.frontmatter.tags:
             tag_counts[t] = tag_counts.get(t, 0) + 1
+        zone_counts[m.frontmatter.zone] = zone_counts.get(m.frontmatter.zone, 0) + 1
 
     return {
         "memory_count": len(memories),
         "skill_count": len(skills),
         "memories_by_scope": mem_by_scope,
         "memories_by_confidence": mem_by_confidence,
+        "memories_by_zone": zone_counts,
         "top_tags": sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10],
     }
+
+
+# ---------------------------------------------------------------------------
+# NEW: Memory Management endpoints (CRUD + reorder)
+# ---------------------------------------------------------------------------
+
+@router.post("/memories")
+async def create_memory(payload: MemoryCreate):
+    """Create a new memory entry manually."""
+    try:
+        result = srh._tool_srh_memory_write({
+            "body": payload.body,
+            "zone": payload.zone,
+            "confidence": payload.confidence,
+            "tags": payload.tags,
+            "pinned": payload.pinned,
+            "scope": payload.scope,
+        })
+        data = json.loads(result)
+        if data.get("error"):
+            raise HTTPException(status_code=400, detail=data["error"])
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/memories/{memory_id}")
+async def get_memory(memory_id: str):
+    """Get a single memory by ID."""
+    store = srh._get_mem_store()
+    mem = store.get(memory_id)
+    if not mem:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {
+        "id": mem.id(),
+        "scope": mem.scope,
+        "body": mem.body,
+        "confidence": mem.frontmatter.confidence,
+        "pinned": mem.frontmatter.pinned,
+        "tags": mem.frontmatter.tags,
+        "supersedes": mem.frontmatter.supersedes,
+        "created": mem.frontmatter.created,
+        "source": mem.frontmatter.source,
+        "zone": mem.frontmatter.zone,
+    }
+
+
+@router.put("/memories/{memory_id}")
+async def update_memory(memory_id: str, payload: MemoryUpdate):
+    """Update an existing memory's content or metadata.
+
+    Implementation: read existing → delete old → write new (preserving id).
+    """
+    store = srh._get_mem_store()
+    mem = store.get(memory_id)
+    if not mem:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    # Build updated frontmatter
+    fm = srh.MemoryFrontmatter(
+        id=memory_id,
+        created=mem.frontmatter.created,
+        source=mem.frontmatter.source,
+        confidence=payload.confidence or mem.frontmatter.confidence,
+        pinned=payload.pinned if payload.pinned is not None else mem.frontmatter.pinned,
+        tags=payload.tags if payload.tags is not None else mem.frontmatter.tags,
+        supersedes=mem.frontmatter.supersedes,
+        zone=payload.zone or mem.frontmatter.zone,
+    )
+
+    body = payload.body if payload.body is not None else mem.body
+
+    # Delete old file
+    store.delete(mem.scope, memory_id)
+
+    # Write new file with same ID
+    path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+    srh._write_memory(path, fm, body)
+
+    # Update cache incrementally
+    store._id_to_path[fm.id] = path
+    store._update_cache_for_put(mem.scope, fm, body, path)
+
+    return {
+        "success": True,
+        "id": memory_id,
+        "message": "Memory updated",
+    }
+
+
+@router.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str):
+    """Delete a memory by ID."""
+    store = srh._get_mem_store()
+    mem = store.get(memory_id)
+    if not mem:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    success = store.delete(mem.scope, memory_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete memory")
+
+    return {"success": True, "id": memory_id}
+
+
+@router.post("/memories/reorder")
+async def reorder_memories(payload: MemoryReorder):
+    """Reorder memories by rewriting their created timestamps.
+
+    The new order is determined by the provided memory_ids list.
+    Each memory gets a new created timestamp based on its position,
+    preserving the relative ordering.
+    """
+    from datetime import datetime, timezone
+
+    store = srh._get_mem_store()
+    now = datetime.now(timezone.utc)
+
+    updated = []
+    for i, mem_id in enumerate(payload.memory_ids):
+        mem = store.get(mem_id)
+        if not mem:
+            continue
+
+        # Generate a new timestamp that preserves ordering
+        new_created = (now.replace(microsecond=i * 1000)).isoformat()
+
+        fm = srh.MemoryFrontmatter(
+            id=mem_id,
+            created=new_created,
+            source=mem.frontmatter.source,
+            confidence=mem.frontmatter.confidence,
+            pinned=mem.frontmatter.pinned,
+            tags=mem.frontmatter.tags,
+            supersedes=mem.frontmatter.supersedes,
+            zone=mem.frontmatter.zone,
+        )
+
+        # Delete old and rewrite
+        store.delete(mem.scope, mem_id)
+        path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+        srh._write_memory(path, fm, mem.body)
+        store._id_to_path[fm.id] = path
+        store._update_cache_for_put(mem.scope, fm, mem.body, path)
+        updated.append(mem_id)
+
+    # Invalidate cache to ensure fresh ordering
+    store._invalidate_cache()
+
+    return {"success": True, "updated": updated, "count": len(updated)}
+
+
+@router.get("/zones")
+async def get_zones():
+    """Return all available zones and their counts."""
+    result = json.loads(srh._tool_srh_palace_zones({}))
+    return result
