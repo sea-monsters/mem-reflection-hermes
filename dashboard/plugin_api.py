@@ -282,7 +282,8 @@ async def update_memory(memory_id: str, payload: MemoryUpdate):
     if new_path != mem.source_path:
         store.delete(mem.scope, memory_id)
 
-    # Update cache and re-index embedding
+    # Invalidate cache to remove stale entry, then re-add updated memory
+    store._invalidate_cache()
     store._id_to_path[fm.id] = new_path
     store._update_cache_for_put(mem.scope, fm, body, new_path)
     store._try_index(fm.id, body)

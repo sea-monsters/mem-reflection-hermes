@@ -123,6 +123,11 @@
     };
 
     const moveItem = (index, direction) => {
+      // Reorder must operate on the full canonical list, not filtered subset
+      if (searchQuery || zoneFilter !== "all") {
+        alert("Please clear search and zone filters before reordering.");
+        return;
+      }
       const newList = [...filtered];
       const targetIndex = index + direction;
       if (targetIndex < 0 || targetIndex >= newList.length) return;
