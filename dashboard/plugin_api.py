@@ -213,21 +213,18 @@ async def get_stats():
 @router.post("/memories")
 async def create_memory(payload: MemoryCreate):
     """Create a new memory entry manually."""
-    try:
-        result = srh._tool_srh_memory_write({
-            "body": payload.body,
-            "zone": payload.zone,
-            "confidence": payload.confidence,
-            "tags": payload.tags,
-            "pinned": payload.pinned,
-            "scope": payload.scope,
-        })
-        data = json.loads(result)
-        if data.get("error"):
-            raise HTTPException(status_code=400, detail=data["error"])
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = srh._tool_srh_memory_write({
+        "body": payload.body,
+        "zone": payload.zone,
+        "confidence": payload.confidence,
+        "tags": payload.tags,
+        "pinned": payload.pinned,
+        "scope": payload.scope,
+    })
+    data = json.loads(result)
+    if data.get("error"):
+        raise HTTPException(status_code=400, detail=data["error"])
+    return data
 
 
 @router.get("/memories/{memory_id}")
@@ -255,7 +252,8 @@ async def get_memory(memory_id: str):
 async def update_memory(memory_id: str, payload: MemoryUpdate):
     """Update an existing memory's content or metadata.
 
-    Implementation: read existing → delete old → write new (preserving id).
+    Uses write-then-delete swap to avoid data loss on write failure.
+    Re-indexes embedding after successful rewrite.
     """
     store = srh._get_mem_store()
     mem = store.get(memory_id)
@@ -276,16 +274,17 @@ async def update_memory(memory_id: str, payload: MemoryUpdate):
 
     body = payload.body if payload.body is not None else mem.body
 
-    # Delete old file
+    # Write new file FIRST (preserves data on write failure)
+    new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+    srh._write_memory(new_path, fm, body)
+
+    # Delete old file only after successful write
     store.delete(mem.scope, memory_id)
 
-    # Write new file with same ID
-    path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
-    srh._write_memory(path, fm, body)
-
-    # Update cache incrementally
-    store._id_to_path[fm.id] = path
-    store._update_cache_for_put(mem.scope, fm, body, path)
+    # Update cache and re-index embedding
+    store._id_to_path[fm.id] = new_path
+    store._update_cache_for_put(mem.scope, fm, body, new_path)
+    store._try_index(fm.id, body)
 
     return {
         "success": True,
@@ -315,9 +314,9 @@ async def reorder_memories(payload: MemoryReorder):
 
     The new order is determined by the provided memory_ids list.
     Each memory gets a new created timestamp based on its position,
-    preserving the relative ordering.
+    preserving the relative ordering. Uses timedelta to avoid microsecond overflow.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
 
     store = srh._get_mem_store()
     now = datetime.now(timezone.utc)
@@ -328,8 +327,8 @@ async def reorder_memories(payload: MemoryReorder):
         if not mem:
             continue
 
-        # Generate a new timestamp that preserves ordering
-        new_created = (now.replace(microsecond=i * 1000)).isoformat()
+        # Generate a new timestamp using timedelta (safe for any list size)
+        new_created = (now + timedelta(milliseconds=i)).isoformat()
 
         fm = srh.MemoryFrontmatter(
             id=mem_id,
@@ -342,12 +341,15 @@ async def reorder_memories(payload: MemoryReorder):
             zone=mem.frontmatter.zone,
         )
 
-        # Delete old and rewrite
+        # Write new file FIRST, then delete old (atomic swap pattern)
+        new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+        srh._write_memory(new_path, fm, mem.body)
         store.delete(mem.scope, mem_id)
-        path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
-        srh._write_memory(path, fm, mem.body)
-        store._id_to_path[fm.id] = path
-        store._update_cache_for_put(mem.scope, fm, mem.body, path)
+
+        # Update cache and re-index embedding
+        store._id_to_path[fm.id] = new_path
+        store._update_cache_for_put(mem.scope, fm, mem.body, new_path)
+        store._try_index(fm.id, mem.body)
         updated.append(mem_id)
 
     # Invalidate cache to ensure fresh ordering
