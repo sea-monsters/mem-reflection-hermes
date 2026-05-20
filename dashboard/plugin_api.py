@@ -329,8 +329,11 @@ async def reorder_memories(payload: MemoryReorder):
         if not mem:
             continue
 
-        # Generate a new timestamp using timedelta (safe for any list size)
-        new_created = (now + timedelta(milliseconds=i)).isoformat()
+        # Generate a new timestamp: earlier items in the submitted list get LATER
+        # timestamps so they appear first when sorted by created descending.
+        # e.g. list[0] gets now+100ms, list[-1] gets now+0ms
+        offset_ms = (len(payload.memory_ids) - 1 - i) * 100
+        new_created = (now + timedelta(milliseconds=offset_ms)).isoformat()
 
         fm = srh.MemoryFrontmatter(
             id=mem_id,
