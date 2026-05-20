@@ -40,7 +40,7 @@
   // Memory Manager Component (NEW)
   // ---------------------------------------------------------------------------
 
-  function MemoryManager({ memories, zones, onRefresh }) {
+  function MemoryManager({ memories, zones, onRefresh, onMutate }) {
     const [editing, setEditing] = React.useState(null);
     const [creating, setCreating] = React.useState(false);
     const [searchQuery, setSearchQuery] = React.useState("");
@@ -72,6 +72,7 @@
       try {
         await SDK.fetchJSON(`/api/plugins/mem-reflection-hermes/memories/${id}`, { method: "DELETE" });
         onRefresh();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to delete: " + e.message);
       }
@@ -101,6 +102,7 @@
         setEditing(null);
         setCreating(false);
         onRefresh();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to save: " + e.message);
       }
@@ -114,12 +116,22 @@
           body: JSON.stringify({ memory_ids: newOrder.map(m => m.id) }),
         });
         onRefresh();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to reorder: " + e.message);
       }
     };
 
     const moveItem = (index, direction) => {
+      // Reorder must operate on the full canonical list in created-date mode
+      if (searchQuery || zoneFilter !== "all") {
+        alert("Please clear search and zone filters before reordering.");
+        return;
+      }
+      if (sortBy !== "created") {
+        alert("Please switch to 'Sort by Date' mode before reordering.");
+        return;
+      }
       const newList = [...filtered];
       const targetIndex = index + direction;
       if (targetIndex < 0 || targetIndex >= newList.length) return;
@@ -419,7 +431,8 @@
     const { memories, refresh } = useMemories();
     const zones = useZones();
 
-    React.useEffect(() => {
+    // Global refresh: re-fetches graph, stats, reflections, and memories
+    const refreshAll = React.useCallback(() => {
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/graph")
         .then(setGraph)
         .catch(console.error);
@@ -429,7 +442,12 @@
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/reflections")
         .then(r => setReflections(r.reflections || []))
         .catch(console.error);
-    }, []);
+      refresh();
+    }, [refresh]);
+
+    React.useEffect(() => {
+      refreshAll();
+    }, [refreshAll]);
 
     return React.createElement("div", { className: "p-6 space-y-6" },
       React.createElement("h1", { className: "text-2xl font-bold" }, "Memory & Reflection"),
@@ -445,7 +463,7 @@
 
         // Memory Manager tab (NEW)
         activeTab === "manager" && React.createElement("div", { className: "mt-4" },
-          React.createElement(MemoryManager, { memories, zones, onRefresh: refresh })
+          React.createElement(MemoryManager, { memories, zones, onRefresh: refresh, onMutate: refreshAll })
         ),
 
         // Graph tab

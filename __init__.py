@@ -40,7 +40,13 @@ logger = logging.getLogger(__name__)
 # Register module in sys.modules early to avoid dataclass resolution failure
 # when loaded via importlib.util (Python 3.11 bug workaround).
 if __name__ != "__main__" and __name__ not in sys.modules:
-    sys.modules[__name__] = sys.modules[__spec__.name] if hasattr(sys, "_getframe") and __spec__ else sys.modules.get("__main__")
+    import types
+    # Fallback chain: __spec__.name → __name__ → create fresh module
+    mod_name = getattr(__spec__, "name", None) if "__spec__" in globals() else None
+    if mod_name is None:
+        mod_name = __name__
+    # Register the current executing module object, not a placeholder
+    sys.modules[mod_name] = sys.modules.get(mod_name) or sys.modules.get(__name__) or types.ModuleType(mod_name)
 
 # ---------------------------------------------------------------------------
 # Config & paths (with caching)
