@@ -19,9 +19,11 @@ All data lives in flat files for transparency and version-control friendliness.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import sys
 import threading
@@ -48,6 +50,13 @@ _CONFIG_SECTION = "mem_reflection_hermes"
 _CONFIG_KEY_EMBEDDINGS = "embeddings"
 _CONFIG_KEY_MICRO_REFLECTION = "micro_reflection"
 _CONFIG_KEY_REFLECTION_MODE = "reflection_mode"
+_CONFIG_KEY_PALACE_MODE = "palace_mode"
+_CONFIG_KEY_PROFILE_MODE = "profile_mode"
+_CONFIG_KEY_PALACE_INSTRUCTIONS = "palace_instructions"
+_CONFIG_KEY_ACTIVE_MEMORY_CAP = "active_memory_index_cap"
+_CONFIG_KEY_SKILL_INDEX_CAP = "skill_index_cap"
+_CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
+_CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
 
 
 def _hermes_home() -> Path:
@@ -109,6 +118,158 @@ def _reflection_mode() -> str:
     return str(_plugin_config().get(_CONFIG_KEY_REFLECTION_MODE, "embedding"))
 
 
+def _palace_mode_enabled() -> bool:
+    """Check if Memory Palace mode is enabled (zone-based, tool-driven retrieval)."""
+    return bool(_plugin_config().get(_CONFIG_KEY_PALACE_MODE, True))
+
+
+def _profile_mode_enabled() -> bool:
+    """Check if compiled profile mode is enabled (LLM-compiled, all-in-one injection)."""
+    return bool(_plugin_config().get(_CONFIG_KEY_PROFILE_MODE, False))
+
+
+def _palace_instructions_enabled() -> bool:
+    """Check if palace usage instructions should be included in context."""
+    return bool(_plugin_config().get(_CONFIG_KEY_PALACE_INSTRUCTIONS, True))
+
+
+def _active_memory_cap() -> int:
+    """Max episodic memories in the Active memory index section (default 50)."""
+    return int(_plugin_config().get(_CONFIG_KEY_ACTIVE_MEMORY_CAP, 50))
+
+
+def _skill_index_cap() -> int:
+    """Max skills in the Available skills index (default 50)."""
+    return int(_plugin_config().get(_CONFIG_KEY_SKILL_INDEX_CAP, 50))
+
+
+def _relevant_memory_cap() -> int:
+    """Max per-turn memory bodies injected in legacy mode (default 3)."""
+    return int(_plugin_config().get(_CONFIG_KEY_RELEVANT_MEMORY_CAP, 3))
+
+
+def _triggered_skill_cap() -> int:
+    """Max skills expanded per turn (default 3)."""
+    return int(_plugin_config().get(_CONFIG_KEY_TRIGGERED_SKILL_CAP, 3))
+
+
+# ---------------------------------------------------------------------------
+# CJK-aware token estimation (mirrors small-rust-hermes compaction.rs)
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count with CJK awareness (fast bytes-based, P1-1).
+
+    CJK/Unicode text → ~3 bytes per token.
+    ASCII text → ~4 bytes per token.
+    The hybrid byte-count approach is ~600x faster than char-by-char CJK range checks
+    while staying within ±15% of tiktoken cl100k_base for mixed CJK+English text.
+    """
+    if not text:
+        return 0
+    encoded = text.encode("utf-8")
+    n_bytes = len(encoded)
+    # Fast path: mostly ASCII text
+    if n_bytes <= len(text) * 1.2:
+        return (n_bytes + 3) // 4
+    # Mixed CJK: UTF-8 multi-byte characters use 3 bytes each → ~1.5 chars/token
+    return (n_bytes + 2) // 3
+
+
+_PALACE_USAGE_INSTRUCTIONS = """## Memory Palace
+Your persistent memory is organized in a Memory Palace with zones.
+- Use `srh_palace_zones` to see available zones and their counts
+- Use `srh_palace_read_zone` to load all memories from a specific zone
+- Use `srh_palace_recall` to search by topic, optionally scoped to a zone
+- Use `srh_memory_write` (with zone parameter) to persist new learnings
+- Use `srh_memory_delete` to remove outdated memories
+Don't guess about preferences or conventions — load the relevant zone first."""
+
+
+# ---------------------------------------------------------------------------
+# Palace Index & Zone Cache (mirrors small-rust-hermes palace.rs)
+# ---------------------------------------------------------------------------
+
+def _palace_index_path() -> Path:
+    """Path to palace-index.md cache file."""
+    return _plugin_data_dir() / "palace-index.md"
+
+
+def _zone_cache_dir() -> Path:
+    """Path to zone-cache directory for per-zone summaries."""
+    d = _plugin_data_dir() / "zone-cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sanitize_zone_filename(zone: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", zone)
+
+
+def _fast_hash(text: str) -> str:
+    """Fast non-crypto hash for write-on-change comparison (P0-1)."""
+    return hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
+
+
+def build_palace_index(memories: List[LoadedMemory]) -> str:
+    """Generate a code-based palace index (no LLM needed).
+
+    Groups memories by zone, shows counts and first-line previews.
+    Typically ~200-400 tokens.
+    """
+    groups: Dict[str, List[LoadedMemory]] = {}
+    for m in memories:
+        groups.setdefault(m.frontmatter.zone, []).append(m)
+
+    if not groups:
+        return "## Memory Palace\nEmpty — no memories yet."
+
+    total = len(memories)
+    buf = f"## Memory Palace\n{total} memories across {len(groups)} zones. Use srh_palace_read_zone to load details.\n"
+
+    # Zones in consistent order: core > work > episode > general > custom
+    zone_order = ["core", "work", "episode", "general"]
+    sorted_zones = sorted(groups.keys(), key=lambda z: (
+        (zone_order.index(z), z) if z in zone_order else (99, z)
+    ))
+
+    for zone in sorted_zones:
+        mems = groups[zone]
+        # Re-sort: core/work zone zones by predefined order
+        if zone in zone_order:
+            idx = zone_order.index(zone)
+        else:
+            idx = 99
+        buf += f"\n### {zone} ({len(mems)})\n"
+        for m in mems[:5]:
+            line = m.body.split("\n")[0].strip()[:80]
+            buf += f"- {line}\n"
+        if len(mems) > 5:
+            buf += f"- ... ({len(mems) - 5} more)\n"
+    return buf
+
+
+def load_zone_summary(zone: str) -> Optional[str]:
+    """Load a cached zone summary if available."""
+    safe = _sanitize_zone_filename(zone)
+    path = _zone_cache_dir() / f"{safe}.md"
+    if not path.exists():
+        return None
+    content = path.read_text(encoding="utf-8").strip()
+    return content or None
+
+
+def save_zone_summary(zone: str, content: str) -> Path:
+    """Save a zone summary atomically (tmp + rename)."""
+    safe = _sanitize_zone_filename(zone)
+    d = _zone_cache_dir()
+    path = d / f"{safe}.md"
+    tmp = d / f".{safe}.md.tmp"
+    tmp.write_text(content, encoding="utf-8")
+    tmp.rename(path)
+    return path
+
+
 def _plugin_data_dir() -> Path:
     """Plugin data directory (for pending skills, logs, etc.)."""
     # Use the directory containing this file as the plugin root
@@ -142,6 +303,25 @@ def _project_skills_dir() -> Optional[Path]:
 # Data models
 # ---------------------------------------------------------------------------
 
+# Predefined memory zones — mirrors small-rust-hermes zone taxonomy
+_ZONE_CORE = "core"
+_ZONE_WORK = "work"
+_ZONE_EPISODE = "episode"
+_ZONE_GENERAL = "general"
+_VALID_ZONES = frozenset({_ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL})
+# Project zones: any string starting with "project:" is valid
+_PROJECT_ZONE_PREFIX = "project:"
+
+def _normalize_zone(zone: Optional[str]) -> str:
+    """Normalize a zone string to a valid zone."""
+    if not zone:
+        return _ZONE_GENERAL
+    zone = zone.strip().lower()
+    if zone in _VALID_ZONES or zone.startswith(_PROJECT_ZONE_PREFIX):
+        return zone
+    return _ZONE_GENERAL
+
+
 @dataclass
 class MemoryFrontmatter:
     id: str
@@ -151,9 +331,11 @@ class MemoryFrontmatter:
     pinned: bool = False
     tags: List[str] = field(default_factory=list)
     supersedes: List[str] = field(default_factory=list)
+    zone: str = "general"  # core | work | episode | general | project:<name>
 
     @staticmethod
-    def new(source: str = "reflection", confidence: str = "medium", tags: Optional[List[str]] = None) -> "MemoryFrontmatter":
+    def new(source: str = "reflection", confidence: str = "medium", tags: Optional[List[str]] = None,
+            zone: str = "general") -> "MemoryFrontmatter":
         return MemoryFrontmatter(
             id=f"mem_{uuid.uuid4().hex[:16]}",
             created=datetime.now(timezone.utc).isoformat(),
@@ -162,6 +344,7 @@ class MemoryFrontmatter:
             pinned=False,
             tags=tags or [],
             supersedes=[],
+            zone=_normalize_zone(zone),
         )
 
 
@@ -176,6 +359,142 @@ class LoadedMemory:
         return self.frontmatter.id
 
 
+# ---------------------------------------------------------------------------
+# Memory Effectiveness Tracking (mirrors small-rust-hermes stats.rs)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MemoryStatEntry:
+    """A single memory usage event."""
+    memory_id: str
+    event: str  # "loaded" | "referenced" | "accessed"
+    at: str  # ISO-8601 timestamp
+
+
+@dataclass
+class MemoryEffectiveness:
+    """Per-memory effectiveness summary — computed from stats.jsonl."""
+    loaded: int = 0
+    referenced: int = 0
+    accessed: int = 0
+    last_event_at: Optional[str] = None
+
+    def factor(self) -> float:
+        """Effectiveness factor in [0.5, 1.0].
+
+        Memories with no data default to 1.0. Low referenced/loaded
+        ratio pulls the factor down toward 0.5.
+        """
+        if self.loaded == 0:
+            return 1.0
+        ratio = self.referenced / self.loaded
+        return 0.5 + 0.5 * ratio
+
+    def decay_factor(self, now: Optional[datetime] = None) -> float:
+        """Decay factor based on time since last access. 30-day half-life, floor 0.3."""
+        if self.last_event_at is None:
+            return 1.0
+        now_dt = now or datetime.now(timezone.utc)
+        try:
+            last_dt = datetime.fromisoformat(self.last_event_at)
+            days = max(0, (now_dt - last_dt).days)
+            return max(0.3, 0.5 ** (days / 30.0))
+        except Exception:
+            return 1.0
+
+
+def _stats_path() -> Path:
+    """Path to memory-stats.jsonl."""
+    return _plugin_data_dir() / "memory-stats.jsonl"
+
+
+def record_memory_stat(memory_id: str, event: str) -> None:
+    """Append a memory stat entry to stats.jsonl. Best-effort."""
+    _batch_record_stats([(memory_id, event)])
+
+
+def _batch_record_stats(entries: List[Tuple[str, str]]) -> None:
+    """Append multiple stat entries in a single file open. Best-effort."""
+    _stat_queue.put(entries)  # P1-2: async flush via background thread
+
+
+# P1-2: Background stat writer — avoids blocking the hot path on JSONL fsync
+import atexit as _atexit
+
+_stat_queue: "queue.Queue[List[Tuple[str, str]]]" = queue.Queue()
+
+def _stat_flush_worker() -> None:
+    """Drain the stat queue and append to JSONL in a single file open per batch."""
+    while True:
+        try:
+            batch = _stat_queue.get(timeout=1)
+        except Exception:
+            continue  # Timeout, loop again
+        if batch is None:
+            break  # Shutdown signal
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            sp = _stats_path()
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            with open(sp, "a", encoding="utf-8") as f:
+                for memory_id, event in batch:
+                    f.write(json.dumps({
+                        "memory_id": memory_id,
+                        "event": event,
+                        "at": now,
+                    }, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("Failed to batch record %d memory stats", len(batch))
+
+_stat_thread = threading.Thread(target=_stat_flush_worker, daemon=True)
+_stat_thread.start()
+
+def _shutdown_stat_writer() -> None:
+    """Flush remaining stats on process exit."""
+    _stat_queue.put(None)  # Signal shutdown
+    _stat_thread.join(timeout=2)
+
+_atexit.register(_shutdown_stat_writer)
+
+
+def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
+    """Load effectiveness stats for all memories from stats.jsonl.
+
+    Returns a dict mapping memory_id → MemoryEffectiveness.
+    """
+    sp = _stats_path()
+    if not sp.exists():
+        return {}
+    eff: Dict[str, MemoryEffectiveness] = {}
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mid = entry.get("memory_id", "")
+                if not mid:
+                    continue
+                e = eff.setdefault(mid, MemoryEffectiveness())
+                ev = entry.get("event", "")
+                if ev == "loaded":
+                    e.loaded += 1
+                elif ev == "referenced":
+                    e.referenced += 1
+                elif ev == "accessed":
+                    e.accessed += 1
+                at = entry.get("at")
+                if at and (e.last_event_at is None or at > e.last_event_at):
+                    e.last_event_at = at
+    except Exception:
+        logger.debug("Failed to load effectiveness stats")
+    return eff
+
+
 @dataclass
 class SkillFrontmatter:
     name: str
@@ -183,6 +502,7 @@ class SkillFrontmatter:
     triggers: List[str] = field(default_factory=list)
     version: Optional[str] = None
     license: Optional[str] = None
+    always_active: bool = False  # If True, inject full body into session prompt unconditionally
 
 
 @dataclass
@@ -227,6 +547,8 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
             pinned: bool = False
             tags: List[str] = []
             supersedes: List[str] = []
+            zone: str = "general"
+            always_active: bool = False
 
         # msgspec doesn't auto-parse datetime strings, so we pre-process
         decoded = msgspec.yaml.decode(yaml_part, type=_FrontmatterStruct)
@@ -238,6 +560,8 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
             "pinned": decoded.pinned,
             "tags": decoded.tags,
             "supersedes": decoded.supersedes,
+            "zone": decoded.zone or "general",
+            "always_active": decoded.always_active,
         }
         return data, body_part
     except Exception:
@@ -275,6 +599,7 @@ def _read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
             pinned=bool(data.get("pinned", False)),
             tags=data.get("tags", []),
             supersedes=data.get("supersedes", []),
+            zone=_normalize_zone(data.get("zone", "general")),
         )
         return LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
     except Exception as e:
@@ -292,8 +617,58 @@ def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
         "pinned": fm.pinned,
         "tags": fm.tags,
         "supersedes": fm.supersedes,
+        "zone": fm.zone,
     }
     path.write_text(_serialize_frontmatter(data, body), encoding="utf-8")
+
+
+# P2-2: Async file writer — avoids blocking agent on disk I/O
+_write_queue: "queue.Queue[Tuple[Path, str]]" = queue.Queue()
+_pending_writes: Set[Path] = set()  # Track files being written (for delete safety)
+
+def _file_flush_worker() -> None:
+    """Drain write queue in background, writing files to disk."""
+    while True:
+        try:
+            item = _write_queue.get(timeout=1)
+        except Exception:
+            continue
+        if item is None:
+            break
+        path, content = item
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except Exception:
+            logger.debug("Async write failed for %s", path)
+        finally:
+            _pending_writes.discard(path)
+
+_write_thread = threading.Thread(target=_file_flush_worker, daemon=True)
+_write_thread.start()
+
+def _async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
+    """Submit memory file write to background thread (P2-2)."""
+    data = {
+        "id": fm.id,
+        "created": fm.created,
+        "source": fm.source,
+        "confidence": fm.confidence,
+        "pinned": fm.pinned,
+        "tags": fm.tags,
+        "supersedes": fm.supersedes,
+        "zone": fm.zone,
+    }
+    content = _serialize_frontmatter(data, body)
+    _pending_writes.add(path)
+    _write_queue.put((path, content))
+
+def _shutdown_file_writer() -> None:
+    """Flush remaining file writes on process exit."""
+    _write_queue.put(None)
+    _write_thread.join(timeout=5)
+
+_atexit.register(_shutdown_file_writer)
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +681,14 @@ class MemoryStore:
         self.project_root = project_root
         self._embed_index: Optional[Any] = None
         self._embed_lock = threading.Lock()
+        self._effectiveness_cache: Optional[Dict[str, MemoryEffectiveness]] = None  # lazy-loaded from JSONL
+        self._doc_tokens: Optional[List[Tuple[str, List[str]]]] = None  # cached (id, tokens) for TF-IDF
         self._cache: Dict[str, Any] = {}  # In-memory cache
         self._cache_valid = False
+        self._id_to_path: Dict[str, Path] = {}  # O(1) delete: memory id → file path
+        self._index_dirty: bool = True  # P2-1: event-driven palace index rebuild
+        self._last_index_hash: str = ""  # P0-1: write-on-change
+        self._cached_index: str = ""  # Cached built index string (avoids rebuild on warm path)
 
     # -- listing --------------------------------------------------------------
 
@@ -319,6 +700,8 @@ class MemoryStore:
         if not self._cache_valid:
             return  # Will be rebuilt on next access
         loaded = LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
+        # O(1) id→path index
+        self._id_to_path[fm.id] = path
         # Insert into 'all' maintaining sort order
         all_mems = self._cache["all"]
         # Find insertion point
@@ -341,6 +724,9 @@ class MemoryStore:
             # Remove superseded from active/pinned
             self._cache["active"] = [m for m in self._cache["active"] if m.id() != old_id]
             self._cache["pinned"] = [m for m in self._cache["pinned"] if m.id() != old_id]
+        self._doc_tokens = None  # invalidate on mutation
+        self._index_dirty = True  # P2-1: mark palace index for rebuild
+        self._cached_index = ""  # Invalidate cached index
 
     def _update_cache_for_delete(self, mem_id: str) -> None:
         """Incrementally update cache after delete() without re-reading all files."""
@@ -350,11 +736,16 @@ class MemoryStore:
         self._cache["active"] = [m for m in self._cache["active"] if m.id() != mem_id]
         self._cache["pinned"] = [m for m in self._cache["pinned"] if m.id() != mem_id]
         self._cache["superseded"].discard(mem_id)
+        self._doc_tokens = None  # invalidate on mutation
+        self._id_to_path.pop(mem_id, None)  # P0-2: clean up id→path index
+        self._index_dirty = True  # P2-1: mark palace index for rebuild
+        self._cached_index = ""  # Invalidate cached index
 
     def _ensure_cache(self) -> None:
         if self._cache_valid:
             return
         all_mems: List[LoadedMemory] = []
+        self._id_to_path.clear()  # P0-2: rebuild id→path index
         for scope, root in (("user", self.user_root), ("project", self.project_root)):
             if root is None or not root.exists():
                 continue
@@ -363,6 +754,7 @@ class MemoryStore:
                     m = _read_memory(f, scope)
                     if m:
                         all_mems.append(m)
+                        self._id_to_path[m.id()] = f  # P0-2: populate O(1) index
         all_mems.sort(key=lambda m: m.id())
 
         superseded: Set[str] = set()
@@ -390,6 +782,21 @@ class MemoryStore:
         self._ensure_cache()
         return list(self._cache["pinned"])
 
+    def list_by_zone(self, zone: str) -> List[LoadedMemory]:
+        """Return all active memories in a given zone."""
+        return [m for m in self.list_active() if m.frontmatter.zone == zone]
+
+    def group_by_zone(self) -> Dict[str, List[LoadedMemory]]:
+        """Group active memories by zone, returning a dict of zone→memories."""
+        groups: Dict[str, List[LoadedMemory]] = {}
+        for m in self.list_active():
+            groups.setdefault(m.frontmatter.zone, []).append(m)
+        return groups
+
+    def zone_counts(self) -> Dict[str, int]:
+        """Return {zone: count} for all active memories."""
+        return {zone: len(mems) for zone, mems in self.group_by_zone().items()}
+
     def get(self, mem_id: str) -> Optional[LoadedMemory]:
         self._ensure_cache()
         for m in self._cache["all"]:
@@ -406,13 +813,26 @@ class MemoryStore:
         date_prefix = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
         short = fm.id[:16]
         path = root / f"{date_prefix}-{short}.md"
-        _write_memory(path, fm, body)
+        _async_write_memory(path, fm, body)  # P2-2: async disk I/O
+        self._id_to_path[fm.id] = path  # P0-2: O(1) id→path
         self._update_cache_for_put(scope, fm, body, path)
         # Try to index embedding
         self._try_index(fm.id, body)
         return path
 
     def delete(self, scope: str, mem_id: str) -> bool:
+        # P0-2: O(1) lookup via id→path index
+        path = self._id_to_path.get(mem_id)
+        if path is not None:
+            # P2-2: if file is still pending async write, just remove from queue tracking
+            _pending_writes.discard(path)
+            if path.exists():
+                path.unlink()
+            self._id_to_path.pop(mem_id, None)
+            self._update_cache_for_delete(mem_id)
+            self._try_remove_index(mem_id)
+            return True
+        # Fallback: directory scan (backward compat, if index missed)
         root = self._root_for(scope)
         for f in root.iterdir():
             if f.suffix != ".md":
@@ -420,6 +840,7 @@ class MemoryStore:
             m = _read_memory(f, scope)
             if m and m.id() == mem_id:
                 f.unlink()
+                self._id_to_path.pop(mem_id, None)
                 self._update_cache_for_delete(mem_id)
                 self._try_remove_index(mem_id)
                 return True
@@ -436,14 +857,41 @@ class MemoryStore:
 
     # -- search ---------------------------------------------------------------
 
-    def search(self, query: str, k: int = 5) -> List[LoadedMemory]:
+    def _get_effectiveness(self) -> Dict[str, MemoryEffectiveness]:
+        """Lazy-load effectiveness stats from JSONL. Cached per store instance."""
+        if self._effectiveness_cache is not None:
+            return self._effectiveness_cache
+        self._effectiveness_cache = load_effectiveness()
+        return self._effectiveness_cache
+
+    def refresh_effectiveness(self) -> None:
+        """Force reload of effectiveness stats (call after writing new stats)."""
+        self._effectiveness_cache = None
+
+    def _ensure_doc_tokens(self, active: List[LoadedMemory]) -> List[Tuple[str, List[str]]]:
+        """Build or return cached tokenized documents for TF-IDF."""
+        if self._doc_tokens is not None and len(self._doc_tokens) == len(active):
+            # Quick check: same IDs in same order
+            if all(self._doc_tokens[i][0] == active[i].id() for i in range(len(active))):
+                return self._doc_tokens
+        # Rebuild
+        self._doc_tokens = [(m.id(), _memory_tokens(m)) for m in active]
+        return self._doc_tokens
+
+    def search(self, query: str, k: int = 5, zone: Optional[str] = None) -> List[LoadedMemory]:
         active = self.list_active()
         # Try embedding first if available
         embed_results = self._embed_search(query, k)
         if embed_results is not None:
             id_set = {mid for mid, _ in embed_results}
-            return [m for m in active if m.id() in id_set]
-        return _tfidf_search(active, query, k)
+            results = [m for m in active if m.id() in id_set]
+            if zone:
+                results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone)]
+            return results[:k]
+        # Load effectiveness and cached doc_tokens
+        effectiveness = self._get_effectiveness()
+        doc_tokens = self._ensure_doc_tokens(active)
+        return _tfidf_search(active, query, k, effectiveness, doc_tokens)
 
     def check_conflict(self, body: str, threshold: float = 0.85) -> Optional[Tuple[str, float]]:
         active = self.list_active()
@@ -564,12 +1012,17 @@ def _memory_tokens(m: LoadedMemory) -> List[str]:
     return tokens
 
 
-def _tfidf_search(memories: List[LoadedMemory], query: str, k: int) -> List[LoadedMemory]:
-    scored = _tfidf_search_scored(memories, query, k)
+def _tfidf_search(memories: List[LoadedMemory], query: str, k: int,
+                  effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+                  doc_tokens: Optional[List[Tuple[str, List[str]]]] = None) -> List[LoadedMemory]:
+    scored = _tfidf_search_scored(memories, query, k, effectiveness, doc_tokens)
     return [m for m, _ in scored]
 
 
-def _tfidf_search_scored(memories: List[LoadedMemory], query: str, k: int) -> List[Tuple[LoadedMemory, float]]:
+def _tfidf_search_scored(memories: List[LoadedMemory], query: str, k: int,
+                         effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+                         doc_tokens: Optional[List[Tuple[str, List[str]]]] = None
+                         ) -> List[Tuple[LoadedMemory, float]]:
     if k == 0 or not memories:
         return []
     q_tokens = _tokenise(query)
@@ -577,21 +1030,28 @@ def _tfidf_search_scored(memories: List[LoadedMemory], query: str, k: int) -> Li
         return []
     n = len(memories)
     df: Dict[str, int] = Counter()
-    doc_tokens: List[List[str]] = []
-    for m in memories:
-        tokens = _memory_tokens(m)
-        unique = set(tokens)
-        for t in unique:
+    # Use pre-computed doc_tokens cache or compute on the fly
+    raw_doc_tokens: List[List[str]]
+    if doc_tokens is not None:
+        raw_doc_tokens = [tokens for _, tokens in doc_tokens]
+    else:
+        raw_doc_tokens = [_memory_tokens(m) for m in memories]
+    for tokens in raw_doc_tokens:
+        for t in set(tokens):
             df[t] += 1
-        doc_tokens.append(tokens)
     q_tf = Counter(q_tokens)
     q_vec = {t: (c / len(q_tokens)) * ((n / df[t]) + 1) for t, c in q_tf.items() if df.get(t)}
     scored: List[Tuple[float, LoadedMemory]] = []
-    for tokens, m in zip(doc_tokens, memories):
+    for tokens, m in zip(raw_doc_tokens, memories):
         m_tf = Counter(tokens)
         m_vec = {t: (c / len(tokens)) * ((n / df[t]) + 1) for t, c in m_tf.items() if df.get(t)}
         score = _cosine_similarity(q_vec, m_vec)
         if score > 0:
+            # Apply effectiveness factor if available
+            if effectiveness:
+                eff = effectiveness.get(m.id())
+                if eff:
+                    score *= eff.factor() * eff.decay_factor()
             scored.append((score, m))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(m, s) for s, m in scored[:k]]
@@ -614,15 +1074,23 @@ class SkillStore:
     def __init__(self, user_root: Path, project_root: Optional[Path] = None):
         self.user_root = user_root
         self.project_root = project_root
+        self._cache: Optional[List[LoadedSkill]] = None  # Lazy cache (skills are static per session)
 
     def list(self) -> List[LoadedSkill]:
+        if self._cache is not None:
+            return self._cache
         user_skills = self._list_scope(self.user_root, "user")
         project_skills = self._list_scope(self.project_root, "project") if self.project_root else []
         project_names = {s.frontmatter.name for s in project_skills}
         user_skills = [s for s in user_skills if s.frontmatter.name not in project_names]
         out = user_skills + project_skills
         out.sort(key=lambda s: s.frontmatter.name)
+        self._cache = out
         return out
+
+    def invalidate_cache(self) -> None:
+        """Force reload on next list() call (e.g., after skill changes)."""
+        self._cache = None
 
     def _list_scope(self, root: Optional[Path], scope: str) -> List[LoadedSkill]:
         out: List[LoadedSkill] = []
@@ -660,6 +1128,7 @@ def _read_skill(path: Path, scope: str) -> Optional[LoadedSkill]:
             triggers=data.get("triggers", []),
             version=data.get("version"),
             license=data.get("license"),
+            always_active=bool(data.get("always_active", False)),
         )
         return LoadedSkill(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
     except Exception as e:
@@ -962,42 +1431,123 @@ def _get_skill_store() -> SkillStore:
 # ---------------------------------------------------------------------------
 
 def _build_context_block(query: str = "") -> str:
+    """Build the memory context block injected into the user message.
+
+    Three modes (checked in priority order):
+    1. Palace mode: inject palace index (zone map), agent uses tools for retrieval
+    2. Profile mode: inject compiled profile.md if available, no per-turn injection
+    3. Legacy mode: pinned + active index + per-turn TF-IDF relevance injection
+    """
     mem_store = _get_mem_store()
     skill_store = _get_skill_store()
     parts: List[str] = []
+    stat_entries: List[Tuple[str, str]] = []  # Batch collect (id, event)
 
-    # 1. Pinned memories (always loaded)
-    pinned = mem_store.list_pinned()
-    if pinned:
-        parts.append("=== Pinned memories (always relevant) ===")
-        for m in pinned:
-            parts.append(f"- [{m.id()}] {m.body[:200]}")
-        parts.append("")
+    # Determine mode — cache config lookups
+    palace_mode = _palace_mode_enabled()
+    profile_mode = _profile_mode_enabled()
 
-    # 2. Active index (TF-IDF search on query, or all active if no query)
-    if query:
-        active = mem_store.search(query, k=5)
+    # Pre-load skills once (used in palace index, triggered, always-active)
+    all_skills = skill_store.list()
+
+    # ---- Mode 1: Palace (zone-based, tool-driven retrieval) ----
+    if palace_mode:
+        active = mem_store.list_active()
+        if active:
+            # P0-1+P2-1: write-on-change + event-driven rebuild
+            if mem_store._index_dirty:
+                index = build_palace_index(active)
+                h = _fast_hash(index)
+                if h != mem_store._last_index_hash:
+                    _palace_index_path().parent.mkdir(parents=True, exist_ok=True)
+                    _palace_index_path().write_text(index, encoding="utf-8")
+                    mem_store._last_index_hash = h
+                mem_store._index_dirty = False
+                mem_store._cached_index = index  # Cache built string
+            else:
+                # Reuse cached index (don't rebuild, don't write)
+                index = mem_store._cached_index
+            parts.append(index)
+            for m in active:
+                stat_entries.append((m.id(), "loaded"))
+        else:
+            parts.append("## Memory Palace\nEmpty — no memories yet.")
+
+        if _palace_instructions_enabled():
+            parts.append(_PALACE_USAGE_INSTRUCTIONS)
+
+        cap = _skill_index_cap()
+        if all_skills:
+            parts.append("\n## Available skills")
+            for s in all_skills[:cap]:
+                parts.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
+            if len(all_skills) > cap:
+                parts.append(f"- ... ({len(all_skills) - cap} more)")
+
+    # ---- Mode 2: Compiled Profile (LLM-compiled, all-in-one) ----
+    elif profile_mode:
+        profile_path = _plugin_data_dir() / "profile.md"
+        if profile_path.exists():
+            profile = profile_path.read_text(encoding="utf-8").strip()
+            if profile:
+                parts.append("## User Profile\n")
+                parts.append(profile)
+
+        if not parts:
+            pinned = mem_store.list_pinned()
+            if pinned:
+                parts.append("=== Pinned memories (always relevant) ===")
+                for m in pinned:
+                    parts.append(f"- [{m.id()}] {m.body[:200]}")
+                    stat_entries.append((m.id(), "loaded"))
+                parts.append("")
+
+    # ---- Mode 3: Legacy (pinned + active index + per-turn TF-IDF) ----
     else:
-        active = mem_store.list_active()[:10]
-    if active:
-        parts.append("=== Relevant memories ===")
-        for m in active:
-            if m not in pinned:
+        pinned = mem_store.list_pinned()
+        if pinned:
+            parts.append("=== Pinned memories (always relevant) ===")
+            for m in pinned:
                 parts.append(f"- [{m.id()}] {m.body[:200]}")
-        parts.append("")
+                stat_entries.append((m.id(), "loaded"))
+            parts.append("")
 
-    # 3. Triggered skills
-    if query:
-        skills = match_skills(skill_store.list(), query, k=3)
-    else:
-        skills = []
-    if skills:
-        parts.append("=== Triggered skills ===")
-        for s in skills:
-            parts.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
-        parts.append("")
+        if query:
+            active = mem_store.search(query, k=_relevant_memory_cap())
+        else:
+            active = mem_store.list_active()[:_active_memory_cap()]
+        if active:
+            parts.append("=== Relevant memories ===")
+            for m in active:
+                if m not in pinned:
+                    parts.append(f"- [{m.id()}] {m.body[:200]}")
+                    stat_entries.append((m.id(), "loaded"))
+            parts.append("")
 
-    return "\n".join(parts)
+    # Triggered skills (legacy/profile fallback)
+    if not palace_mode or (palace_mode and not parts):
+        if query:
+            skills = match_skills(all_skills, query, k=_triggered_skill_cap())
+        else:
+            skills = []
+        if skills:
+            parts.append("=== Triggered skills ===")
+            for s in skills:
+                parts.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
+            parts.append("")
+
+    # Always-active skills (all modes)
+    always_active = [s for s in all_skills if s.frontmatter.always_active]
+    if always_active:
+        parts.append("\n## Always-Active Skills\n")
+        for s in always_active:
+            parts.append(f"### {s.frontmatter.name}\n{s.body.strip()}\n")
+
+    # Flush all stat entries in one file open
+    if stat_entries:
+        _batch_record_stats(stat_entries)
+
+    return "\n".join(parts).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,8 +1557,12 @@ def _build_context_block(query: str = "") -> str:
 def _tool_srh_memory_search(args: dict) -> str:
     query = args.get("query", "")
     k = int(args.get("k", 5))
+    zone_filter = args.get("zone")  # Optional zone scope
     mem_store = _get_mem_store()
     results = mem_store.search(query, k)
+    # Apply zone filter if specified
+    if zone_filter:
+        results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone_filter)][:k]
     out = []
     for m in results:
         out.append({
@@ -1017,8 +1571,10 @@ def _tool_srh_memory_search(args: dict) -> str:
             "confidence": m.frontmatter.confidence,
             "pinned": m.frontmatter.pinned,
             "tags": m.frontmatter.tags,
+            "zone": m.frontmatter.zone,
             "body": m.body[:500],
         })
+        record_memory_stat(m.id(), "accessed")
     return json.dumps({"results": out}, ensure_ascii=False)
 
 
@@ -1032,6 +1588,7 @@ def _tool_srh_memory_write(args: dict) -> str:
     tags = args.get("tags", [])
     pinned = bool(args.get("pinned", False))
     supersedes = args.get("supersedes", [])
+    zone = _normalize_zone(args.get("zone"))
 
     # Conflict check
     conflict = mem_store.check_conflict(body)
@@ -1043,7 +1600,7 @@ def _tool_srh_memory_write(args: dict) -> str:
             "similarity": score,
         })
 
-    fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags)
+    fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags, zone=zone)
     fm.pinned = pinned
     fm.supersedes = supersedes
     path = mem_store.put(scope, fm, body)
@@ -1080,6 +1637,110 @@ def _tool_srh_skill_search(args: dict) -> str:
     return json.dumps({"results": out}, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Palace tools (zone-based memory navigation)
+# ---------------------------------------------------------------------------
+
+def _tool_srh_palace_zones(args: dict) -> str:
+    """List all Memory Palace zones with memory counts."""
+    mem_store = _get_mem_store()
+    groups = mem_store.group_by_zone()
+    if not groups:
+        return json.dumps({"zones": [], "total": 0, "message": "Memory Palace is empty — no memories yet."})
+    zones = []
+    total = 0
+    for zone, mems in sorted(groups.items()):
+        zones.append({"zone": zone, "count": len(mems)})
+        total += len(mems)
+    return json.dumps({"zones": zones, "total": total}, ensure_ascii=False)
+
+
+def _tool_srh_palace_read_zone(args: dict) -> str:
+    """Load all memories from a specific zone. Returns cached summary if available."""
+    zone = _normalize_zone(args.get("zone"))
+    mem_store = _get_mem_store()
+
+    # Try cached summary first
+    cached = load_zone_summary(zone)
+    if cached:
+        return json.dumps({
+            "zone": zone,
+            "source": "cache",
+            "content": cached,
+        }, ensure_ascii=False)
+
+    # Load raw memories from the zone
+    zone_mems = mem_store.list_by_zone(zone)
+    if not zone_mems:
+        return json.dumps({
+            "zone": zone,
+            "source": "live",
+            "memories": [],
+            "message": f"Zone '{zone}' is empty or does not exist.",
+        }, ensure_ascii=False)
+
+    # Record access stats
+    for m in zone_mems:
+        record_memory_stat(m.id(), "accessed")
+
+    memories = []
+    for m in zone_mems:
+        memories.append({
+            "id": m.id(),
+            "confidence": m.frontmatter.confidence,
+            "pinned": m.frontmatter.pinned,
+            "tags": m.frontmatter.tags,
+            "body": m.body[:500],
+        })
+    return json.dumps({
+        "zone": zone,
+        "source": "live",
+        "count": len(memories),
+        "memories": memories,
+    }, ensure_ascii=False)
+
+
+def _tool_srh_palace_recall(args: dict) -> str:
+    """Search memories by topic, optionally scoped to a zone."""
+    query = args.get("topic", "")
+    if not query:
+        return json.dumps({"error": "topic is required"})
+    k = int(args.get("limit", 5))
+    zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
+
+    mem_store = _get_mem_store()
+    results = mem_store.search(query, k=k * 3)  # Over-fetch for zone filtering
+
+    # Apply zone filter if specified
+    if zone:
+        results = [m for m in results if m.frontmatter.zone == zone][:k]
+    else:
+        results = results[:k]
+
+    if not results:
+        scope_msg = f" in zone '{zone}'" if zone else ""
+        return json.dumps({
+            "results": [],
+            "message": f"No memories matching '{query}'{scope_msg}",
+        }, ensure_ascii=False)
+
+    # Record access stats
+    for m in results:
+        record_memory_stat(m.id(), "accessed")
+
+    out = []
+    for i, m in enumerate(results):
+        out.append({
+            "rank": i + 1,
+            "id": m.id(),
+            "zone": m.frontmatter.zone,
+            "confidence": m.frontmatter.confidence,
+            "tags": m.frontmatter.tags,
+            "body": m.body[:500],
+        })
+    return json.dumps({"results": out}, ensure_ascii=False)
+
+
 def _tool_srh_reflect_now(args: dict) -> str:
     """Trigger a full reflection on the current session messages."""
     ctx = args.get("ctx")
@@ -1096,6 +1757,164 @@ def _tool_srh_reflect_now(args: dict) -> str:
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Profile Compilation (LLM-compiled memory summary, mirrors small-rust-hermes compile.rs)
+# ---------------------------------------------------------------------------
+
+_COMPILE_PROFILE_SYSTEM = """You are a memory curator. Given a list of individual memory entries about a user accumulated over multiple conversations, compile them into a structured profile document.
+
+Rules:
+- Use ## markdown headers to organize by topic (categories emerge naturally from the content)
+- Merge overlapping or redundant memories into single concise entries
+- Use bullet points, one line per point
+- Preserve the user's language (Chinese / English as found in entries)
+- Drop entries that are trivially obvious or redundant after merging
+- Output ONLY the profile markdown, no preamble or explanation"""
+
+_COMPILE_PALACE_INDEX_SYSTEM = """You are a memory curator organizing a Memory Palace index. Given memories grouped by zone, produce a concise zone map.
+
+Rules:
+- Use ## Memory Palace as the top header
+- Show total memory count and zone count in the first line
+- For each zone, use ### zone_name (count) as header
+- Under each zone, list 2-3 bullet points summarizing key content
+- Keep the entire output under 300 tokens
+- Preserve the user's language (Chinese / English as found in entries)
+- Output ONLY the index markdown, no preamble"""
+
+_COMPILE_ZONE_SYSTEM = """You are a memory curator. Given all memories from a single zone, compile them into a concise summary.
+
+Rules:
+- Use bullet points, one line per point
+- Merge overlapping or redundant memories
+- Preserve the user's language (Chinese / English as found in entries)
+- Keep the output under 400 tokens
+- Output ONLY the summary markdown, no preamble"""
+
+
+def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
+    """Compile active memories into a structured markdown document via LLM.
+
+    Args:
+        ctx: Hermes agent context with ctx.llm access
+        mode: "profile" (profile.md), "palace_index" (palace-index.md), or "zone" (zone-cache/*)
+
+    Returns:
+        Dict with 'success', 'path', 'mode', 'token_count' or 'error'
+    """
+    if not hasattr(ctx, "llm"):
+        return {"error": "No LLM available for compilation"}
+
+    mem_store = _get_mem_store()
+    active = mem_store.list_active()
+    if not active:
+        return {"error": "No active memories to compile"}
+
+    try:
+        if mode == "profile":
+            system = _COMPILE_PROFILE_SYSTEM
+            prompt = _build_compile_profile_prompt(active)
+            save_path = _plugin_data_dir() / "profile.md"
+        elif mode == "palace_index":
+            system = _COMPILE_PALACE_INDEX_SYSTEM
+            prompt = _build_compile_palace_prompt(active)
+            save_path = _palace_index_path()
+        elif mode == "zone":
+            # Compile all zones
+            results = {}
+            groups = mem_store.group_by_zone()
+            for zone, mems in groups.items():
+                prompt = _build_compile_zone_prompt(zone, mems)
+                result = ctx.llm.complete_structured(
+                    instructions=prompt,
+                    input=[{"type": "text", "text": prompt}],
+                    system_prompt=_COMPILE_ZONE_SYSTEM,
+                    purpose=f"compile_zone_{_sanitize_zone_filename(zone)}",
+                    max_tokens=1024,
+                )
+                if result and not result.error:
+                    text = result.text.strip() if hasattr(result, 'text') else str(result)
+                    save_zone_summary(zone, text)
+                    results[zone] = {"tokens": len(text.split())}
+                else:
+                    results[zone] = {"error": str(result.error) if result and hasattr(result, 'error') else "unknown"}
+            return {"success": True, "mode": "zone", "zones": results}
+        else:
+            return {"error": f"Unknown compilation mode: {mode}"}
+
+        result = ctx.llm.complete_structured(
+            instructions=prompt,
+            input=[{"type": "text", "text": prompt}],
+            system_prompt=system,
+            purpose=f"compile_{mode}",
+            max_tokens=4096,
+        )
+
+        if not result or result.error:
+            return {"error": f"LLM compilation failed: {getattr(result, 'error', 'unknown')}"}
+
+        text = result.text.strip() if hasattr(result, 'text') else str(result)
+        if not text:
+            return {"error": "LLM returned empty response"}
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(text, encoding="utf-8")
+
+        return {
+            "success": True,
+            "mode": mode,
+            "path": str(save_path),
+            "token_count": len(text.split()),
+        }
+    except Exception as e:
+        logger.warning("Profile compilation failed: %s", e)
+        return {"error": str(e)}
+
+
+def _build_compile_profile_prompt(memories: List[LoadedMemory]) -> str:
+    """Build user prompt for profile compilation."""
+    buf = "Compile the following memory entries into a structured profile:\n\n"
+    for m in memories:
+        pin = "pinned, " if m.frontmatter.pinned else ""
+        conf = m.frontmatter.confidence
+        buf += f"- [{m.id()}] ({pin}{conf}, zone={m.frontmatter.zone}) {m.body.strip()}\n"
+    return buf
+
+
+def _build_compile_palace_prompt(memories: List[LoadedMemory]) -> str:
+    """Build user prompt for palace index compilation."""
+    groups: Dict[str, List[LoadedMemory]] = {}
+    for m in memories:
+        groups.setdefault(m.frontmatter.zone, []).append(m)
+    buf = "Organize these memories into a palace index:\n\n"
+    for zone, mems in sorted(groups.items()):
+        buf += f"### {zone} ({len(mems)} memories)\n"
+        for m in mems:
+            buf += f"- {m.body.strip()}\n"
+        buf += "\n"
+    return buf
+
+
+def _build_compile_zone_prompt(zone: str, memories: List[LoadedMemory]) -> str:
+    """Build user prompt for zone summary compilation."""
+    buf = f"Summarize zone '{zone}' ({len(memories)} memories):\n\n"
+    for m in memories:
+        buf += f"- ({m.frontmatter.confidence}) {m.body.strip()}\n"
+    return buf
+
+
+def _tool_srh_compile_profile(args: dict) -> str:
+    """Compile memories into a structured profile via LLM."""
+    ctx = args.get("ctx")
+    if not ctx:
+        return json.dumps({
+            "error": "Compilation requires ctx with LLM access. Use /compile-profile slash command.",
+        })
+    mode = args.get("mode", "profile")
+    result = _compile_profile_via_llm(ctx, mode)
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1143,13 +1962,19 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
         if user_msg and assistant_msg:
             break
 
-    # Trigger micro-reflection on every turn (now fast enough with embedding mode)
-    # Uses local ONNX embeddings (~20ms), zero LLM token cost
+    # Trigger micro-reflection: explicit intent always, otherwise every 3 turns
+    # (mirrors small-rust-hermes simplified heuristic)
     if _micro_reflection_enabled() and user_msg and assistant_msg:
-        try:
-            _run_micro_reflection(ctx, user_msg, assistant_msg)
-        except Exception as e:
-            logger.debug("Micro-reflection failed: %s", e)
+        global _turns_since_reflect
+        has_intent = _is_explicit_memory_intent(user_msg)
+        if has_intent or _turns_since_reflect >= 3:
+            try:
+                _run_micro_reflection(ctx, user_msg, assistant_msg)
+                _turns_since_reflect = 0
+            except Exception as e:
+                logger.debug("Micro-reflection failed: %s", e)
+        else:
+            _turns_since_reflect += 1
 
     # Build context block
     query = ""
@@ -1177,12 +2002,13 @@ def register(ctx) -> None:
         toolset="mem_reflection_hermes",
         schema={
             "name": "srh_memory_search",
-            "description": "Search active memories by TF-IDF relevance (or embedding if available).",
+            "description": "Search active memories by TF-IDF relevance (or embedding if available). Use 'zone' parameter to filter by zone.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
                     "k": {"type": "integer", "description": "Max results", "default": 5},
+                    "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
                 },
                 "required": ["query"],
             },
@@ -1196,7 +2022,7 @@ def register(ctx) -> None:
         toolset="mem_reflection_hermes",
         schema={
             "name": "srh_memory_write",
-            "description": "Write a new structured memory with YAML frontmatter. Checks for conflicts.",
+            "description": "Write a new structured memory with YAML frontmatter. Checks for conflicts. Specify zone to organize memories.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1206,6 +2032,7 @@ def register(ctx) -> None:
                     "tags": {"type": "array", "items": {"type": "string"}, "default": []},
                     "pinned": {"type": "boolean", "default": False},
                     "supersedes": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
                 },
                 "required": ["body"],
             },
@@ -1268,6 +2095,80 @@ def register(ctx) -> None:
         emoji="🔍",
     )
 
+    # Palace tools (zone-based memory navigation)
+    ctx.register_tool(
+        name="srh_palace_zones",
+        toolset="mem_reflection_hermes",
+        schema={
+            "name": "srh_palace_zones",
+            "description": "List all Memory Palace zones with memory counts. Use this to discover what zones exist before reading details.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        handler=_tool_srh_palace_zones,
+        description="List memory zones",
+        emoji="🏰",
+    )
+    ctx.register_tool(
+        name="srh_palace_read_zone",
+        toolset="mem_reflection_hermes",
+        schema={
+            "name": "srh_palace_read_zone",
+            "description": "Load all memories from a specific zone. Returns cached zone summary if available, otherwise raw memory bodies.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "zone": {"type": "string", "description": "Zone name (core, work, episode, general, or project:<name>)"},
+                },
+                "required": ["zone"],
+            },
+        },
+        handler=_tool_srh_palace_read_zone,
+        description="Read a memory zone",
+        emoji="📂",
+    )
+    ctx.register_tool(
+        name="srh_palace_recall",
+        toolset="mem_reflection_hermes",
+        schema={
+            "name": "srh_palace_recall",
+            "description": "Search memories by topic, optionally scoped to a zone. More focused than srh_memory_search — use this for palace navigation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "What to recall (e.g. 'editor preference', 'error handling convention')"},
+                    "limit": {"type": "integer", "description": "Max results", "default": 5},
+                    "zone": {"type": "string", "description": "Optional: restrict to a specific zone"},
+                },
+                "required": ["topic"],
+            },
+        },
+        handler=_tool_srh_palace_recall,
+        description="Recall by topic",
+        emoji="🔎",
+    )
+
+    # Profile compilation tool (LLM-driven)
+    ctx.register_tool(
+        name="srh_compile_profile",
+        toolset="mem_reflection_hermes",
+        schema={
+            "name": "srh_compile_profile",
+            "description": "Compile all active memories into a structured profile document via LLM. Modes: 'profile' (profile.md), 'palace_index' (palace index), 'zone' (per-zone summaries).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "default": "profile", "description": "Compilation mode"},
+                },
+            },
+        },
+        handler=_tool_srh_compile_profile,
+        description="Compile memories into profile",
+        emoji="📋",
+    )
+
     # Register hooks
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
@@ -1309,6 +2210,12 @@ def register(ctx) -> None:
         handler=lambda raw: _slash_skills(raw),
         description="List or search skills",
         args_hint="[query]",
+    )
+    ctx.register_command(
+        name="compile-profile",
+        handler=lambda raw: _slash_compile_profile(raw),
+        description="Compile all memories into a structured profile via LLM",
+        args_hint="[profile|palace_index|zone]",
     )
 
     logger.info("mem-reflection-hermes plugin registered")
@@ -1375,6 +2282,19 @@ def _slash_skills(raw_args: str) -> str:
     for s in skills:
         lines.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
     return "\n".join(lines) if lines else "No skills found."
+
+
+def _slash_compile_profile(raw_args: str) -> str:
+    """Handle /compile-profile [mode] slash command."""
+    mode = raw_args.strip() or "profile"
+    if mode not in ("profile", "palace_index", "zone"):
+        return f"⚠️ Unknown mode: {mode}. Use: profile, palace_index, or zone."
+    # This requires ctx — can only work when called from a session with LLM access
+    return (
+        f"📋 Compile Profile command received (mode={mode}).\n"
+        f"Use the srh_compile_profile tool with ctx access to execute, "
+        f"or wait for session-end auto-compilation."
+    )
 
 
 # ---------------------------------------------------------------------------
