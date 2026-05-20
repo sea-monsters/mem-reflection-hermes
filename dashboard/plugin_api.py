@@ -278,8 +278,9 @@ async def update_memory(memory_id: str, payload: MemoryUpdate):
     new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
     srh._write_memory(new_path, fm, body)
 
-    # Delete old file only after successful write
-    store.delete(mem.scope, memory_id)
+    # Delete old file only after successful write AND only if path changed
+    if new_path != mem.source_path:
+        store.delete(mem.scope, memory_id)
 
     # Update cache and re-index embedding
     store._id_to_path[fm.id] = new_path
@@ -341,10 +342,11 @@ async def reorder_memories(payload: MemoryReorder):
             zone=mem.frontmatter.zone,
         )
 
-        # Write new file FIRST, then delete old (atomic swap pattern)
+        # Write new file FIRST, then delete old only if path changed
         new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
         srh._write_memory(new_path, fm, mem.body)
-        store.delete(mem.scope, mem_id)
+        if new_path != mem.source_path:
+            store.delete(mem.scope, mem_id)
 
         # Update cache and re-index embedding
         store._id_to_path[fm.id] = new_path

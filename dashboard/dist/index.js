@@ -40,7 +40,7 @@
   // Memory Manager Component (NEW)
   // ---------------------------------------------------------------------------
 
-  function MemoryManager({ memories, zones, onRefresh }) {
+  function MemoryManager({ memories, zones, onRefresh, onMutate }) {
     const [editing, setEditing] = React.useState(null);
     const [creating, setCreating] = React.useState(false);
     const [searchQuery, setSearchQuery] = React.useState("");
@@ -72,7 +72,7 @@
       try {
         await SDK.fetchJSON(`/api/plugins/mem-reflection-hermes/memories/${id}`, { method: "DELETE" });
         onRefresh();
-        refreshAll();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to delete: " + e.message);
       }
@@ -102,8 +102,7 @@
         setEditing(null);
         setCreating(false);
         onRefresh();
-        // Refresh global dashboard data so other tabs stay consistent
-        refreshAll();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to save: " + e.message);
       }
@@ -117,7 +116,7 @@
           body: JSON.stringify({ memory_ids: newOrder.map(m => m.id) }),
         });
         onRefresh();
-        refreshAll();
+        if (onMutate) onMutate();
       } catch (e) {
         alert("Failed to reorder: " + e.message);
       }
@@ -455,7 +454,7 @@
 
         // Memory Manager tab (NEW)
         activeTab === "manager" && React.createElement("div", { className: "mt-4" },
-          React.createElement(MemoryManager, { memories, zones, onRefresh: refresh })
+          React.createElement(MemoryManager, { memories, zones, onRefresh: refresh, onMutate: refreshAll })
         ),
 
         // Graph tab
