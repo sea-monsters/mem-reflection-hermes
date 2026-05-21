@@ -1,13 +1,13 @@
 # mem-reflection-hermes
 
-Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements.
+Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements and a full-featured dashboard.
 
 ## Features
 
-- **Structured Memories**: Markdown + YAML frontmatter (id, created, source, confidence, pinned, tags, supersedes)
+- **Structured Memories**: Markdown + YAML frontmatter (id, created, source, confidence, pinned, tags, supersedes, zone, rank)
 - **Dual Scope**: User-level (`~/.hermes/memories/`) and project-level (`./.hermes/memories/`)
 - **Memory Palace**: Zone-based organization (core, work, episode, general, project:*) with tool-driven navigation
-- **TF-IDF Search**: Pure Python implementation, zero external dependencies, ~1ms for 50 memories
+- **TF-IDF Search**: Pure Python implementation, zero external dependencies, ~0.8ms for 50 memories
 - **Semantic Search**: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
 - **Conflict Detection**: Automatic similarity checking on write with supersedes chains
 - **Effectiveness Tracking**: Per-memory effectiveness scoring with time decay
@@ -16,51 +16,65 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Skill Auto-Matching**: Token overlap + optional embedding hybrid for context injection
 - **Context Layering**: Pinned → Active Index → Triggered Skills → Always-Active Skills
 - **Profile Compilation**: LLM-driven compilation of all memories into structured profile documents
+- **Dashboard Memory Manager**: Full CRUD + reorder UI with search, zone filter, and sort controls
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│           Hermes Agent Session          │
-├─────────────────────────────────────────┤
-│  pre_llm_call hook                      │
-│    ├── Inject palace index (zone map)   │
-│    ├── Inject compiled profile          │
-│    ├── Inject triggered/always skills   │
-│    └── Trigger micro-reflection         │
-├─────────────────────────────────────────┤
-│  on_session_end hook                    │
-│    └── Run full reflection              │
-├─────────────────────────────────────────┤
-│  Tools (9)                              │
-│    ├── srh_memory_search                │
-│    ├── srh_memory_write                 │
-│    ├── srh_memory_delete                │
-│    ├── srh_skill_search                 │
-│    ├── srh_reflect_now                  │
-│    ├── srh_palace_zones                 │
-│    ├── srh_palace_read_zone             │
-│    ├── srh_palace_recall                │
-│    └── srh_compile_profile              │
-├─────────────────────────────────────────┤
-│  Slash Commands (7)                     │
-│    ├── /memories                        │
-│    ├── /skills                          │
-│    ├── /pending-skills                  │
-│    ├── /approve-skill <id>              │
-│    ├── /reject-skill <id>               │
-│    ├── /reflect                         │
-│    └── /compile-profile                 │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                 Hermes Agent Session                  │
+├──────────────────────────────────────────────────────┤
+│  pre_llm_call hook                                    │
+│    ├── Inject palace index (zone map)                 │
+│    ├── Inject compiled profile                        │
+│    ├── Inject triggered/always skills                 │
+│    └── Trigger micro-reflection                       │
+├──────────────────────────────────────────────────────┤
+│  on_session_end hook                                  │
+│    └── Run full reflection                            │
+├──────────────────────────────────────────────────────┤
+│  Tools (9)                                            │
+│    ├── srh_memory_search                              │
+│    ├── srh_memory_write                               │
+│    ├── srh_memory_delete                              │
+│    ├── srh_skill_search                               │
+│    ├── srh_reflect_now                                │
+│    ├── srh_palace_zones                               │
+│    ├── srh_palace_read_zone                           │
+│    ├── srh_palace_recall                              │
+│    └── srh_compile_profile                            │
+├──────────────────────────────────────────────────────┤
+│  Slash Commands (7)                                   │
+│    ├── /memories                                      │
+│    ├── /skills                                        │
+│    ├── /pending-skills                                │
+│    ├── /approve-skill <id>                            │
+│    ├── /reject-skill <id>                             │
+│    ├── /reflect                                       │
+│    └── /compile-profile                               │
+├──────────────────────────────────────────────────────┤
+│  Dashboard API (FastAPI)                              │
+│    GET    /memories                    List all       │
+│    POST   /memories                    Create         │
+│    GET    /memories/{id}               Get one        │
+│    PUT    /memories/{id}               Update (atomic)│
+│    DELETE /memories/{id}               Delete         │
+│    POST   /memories/reorder            Reorder (rank) │
+│    GET    /zones                       List zones     │
+│    GET    /graph                       Memory graph   │
+│    GET    /skills                      Skill list     │
+│    GET    /reflections                 Reflection log │
+│    GET    /stats                       Aggregate stats│
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Performance
 
-### v0.5.0 Optimization Results (50 memories, 10 skills, TF-IDF only)
+### v0.6.1 (50 memories, 10 skills, TF-IDF only, palace mode)
 
-| Metric | v0.4.0 | v0.5.0 | Improvement | Mechanism |
+| Metric | v0.4.0 | v0.6.1 | Improvement | Mechanism |
 |--------|--------|--------|-------------|-----------|
-| Context Block (warm) | 1.74ms | 1.31ms | ↓ 25% | Write-on-change + event-driven index + SkillStore cache |
+| Context Block (warm) | 1.74ms | 1.31ms | ↓ 25% | Write-on-change + index cache |
 | Memory Write (agent perceived) | 11.69ms | 0.57ms | ↓ 95% | Async I/O (P2-2) |
 | Memory Delete | 10.68ms | 0.14ms | ↓ 99% | O(1) id→path index (P0-2) |
 | Token Estimation | 2.96ms | 0.6µs | ↓ 5000x | Byte-based fast estimation (P1-1) |
@@ -70,7 +84,53 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 
 > Full benchmark: `python bench_latency.py` (requires 50 test memories)
 
+## Dashboard Memory Manager
+
+The dashboard provides a full-featured UI for managing memories directly:
+
+| Feature | Description |
+|---------|-------------|
+| **Search** | Real-time filter by content or tags |
+| **Zone Filter** | Dropdown to show only memories from a specific zone |
+| **Sort** | By rank (default), date, confidence, or zone |
+| **Create** | `+ New Memory` button opens edit dialog |
+| **Edit** | ✏️ button to modify content, zone, confidence, tags, pinned status |
+| **Delete** | 🗑️ button with confirmation dialog |
+| **Reorder** | ↑↓ buttons to move memories — persists via explicit `rank` field |
+
+The dashboard communicates with MemoryStore through **atomic store methods** (`update()` and `reorder()`) that handle file I/O, cache invalidation, and index rebuilds in a single operation — preventing the cache inconsistency bugs common in earlier approaches.
+
+**API Endpoints (FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`):**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/memories` | List all active memories |
+| `POST` | `/memories` | Create new memory |
+| `GET` | `/memories/{id}` | Get single memory |
+| `PUT` | `/memories/{id}` | **Atomic update** (write-then-delete swap, cache + index) |
+| `DELETE` | `/memories/{id}` | Delete memory |
+| `POST` | `/memories/reorder` | **Atomic reorder** via explicit `rank` assignment |
+| `GET` | `/zones` | All zones with counts |
+| `GET` | `/graph` | Memory graph (nodes + edges) |
+| `GET` | `/skills` | All skills with metadata |
+| `GET` | `/reflections` | Recent reflection outcomes |
+| `GET` | `/stats` | Aggregate statistics (by scope, confidence, zone, tags) |
+
 ## Changelog
+
+### v0.6.1 — Atomic Store Refactor
+- **Atomic `MemoryStore.update()`**: Single method handles file write, cache invalidation, and index rebuild. Prevents 5 classes of cache inconsistency bugs.
+- **Atomic `MemoryStore.reorder()`**: Assigns explicit `rank` values instead of manipulating timestamps. Stable across filtering and sorting modes.
+- **`rank` field**: New `rank: int = 0` in `MemoryFrontmatter`. Higher rank = earlier in default sort. Backward compatible.
+- **Simplified HTTP layer**: `plugin_api.py` delegates all mutation logic to Store methods — HTTP layer only validates and translates errors.
+- **Post-review fixes**: Plugin registration API compat (`__HERMES_PLUGINS__.register`), atomic write via `os.replace()`, reflections field name fix, scope validation, zone list refresh.
+
+### v0.6.0 — Dashboard Memory Manager + Bug Fixes
+- **Dashboard Memory Manager**: Full CRUD UI with search, zone filter, sort controls, and reorder
+- **6 API endpoints**: Create, read, update, delete, reorder, zones
+- **Bug fix**: Duplicate memory scanning when `cwd` is `~` (user root == project root)
+- **Bug fix**: Python 3.11 `importlib.util` + `@dataclass` compatibility (full fallback chain)
+- Dashboard version: 1.0.0 → 1.1.1; path: `/memory-graph` → `/memory-manager`
 
 ### v0.5.0 — Performance Optimization Release
 - **P0-1**: Palace index write-on-change — skip disk write when content hasn't changed
@@ -90,6 +150,39 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - Always-active skills, supersedes chains
 - CJK-aware token estimation for context limits
 - Configurable caps (memory/skill/trigger limits)
+
+## Known Bugs & Fixes
+
+### Python 3.11 `importlib.util` + `@dataclass` Loading Failure (Fixed in v0.6.0)
+
+When Hermes loads the plugin via `importlib.util`, `@dataclass` definitions fail with `AttributeError: 'NoneType' object has no attribute '__dict__'`. **Fixed** with a full fallback chain that safely registers the module in `sys.modules` before any dataclass decorators execute:
+
+```python
+if __name__ != "__main__" and __name__ not in sys.modules:
+    mod_name = getattr(__spec__, "name", None) if "__spec__" in globals() else None
+    if mod_name is None:
+        mod_name = __name__
+    sys.modules[mod_name] = sys.modules.get(mod_name) or sys.modules.get(__name__) or types.ModuleType(mod_name)
+```
+
+### Duplicate Memory Scanning (Fixed in v0.6.0)
+
+When `cwd` is `~`, `_project_memories_dir()` resolved to the same path as `_user_memories_dir()`, causing every memory to appear twice. **Fixed** with path resolution comparison.
+
+### ONNX Fallback Cache Guard (Known, P3)
+
+When ONNX is unavailable and sentence-transformers fallback is used, `_onnx_tokenizer` is set to `None`, causing every call to re-enter the critical section and re-load the model (~5s each). Impact: only when embeddings are enabled and ONNX model is unavailable.
+
+## Data Safety Patterns
+
+### Write-Then-Delete Swap
+Mutations write the new file first, then delete the old file. If the write fails (disk full, permission error), the original file is preserved.
+
+### Atomic In-Place Writes (v0.6.1)
+When the new file path equals the old path (same-day updates, rank-only changes), the write goes to a `.tmp` file first, then `os.replace()` atomically swaps it — preventing file corruption on partial writes.
+
+### Cache Consistency
+`MemoryStore.update()` and `reorder()` call `_invalidate_cache()` before `_update_cache_for_put()` to prevent duplicate entries, and explicitly set `_index_dirty = True` + `_cached_index = ""` for same-path updates.
 
 ## Installation
 
@@ -121,15 +214,13 @@ EOF
 hermes restart
 ```
 
-### Optional: ONNX Model Setup (Recommended)
+### Optional: ONNX Model Setup
 
 For best performance, use the ONNX model instead of sentence-transformers fallback:
 
 ```bash
-# Install dependencies
 pip install onnxruntime tokenizers
 
-# Download and convert model
 python -c "
 from optimum.onnxruntime import ORTModelForFeatureExtraction
 from transformers import AutoTokenizer
@@ -147,29 +238,19 @@ print(f'Model saved to {output_dir}')
 "
 ```
 
-Or set a custom model directory via environment variable:
+Or set a custom model directory:
 
 ```bash
 export SRH_MODEL_DIR=/path/to/your/onnx-model
 ```
 
-### Alternative: sentence-transformers Fallback
-
-If you skip ONNX setup, the plugin automatically falls back to sentence-transformers:
-
-```bash
-pip install sentence-transformers
-```
-
 ## Configuration
-
-All configuration lives in `~/.hermes/config.yaml` under the `plugins.mem_reflection_hermes` section:
 
 ```yaml
 plugins:
   enabled:
     - mem-reflection-hermes
-  
+
   mem_reflection_hermes:
     # Core features
     embeddings: false              # Enable semantic search (default: true)
@@ -177,7 +258,7 @@ plugins:
     palace_mode: true              # Memory Palace navigation (default: true)
     profile_mode: false            # LLM-compiled profile injection (default: false)
     palace_instructions: true      # Inject palace usage instructions (default: true)
-    
+
     # Capacity limits
     active_memory_index_cap: 50    # Max memories in active index (default: 50)
     skill_index_cap: 50            # Max skills in index (default: 50)
@@ -203,13 +284,11 @@ Once enabled, the plugin works automatically:
 2. **Per Turn**: Injects layered context (palace/profile/pinned) into user message
 3. **Session End**: Runs full reflection, generates skill candidates
 
-### Manual Tools
+### Tools
 
 ```
-# Search memories
 srh_memory_search(query="Python error handling", k=5)
 
-# Write a memory
 srh_memory_write(
     body="Always use anyhow for app-level error handling",
     tags=["rust", "error-handling"],
@@ -217,13 +296,10 @@ srh_memory_write(
     pinned=true
 )
 
-# Delete a memory
 srh_memory_delete(memory_id="mem_abc123")
 
-# Search skills
 srh_skill_search(query="rust async", k=3)
 
-# Trigger manual reflection
 srh_reflect_now(mode="full")
 ```
 
@@ -253,16 +329,15 @@ tags:
   - python
   - rust
 zone: general
+rank: 0
 supersedes: []
 ---
 
 Always use anyhow for app-level error handling in Rust.
 ```
 
-This format is:
-- **Human-readable**: View and edit with any text editor
-- **Git-friendly**: Track changes over time
-- **Portable**: Easy to export/import
+**Fields:**
+- `rank` (v0.6.1+): Explicit ordering. Higher rank = appears earlier. Default 0. Modified via dashboard reorder or `MemoryStore.reorder()`.
 
 ## File Structure
 
@@ -279,10 +354,15 @@ This format is:
 │   └── memory-stats.jsonl           # Effectiveness tracking
 ├── plugins/
 │   └── mem-reflection-hermes/
-│       ├── __init__.py              # Main plugin (~3,400 lines)
+│       ├── __init__.py              # Main plugin (~3,500 lines)
 │       ├── plugin.yaml              # Plugin manifest
+│       ├── README.md                # This file
 │       ├── bench_latency.py         # Performance benchmark
-│       └── PERF_REPORT.md           # Optimization report
+│       ├── PERF_REPORT.md           # Optimization report
+│       └── dashboard/
+│           ├── plugin_api.py        # FastAPI routes (12 endpoints)
+│           ├── dist/index.js        # React frontend (Memory Manager)
+│           └── manifest.json         # Dashboard tab registration
 └── models/                          # ONNX model (optional)
     └── all-MiniLM-L6-v2-onnx/
         ├── model.onnx
@@ -291,33 +371,16 @@ This format is:
 
 ## Development
 
-### Running Tests
-
-```bash
-cd ~/.hermes/plugins/mem-reflection-hermes
-python -m pytest tests/ -v
-```
-
 ### Performance Benchmarking
 
 ```bash
-# Full latency benchmark
+cd ~/.hermes/plugins/mem-reflection-hermes
 python bench_latency.py
-
-# Profile a specific function
-python -c "
-import cProfile, pstats
-pr = cProfile.Profile()
-pr.enable()
-# ... run target code ...
-pr.disable()
-pstats.Stats(pr).sort_stats('cumtime').print_stats(20)
-"
 ```
 
 ## License
 
-MIT - Ported from [coder-brzhang/small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes)
+MIT — Ported from [coder-brzhang/small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes)
 
 ## Acknowledgments
 
