@@ -2,12 +2,15 @@
 
 Exposes endpoints for memory graph visualization, skill inventory,
 reflection history, and memory management (CRUD + reorder).
+
+All mutation operations are delegated to MemoryStore atomic methods
+(update/reorder) to ensure cache and index consistency.
 """
 
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -32,7 +35,7 @@ class MemoryCreate(BaseModel):
     confidence: str = "medium"
     tags: List[str] = []
     pinned: bool = False
-    scope: str = "user"
+    scope: Literal["user", "project"] = "user"
 
 
 class MemoryUpdate(BaseModel):
@@ -47,8 +50,24 @@ class MemoryReorder(BaseModel):
     memory_ids: List[str]  # New ordering of memory IDs
 
 
-class MemoryDelete(BaseModel):
-    id: str
+# ---------------------------------------------------------------------------
+# Helper: serialize LoadedMemory to dict
+# ---------------------------------------------------------------------------
+
+def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
+    return {
+        "id": m.id(),
+        "scope": m.scope,
+        "body": m.body,
+        "confidence": m.frontmatter.confidence,
+        "pinned": m.frontmatter.pinned,
+        "tags": m.frontmatter.tags,
+        "supersedes": m.frontmatter.supersedes,
+        "created": m.frontmatter.created,
+        "source": m.frontmatter.source,
+        "zone": m.frontmatter.zone,
+        "rank": m.frontmatter.rank,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -62,21 +81,7 @@ async def get_memories():
     memories = store.list_active()
     return {
         "count": len(memories),
-        "memories": [
-            {
-                "id": m.id(),
-                "scope": m.scope,
-                "body": m.body,
-                "confidence": m.frontmatter.confidence,
-                "pinned": m.frontmatter.pinned,
-                "tags": m.frontmatter.tags,
-                "supersedes": m.frontmatter.supersedes,
-                "created": m.frontmatter.created,
-                "source": m.frontmatter.source,
-                "zone": m.frontmatter.zone,
-            }
-            for m in memories
-        ],
+        "memories": [_memory_to_dict(m) for m in memories],
     }
 
 
@@ -207,7 +212,8 @@ async def get_stats():
 
 
 # ---------------------------------------------------------------------------
-# NEW: Memory Management endpoints (CRUD + reorder)
+# Memory Management endpoints (CRUD + reorder)
+# All mutations delegated to MemoryStore atomic methods.
 # ---------------------------------------------------------------------------
 
 @router.post("/memories")
@@ -234,68 +240,25 @@ async def get_memory(memory_id: str):
     mem = store.get(memory_id)
     if not mem:
         raise HTTPException(status_code=404, detail="Memory not found")
-    return {
-        "id": mem.id(),
-        "scope": mem.scope,
-        "body": mem.body,
-        "confidence": mem.frontmatter.confidence,
-        "pinned": mem.frontmatter.pinned,
-        "tags": mem.frontmatter.tags,
-        "supersedes": mem.frontmatter.supersedes,
-        "created": mem.frontmatter.created,
-        "source": mem.frontmatter.source,
-        "zone": mem.frontmatter.zone,
-    }
+    return _memory_to_dict(mem)
 
 
 @router.put("/memories/{memory_id}")
 async def update_memory(memory_id: str, payload: MemoryUpdate):
-    """Update an existing memory's content or metadata.
-
-    Uses write-then-delete swap to avoid data loss on write failure.
-    Re-indexes embedding after successful rewrite.
-    """
+    """Update an existing memory's content or metadata."""
     store = srh._get_mem_store()
-    mem = store.get(memory_id)
-    if not mem:
-        raise HTTPException(status_code=404, detail="Memory not found")
-
-    # Build updated frontmatter
-    fm = srh.MemoryFrontmatter(
-        id=memory_id,
-        created=mem.frontmatter.created,
-        source=mem.frontmatter.source,
-        confidence=payload.confidence or mem.frontmatter.confidence,
-        pinned=payload.pinned if payload.pinned is not None else mem.frontmatter.pinned,
-        tags=payload.tags if payload.tags is not None else mem.frontmatter.tags,
-        supersedes=mem.frontmatter.supersedes,
-        zone=payload.zone or mem.frontmatter.zone,
-    )
-
-    body = payload.body if payload.body is not None else mem.body
-
-    # Write new file FIRST (preserves data on write failure)
-    new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
-    srh._write_memory(new_path, fm, body)
-
-    # Delete old file only after successful write AND only if path changed
-    if new_path != mem.source_path:
-        store.delete(mem.scope, memory_id)
-
-    # Invalidate cache to remove stale entry, then re-add updated memory
-    store._invalidate_cache()
-    store._id_to_path[fm.id] = new_path
-    store._update_cache_for_put(mem.scope, fm, body, new_path)
-    # Force palace index dirty even for same-path updates (cache was invalidated)
-    store._index_dirty = True
-    store._cached_index = ""
-    store._try_index(fm.id, body)
-
-    return {
-        "success": True,
-        "id": memory_id,
-        "message": "Memory updated",
-    }
+    try:
+        updated = store.update(
+            memory_id,
+            body=payload.body,
+            zone=payload.zone,
+            confidence=payload.confidence,
+            tags=payload.tags,
+            pinned=payload.pinned,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"success": True, "id": memory_id, "memory": _memory_to_dict(updated)}
 
 
 @router.delete("/memories/{memory_id}")
@@ -315,55 +278,13 @@ async def delete_memory(memory_id: str):
 
 @router.post("/memories/reorder")
 async def reorder_memories(payload: MemoryReorder):
-    """Reorder memories by rewriting their created timestamps.
+    """Reorder memories by assigning explicit rank values.
 
     The new order is determined by the provided memory_ids list.
-    Each memory gets a new created timestamp based on its position,
-    preserving the relative ordering. Uses timedelta to avoid microsecond overflow.
+    Earlier items get higher rank and appear first in the default sort.
     """
-    from datetime import datetime, timezone, timedelta
-
     store = srh._get_mem_store()
-    now = datetime.now(timezone.utc)
-
-    updated = []
-    for i, mem_id in enumerate(payload.memory_ids):
-        mem = store.get(mem_id)
-        if not mem:
-            continue
-
-        # Generate a new timestamp: earlier items in the submitted list get LATER
-        # timestamps so they appear first when sorted by created descending.
-        # e.g. list[0] gets now+100ms, list[-1] gets now+0ms
-        offset_ms = (len(payload.memory_ids) - 1 - i) * 100
-        new_created = (now + timedelta(milliseconds=offset_ms)).isoformat()
-
-        fm = srh.MemoryFrontmatter(
-            id=mem_id,
-            created=new_created,
-            source=mem.frontmatter.source,
-            confidence=mem.frontmatter.confidence,
-            pinned=mem.frontmatter.pinned,
-            tags=mem.frontmatter.tags,
-            supersedes=mem.frontmatter.supersedes,
-            zone=mem.frontmatter.zone,
-        )
-
-        # Write new file FIRST, then delete old only if path changed
-        new_path = store._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
-        srh._write_memory(new_path, fm, mem.body)
-        if new_path != mem.source_path:
-            store.delete(mem.scope, mem_id)
-
-        # Update cache and re-index embedding
-        store._id_to_path[fm.id] = new_path
-        store._update_cache_for_put(mem.scope, fm, mem.body, new_path)
-        store._try_index(fm.id, mem.body)
-        updated.append(mem_id)
-
-    # Invalidate cache to ensure fresh ordering
-    store._invalidate_cache()
-
+    updated = store.reorder(payload.memory_ids)
     return {"success": True, "updated": updated, "count": len(updated)}
 
 

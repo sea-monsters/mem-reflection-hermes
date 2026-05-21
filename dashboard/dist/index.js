@@ -28,16 +28,17 @@
 
   function useZones() {
     const [zones, setZones] = React.useState([]);
-    React.useEffect(() => {
+    const fetchZones = React.useCallback(() => {
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/zones")
         .then(data => setZones(data.zones || []))
         .catch(console.error);
     }, []);
-    return zones;
+    React.useEffect(() => { fetchZones(); }, [fetchZones]);
+    return [zones, fetchZones];
   }
 
   // ---------------------------------------------------------------------------
-  // Memory Manager Component (NEW)
+  // Memory Manager Component
   // ---------------------------------------------------------------------------
 
   function MemoryManager({ memories, zones, onRefresh, onMutate }) {
@@ -45,7 +46,7 @@
     const [creating, setCreating] = React.useState(false);
     const [searchQuery, setSearchQuery] = React.useState("");
     const [zoneFilter, setZoneFilter] = React.useState("all");
-    const [sortBy, setSortBy] = React.useState("created"); // created | confidence | zone
+    const [sortBy, setSortBy] = React.useState("rank"); // rank | created | confidence | zone
 
     const filtered = React.useMemo(() => {
       let list = [...memories];
@@ -56,7 +57,14 @@
       if (zoneFilter !== "all") {
         list = list.filter(m => m.zone === zoneFilter);
       }
-      if (sortBy === "created") {
+      if (sortBy === "rank") {
+        // Primary: rank desc (higher rank = earlier), Secondary: created desc
+        list.sort((a, b) => {
+          const rankDiff = (b.rank || 0) - (a.rank || 0);
+          if (rankDiff !== 0) return rankDiff;
+          return new Date(b.created) - new Date(a.created);
+        });
+      } else if (sortBy === "created") {
         list.sort((a, b) => new Date(b.created) - new Date(a.created));
       } else if (sortBy === "confidence") {
         const order = { high: 0, medium: 1, low: 2 };
@@ -123,13 +131,13 @@
     };
 
     const moveItem = (index, direction) => {
-      // Reorder must operate on the full canonical list in created-date mode
+      // Reorder must operate on the full canonical list in rank sort mode
       if (searchQuery || zoneFilter !== "all") {
         alert("Please clear search and zone filters before reordering.");
         return;
       }
-      if (sortBy !== "created") {
-        alert("Please switch to 'Sort by Date' mode before reordering.");
+      if (sortBy !== "rank") {
+        alert("Please switch to 'Sort by Rank' mode before reordering.");
         return;
       }
       const newList = [...filtered];
@@ -159,6 +167,7 @@
           value: sortBy,
           onValueChange: setSortBy,
         },
+          React.createElement("option", { value: "rank" }, "Sort by Rank"),
           React.createElement("option", { value: "created" }, "Sort by Date"),
           React.createElement("option", { value: "confidence" }, "Sort by Confidence"),
           React.createElement("option", { value: "zone" }, "Sort by Zone")
@@ -183,6 +192,7 @@
                       m.pinned && React.createElement(Badge, { variant: "default" }, "📌 Pinned"),
                       React.createElement(Badge, { variant: "outline" }, m.confidence),
                       React.createElement(Badge, { variant: "secondary" }, m.zone),
+                      (m.rank || 0) > 0 && React.createElement(Badge, { variant: "outline", className: "text-xs" }, `⭐ ${m.rank}`),
                       React.createElement("span", { className: "text-xs text-muted-foreground" }, m.scope),
                       m.tags.map(t => React.createElement(Badge, { key: t, variant: "outline", className: "text-xs" }, t))
                     ),
@@ -429,9 +439,9 @@
     const [reflections, setReflections] = React.useState([]);
     const [activeTab, setActiveTab] = React.useState("manager");
     const { memories, refresh } = useMemories();
-    const zones = useZones();
+    const [zones, refreshZones] = useZones();
 
-    // Global refresh: re-fetches graph, stats, reflections, and memories
+    // Global refresh: re-fetches graph, stats, reflections, zones, and memories
     const refreshAll = React.useCallback(() => {
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/graph")
         .then(setGraph)
@@ -442,8 +452,9 @@
       SDK.fetchJSON("/api/plugins/mem-reflection-hermes/reflections")
         .then(r => setReflections(r.reflections || []))
         .catch(console.error);
+      refreshZones();
       refresh();
-    }, [refresh]);
+    }, [refresh, refreshZones]);
 
     React.useEffect(() => {
       refreshAll();
@@ -461,7 +472,7 @@
           React.createElement(TabsTrigger, { value: "reflections" }, "💭 Reflections")
         ),
 
-        // Memory Manager tab (NEW)
+        // Memory Manager tab
         activeTab === "manager" && React.createElement("div", { className: "mt-4" },
           React.createElement(MemoryManager, { memories, zones, onRefresh: refresh, onMutate: refreshAll })
         ),
@@ -506,15 +517,16 @@
 
         // Reflections tab
         activeTab === "reflections" && React.createElement("div", { className: "mt-4 space-y-2" },
-          reflections.length === 0 && React.createElement("p", { className: "text-muted-foreground" }, "No reflections yet."),
-          reflections.map((r, i) =>
-            React.createElement(Card, { key: i },
+          reflections.map(r =>
+            React.createElement(Card, { key: r.id || r.timestamp },
               React.createElement(CardContent, { className: "py-3" },
                 React.createElement("div", { className: "flex items-center gap-2 mb-1" },
-                  React.createElement(Badge, { variant: "outline" }, r.mode || "unknown"),
-                  React.createElement("span", { className: "text-xs text-muted-foreground" }, r.timestamp)
+                  React.createElement(Badge, { variant: "outline" }, r.mode),
+                  React.createElement("span", { className: "text-xs text-muted-foreground" },
+                    r.timestamp ? new Date(r.timestamp).toLocaleString() : ""
+                  )
                 ),
-                React.createElement("p", { className: "text-sm" }, r.summary || "No summary")
+                React.createElement("p", { className: "text-sm" }, r.summary || "")
               )
             )
           )
@@ -523,5 +535,10 @@
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // Plugin registration
+  // ---------------------------------------------------------------------------
+
   window.__HERMES_PLUGINS__.register("mem-reflection-hermes", MemoryGraphPage);
+
 })();
