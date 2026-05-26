@@ -1678,7 +1678,7 @@ def _build_context_block(query: str = "") -> str:
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-def _tool_srh_memory_search(args: dict) -> str:
+def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     query = args.get("query", "")
     k = int(args.get("k", 5))
     zone_filter = args.get("zone")  # Optional zone scope
@@ -1702,7 +1702,7 @@ def _tool_srh_memory_search(args: dict) -> str:
     return json.dumps({"results": out}, ensure_ascii=False)
 
 
-def _tool_srh_memory_write(args: dict) -> str:
+def _tool_srh_memory_write(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     body = args.get("body", "").strip()
     if not body:
@@ -1735,7 +1735,7 @@ def _tool_srh_memory_write(args: dict) -> str:
     })
 
 
-def _tool_srh_memory_delete(args: dict) -> str:
+def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     mem_id = args.get("id", "")
     scope = args.get("scope", "user")
@@ -1745,7 +1745,7 @@ def _tool_srh_memory_delete(args: dict) -> str:
     return json.dumps({"success": ok, "id": mem_id})
 
 
-def _tool_srh_skill_search(args: dict) -> str:
+def _tool_srh_skill_search(args: dict, **kwargs) -> str:
     query = args.get("query", "")
     k = int(args.get("k", 3))
     skill_store = _get_skill_store()
@@ -1765,7 +1765,7 @@ def _tool_srh_skill_search(args: dict) -> str:
 # Palace tools (zone-based memory navigation)
 # ---------------------------------------------------------------------------
 
-def _tool_srh_palace_zones(args: dict) -> str:
+def _tool_srh_palace_zones(args: dict, **kwargs) -> str:
     """List all Memory Palace zones with memory counts."""
     mem_store = _get_mem_store()
     groups = mem_store.group_by_zone()
@@ -1779,7 +1779,7 @@ def _tool_srh_palace_zones(args: dict) -> str:
     return json.dumps({"zones": zones, "total": total}, ensure_ascii=False)
 
 
-def _tool_srh_palace_read_zone(args: dict) -> str:
+def _tool_srh_palace_read_zone(args: dict, **kwargs) -> str:
     """Load all memories from a specific zone. Returns cached summary if available."""
     zone = _normalize_zone(args.get("zone"))
     mem_store = _get_mem_store()
@@ -1824,7 +1824,7 @@ def _tool_srh_palace_read_zone(args: dict) -> str:
     }, ensure_ascii=False)
 
 
-def _tool_srh_palace_recall(args: dict) -> str:
+def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     """Search memories by topic, optionally scoped to a zone."""
     query = args.get("topic", "")
     if not query:
@@ -1865,7 +1865,7 @@ def _tool_srh_palace_recall(args: dict) -> str:
     return json.dumps({"results": out}, ensure_ascii=False)
 
 
-def _tool_srh_reflect_now(args: dict) -> str:
+def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
     """Trigger a full reflection on the current session messages."""
     ctx = args.get("ctx")
     messages = args.get("messages", [])
@@ -2029,7 +2029,7 @@ def _build_compile_zone_prompt(zone: str, memories: List[LoadedMemory]) -> str:
     return buf
 
 
-def _tool_srh_compile_profile(args: dict) -> str:
+def _tool_srh_compile_profile(args: dict, **kwargs) -> str:
     """Compile memories into a structured profile via LLM."""
     ctx = args.get("ctx")
     if not ctx:
