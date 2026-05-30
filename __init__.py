@@ -2410,13 +2410,13 @@ def register(ctx) -> None:
         # --- tool: srh_associate ---
         MAX_ASSOCIATION_IDS = 20
 
-        def _graph_associate_h(ctx, args, **kw):
+        def _graph_associate_h(args: dict, **kwargs) -> str:
             gm = _ensure_gm()
             mids = args.get("memory_ids", [])[:MAX_ASSOCIATION_IDS]
             ctx_str = args.get("context", "")
             rel = args.get("relation", "co_occurs")
             result = gm.associate_memories(mids, ctx_str, rel)
-            return result
+            return json.dumps(result)
 
         ctx.register_tool(
             name="srh_associate",
@@ -2450,14 +2450,14 @@ def register(ctx) -> None:
         )
 
         # --- tool: srh_graph_retrieve ---
-        def _graph_retrieve_h(ctx, args, **kw):
+        def _graph_retrieve_h(args: dict, **kwargs) -> str:
             gm = _ensure_gm()
             mids = args.get("memory_ids", [])[:20]
             task_type = args.get("task_type", "reasoning")
             max_res = min(args.get("max_results", 10), 100)
             tier = args.get("tier", "list")
             results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
-            return {"results": results, "count": len(results), "seed_ids": mids, "tier": tier}
+            return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier})
 
         ctx.register_tool(
             name="srh_graph_retrieve",
@@ -2504,9 +2504,9 @@ def register(ctx) -> None:
         )
 
         # --- tool: srh_graph_stats ---
-        def _graph_stats_h(ctx, args, **kw):
+        def _graph_stats_h(args: dict, **kwargs) -> str:
             gm = _ensure_gm()
-            return gm.get_stats()
+            return json.dumps(gm.get_stats())
 
         ctx.register_tool(
             name="srh_graph_stats",
