@@ -2533,6 +2533,12 @@ def register(ctx) -> None:
                 result = context.get("result", {})
 
                 if tool_name == "srh_memory_write":
+                    # result may be raw JSON string (srh_memory_write returns json.dumps)
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except json.JSONDecodeError:
+                            result = {}
                     memory_id = result.get("id") or args.get("body", "")[:32]
                     zone = args.get("zone", "general")
                     gm.store.ensure_meta(memory_id, zone=zone)
