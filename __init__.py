@@ -194,6 +194,9 @@ Your persistent memory is organized in a Memory Palace with zones.
 - Use `srh_palace_recall` to search by topic, optionally scoped to a zone
 - Use `srh_memory_write` (with zone parameter) to persist new learnings
 - Use `srh_memory_delete` to remove outdated memories
+Do NOT save task progress, session outcomes, or temporary TODO state here.
+Session summaries go to `episode` zone. User identity/preferences go to `core`.
+Current work focus goes to `work`. Everything else goes to `general`.
 Don't guess about preferences or conventions — load the relevant zone first."""
 
 
@@ -3336,6 +3339,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
+                zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
             scope = cand.get("scope", "user")
@@ -3441,6 +3445,7 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             source="micro_reflection",
             confidence=best["confidence"],
             tags=tags,
+            zone="episode",
         )
         fm.supersedes = supersedes
         path = mem_store.put("user", fm, best["text"])
@@ -3656,6 +3661,7 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
+                zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
             scope = cand.get("scope", "user")
