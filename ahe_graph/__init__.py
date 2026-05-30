@@ -605,6 +605,7 @@ class GraphMemoryManager:
     """
 
     def __init__(self, db_dir: Path):
+        db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = db_dir / "ahe_graph_memory.db"
         self.store = GraphStore(self.db_path)
         self.associator = AssociationEngine(self.store)
