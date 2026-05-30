@@ -2373,21 +2373,23 @@ def register(ctx) -> None:
 
     # ── ahe_graph integration (v0.6.1+) ───────────────────────
     try:
-        from .ahe_graph import get_graph_manager as _get_gm
-    except ImportError:
-        # Standalone plugin load: __package__ may be empty, so relative
-        # import fails. Fallback to importlib-based absolute load.
-        import importlib.util as _iutil
-        import sys as _sys
-        _ahe_path = str(Path(__file__).parent / "ahe_graph" / "__init__.py")
-        _ahe_spec = _iutil.spec_from_file_location(
-            "mem_reflection_hermes.ahe_graph", _ahe_path
-        )
-        _ahe_mod = _iutil.module_from_spec(_ahe_spec)
-        _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
-        _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
-        _get_gm = _ahe_mod.get_graph_manager
+        try:
+            from .ahe_graph import get_graph_manager as _get_gm
+        except ImportError:
+            # Standalone plugin load: __package__ may be empty, so relative
+            # import fails. Fallback to importlib-based absolute load.
+            import importlib.util as _iutil
+            import sys as _sys
+            _ahe_path = str(Path(__file__).parent / "ahe_graph" / "__init__.py")
+            _ahe_spec = _iutil.spec_from_file_location(
+                "mem_reflection_hermes.ahe_graph", _ahe_path
+            )
+            _ahe_mod = _iutil.module_from_spec(_ahe_spec)
+            _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
+            _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
+            _get_gm = _ahe_mod.get_graph_manager
 
+        # ── Common graph setup (runs regardless of import path) ──
         # Lazy-init on first use
         _graph_db_dir = Path(ctx.hermes_home) / "plugins" / "mem-reflection-hermes"
         # Set module-level globals so _on_session_end and _get_graph_neighbors
