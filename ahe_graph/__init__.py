@@ -549,7 +549,7 @@ class GraphMemoryManager:
     def record_access(self, memory_id: str, context: str = ""):
         """Record memory access in graph metadata."""
         self.store.ensure_meta(memory_id)
-        self.store.log_access(memory_id, context)
+        self.store.record_access(memory_id, context)
 
     def associate_memories(self, memory_ids: List[str],
                            context: str = "",
@@ -558,7 +558,7 @@ class GraphMemoryManager:
         # Ensure all have metadata
         for mid in memory_ids:
             self.store.ensure_meta(mid)
-            self.store.log_access(mid, context)
+            self.store.record_access(mid, context)
 
         if relation == "co_occurs":
             count = self.associator.on_co_occurrence(memory_ids, context)

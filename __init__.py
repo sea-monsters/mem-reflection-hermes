@@ -2518,19 +2518,20 @@ def register(ctx) -> None:
                     memory_id = result.get("id") or args.get("body", "")[:32]
                     zone = args.get("zone", "general")
                     gm.store.ensure_meta(memory_id, zone=zone)
-                    gm.store.log_access(memory_id)
+                    gm.store.record_access(memory_id)
                 elif tool_name == "srh_memory_delete":
-                    # Clean up graph metadata and edges
-                    old_text = args.get("old_text", "")
-                    gm.store._connect().execute(
-                        "DELETE FROM graph_memory_meta WHERE id LIKE ?",
-                        (f"%{old_text[:20]}%",)
-                    )
-                    gm.store._connect().execute(
-                        "DELETE FROM graph_edges WHERE source_id LIKE ? OR target_id LIKE ?",
-                        (f"%{old_text[:20]}%", f"%{old_text[:20]}%")
-                    )
-                    gm.store._connect().commit()
+                    # Clean up graph metadata and edges for this memory
+                    mem_id = args.get("id", "")
+                    if mem_id:
+                        gm.store._connect().execute(
+                            "DELETE FROM graph_memory_meta WHERE id=?",
+                            (mem_id,)
+                        )
+                        gm.store._connect().execute(
+                            "DELETE FROM graph_edges WHERE source_id=? OR target_id=?",
+                            (mem_id, mem_id)
+                        )
+                        gm.store._connect().commit()
             except Exception as e:
                 logger.debug("ahe_graph auto-associate: %s", e)
             return context
@@ -2544,7 +2545,7 @@ def register(ctx) -> None:
             cmd = parts[0] if parts else "stats"
 
             if cmd == "stats":
-                s = gm.get_stats()
+                s = gm.get_stats(tier="detail")
                 return (
                     f"📊 **Graph Memory Stats**\n"
                     f"- Nodes: {s['node_count']}\n"
