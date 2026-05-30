@@ -1706,7 +1706,7 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     # ── Graph-enhanced expansion ─────────────────────────
     # Enrich search results with graph-neighbor memories.
     return json.dumps(
-        _enrich_with_graph([m.id() for m in results], out, k),
+        _enrich_with_graph([m.id() for m in results], out, k, zone_filter=_normalize_zone(zone_filter) if zone_filter else None),
         ensure_ascii=False,
     )
 
@@ -1875,7 +1875,7 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     # Enrich palace recall results with graph-neighbor memories.
     result_mids = [m.id() for m in results]
     return json.dumps(
-        _enrich_with_graph(result_mids, out, k),
+        _enrich_with_graph(result_mids, out, k, zone_filter=zone),
         ensure_ascii=False,
     )
 
@@ -2539,7 +2539,12 @@ def register(ctx) -> None:
                             result = json.loads(result)
                         except json.JSONDecodeError:
                             result = {}
-                    memory_id = result.get("id") or args.get("body", "")[:32]
+                    # Guard: only create graph metadata for successful writes
+                    if not result.get("success") and not result.get("id"):
+                        return context
+                    memory_id = result.get("id")
+                    if not memory_id:
+                        return context
                     zone = args.get("zone", "general")
                     gm.store.ensure_meta(memory_id, zone=zone)
                     gm.store.record_access(memory_id)
@@ -2620,10 +2625,12 @@ def _get_graph_mgr():
 
 # ── Graph neighbor helper (used by search/palace tools) ───────────────────
 
-def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tuple[str, float]]:
+def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5,
+                         zone_filter: Optional[str] = None) -> List[Tuple[str, float]]:
     """Look up graph neighbors for the given memory IDs.
 
     Returns deduplicated (memory_id, weight) pairs, sorted by weight descending.
+    If zone_filter is provided, only returns neighbors whose zone matches.
     Gracefully returns empty list if ahe_graph is not available or has no data.
     """
     try:
@@ -2647,6 +2654,14 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tu
         # Filter out seed IDs (prevent self-return)
         seed_set = set(memory_ids)
         deduped = [(mid, w) for mid, w in seen.items() if mid not in seed_set]
+        # Apply zone filter if specified (look up each neighbor's zone)
+        if zone_filter:
+            filtered = []
+            for mid, w in deduped:
+                meta = gm.store.get_meta(mid)
+                if meta and meta.get("zone") == zone_filter:
+                    filtered.append((mid, w))
+            deduped = filtered
         deduped.sort(key=lambda x: -x[1])
         return deduped[:max_results]
     except Exception as e:
@@ -2654,12 +2669,14 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tu
         return []
 
 
-def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int) -> dict:
+def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int,
+                       zone_filter: Optional[str] = None) -> dict:
     """Enrich search results with graph-neighbor memories (shared helper).
 
     Always returns a dict with "results" and "graph_expanded" for uniform schema.
+    If zone_filter is provided, graph neighbors are restricted to that zone.
     """
-    graph_expanded = _get_graph_neighbors(result_ids, max_results=k)
+    graph_expanded = _get_graph_neighbors(result_ids, max_results=k, zone_filter=zone_filter)
     for neigh_id, _ in graph_expanded:
         record_memory_stat(neigh_id, "accessed")
     return {
