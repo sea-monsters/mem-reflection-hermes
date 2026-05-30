@@ -1,6 +1,6 @@
 name: mem-reflection-hermes
-version: 0.6.1
-description: "Self-evolving memory & reflection system ported from small-rust-hermes. Memory Palace with zone-based organization, effectiveness tracking with decay, palace navigation tools, TF-IDF search with effectiveness boosting, LLM-compiled profile generation, always-active skills, supersedes chains, micro/full reflection pipelines. v0.6: Dashboard Memory Manager with full CRUD + reorder, atomic store operations, explicit rank field, Python 3.11 importlib fix, duplicate scanning fix. v0.5: P0-P2 performance optimizations."
+version: 0.7.0
+description: "Self-evolving memory & reflection system ported from small-rust-hermes. Memory Palace with zone-based organization, effectiveness tracking with decay, palace navigation tools, TF-IDF search with effectiveness boosting, LLM-compiled profile generation, always-active skills, supersedes chains, micro/full reflection pipelines, ahe_graph graph memory integration. v0.7: ahe_graph deep integration (srh_associate, srh_graph_retrieve, srh_graph_stats), graph-enhanced search/recall, session-end decay. v0.6: Dashboard Memory Manager with full CRUD + reorder, atomic store operations, explicit rank field, Python 3.11 importlib fix, duplicate scanning fix. v0.5: P0-P2 performance optimizations."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:
   - srh_memory_search
@@ -12,8 +12,12 @@ provides_tools:
   - srh_palace_read_zone
   - srh_palace_recall
   - srh_compile_profile
+  - srh_associate
+  - srh_graph_retrieve
+  - srh_graph_stats
 provides_hooks:
   - on_session_start
   - on_session_end
   - pre_llm_call
+  - post_tool_call
 kind: standalone

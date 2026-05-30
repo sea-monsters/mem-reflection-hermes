@@ -194,6 +194,9 @@ Your persistent memory is organized in a Memory Palace with zones.
 - Use `srh_palace_recall` to search by topic, optionally scoped to a zone
 - Use `srh_memory_write` (with zone parameter) to persist new learnings
 - Use `srh_memory_delete` to remove outdated memories
+Do NOT save task progress, session outcomes, or temporary TODO state here.
+Session summaries go to `episode` zone. User identity/preferences go to `core`.
+Current work focus goes to `work`. Everything else goes to `general`.
 Don't guess about preferences or conventions — load the relevant zone first."""
 
 
@@ -1699,7 +1702,13 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
             "body": m.body[:500],
         })
         record_memory_stat(m.id(), "accessed")
-    return json.dumps({"results": out}, ensure_ascii=False)
+
+    # ── Graph-enhanced expansion ─────────────────────────
+    # Enrich search results with graph-neighbor memories.
+    return json.dumps(
+        _enrich_with_graph([m.id() for m in results], out, k, zone_filter=_normalize_zone(zone_filter) if zone_filter else None),
+        ensure_ascii=False,
+    )
 
 
 def _tool_srh_memory_write(args: dict, **kwargs) -> str:
@@ -1862,7 +1871,13 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
             "tags": m.frontmatter.tags,
             "body": m.body[:500],
         })
-    return json.dumps({"results": out}, ensure_ascii=False)
+    # ── Graph-enhanced expansion ─────────────────────────
+    # Enrich palace recall results with graph-neighbor memories.
+    result_mids = [m.id() for m in results]
+    return json.dumps(
+        _enrich_with_graph(result_mids, out, k, zone_filter=zone),
+        ensure_ascii=False,
+    )
 
 
 def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
@@ -2051,8 +2066,20 @@ def _on_session_start(**kwargs) -> None:
     logger.debug("mem-reflection-hermes: session started")
 
 
+
 def _on_session_end(**kwargs) -> None:
     messages = kwargs.get("messages", [])
+
+    # ── Periodic graph decay ──────────────────────────────
+    # Run Ebbinghaus decay on graph edges every session end so weights
+    # naturally fade for connections that are no longer reinforced.
+    try:
+        gm = _get_graph_mgr()
+        if gm is not None:
+            gm.run_decay()
+    except Exception as e:
+        logger.warning("ahe_graph decay skipped: %s", e)
+
     if not messages:
         return
     # Attempt full reflection via LLM if available
@@ -2131,7 +2158,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "k": {"type": "integer", "description": "Max results", "default": 5},
+                    "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
                     "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
                 },
                 "required": ["query"],
@@ -2153,9 +2180,9 @@ def register(ctx) -> None:
                     "body": {"type": "string", "description": "Memory content (one short fact)"},
                     "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "tags": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 20},
                     "pinned": {"type": "boolean", "default": False},
-                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 5},
                     "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
                 },
                 "required": ["body"],
@@ -2194,7 +2221,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 3},
+                    "k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 100},
                 },
                 "required": ["query"],
             },
@@ -2263,7 +2290,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "What to recall (e.g. 'editor preference', 'error handling convention')"},
-                    "limit": {"type": "integer", "description": "Max results", "default": 5},
+                    "limit": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 50},
                     "zone": {"type": "string", "description": "Optional: restrict to a specific zone"},
                 },
                 "required": ["topic"],
@@ -2344,10 +2371,320 @@ def register(ctx) -> None:
 
     logger.info("mem-reflection-hermes plugin registered")
 
+    # ── ahe_graph integration (v0.6.1+) ───────────────────────
+    try:
+        try:
+            from .ahe_graph import get_graph_manager as _get_gm
+        except ImportError:
+            # Standalone plugin load: __package__ may be empty, so relative
+            # import fails. Fallback to importlib-based absolute load.
+            import importlib.util as _iutil
+            import sys as _sys
+            _ahe_path = str(Path(__file__).parent / "ahe_graph" / "__init__.py")
+            _ahe_spec = _iutil.spec_from_file_location(
+                "mem_reflection_hermes.ahe_graph", _ahe_path
+            )
+            _ahe_mod = _iutil.module_from_spec(_ahe_spec)
+            _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
+            _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
+            _get_gm = _ahe_mod.get_graph_manager
 
-# ---------------------------------------------------------------------------
-# Slash commands
-# ---------------------------------------------------------------------------
+        # ── Common graph setup (runs regardless of import path) ──
+        # Lazy-init on first use
+        _graph_db_dir = Path(ctx.hermes_home) / "plugins" / "mem-reflection-hermes"
+        # Set module-level globals so _on_session_end and _get_graph_neighbors
+        # use the same singleton (P1-2, P2-1)
+        global _gm_getter_func, _gm_getter_path
+        _gm_getter_func = _get_gm
+        _gm_getter_path = _graph_db_dir
+        _gm_ref = {"instance": None}
+        _gm_lock = threading.Lock()
+
+        def _ensure_gm():
+            if _gm_ref["instance"] is None:
+                with _gm_lock:
+                    if _gm_ref["instance"] is None:
+                        _gm_ref["instance"] = _get_gm(_graph_db_dir)
+            return _gm_ref["instance"]
+
+        # --- tool: srh_associate ---
+        MAX_ASSOCIATION_IDS = 20
+
+        def _graph_associate_h(args: dict, **kwargs) -> str:
+            gm = _ensure_gm()
+            mids = args.get("memory_ids", [])[:MAX_ASSOCIATION_IDS]
+            ctx_str = args.get("context", "")
+            rel = args.get("relation", "co_occurs")
+            result = gm.associate_memories(mids, ctx_str, rel)
+            return json.dumps(result)
+
+        ctx.register_tool(
+            name="srh_associate",
+            toolset="mem_reflection_hermes",
+            schema={
+                "name": "srh_associate",
+                "description": "Create graph associations between memories. Records Hebbian co-occurrence edges so related memories activate each other during retrieval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of memory IDs to associate (max 20)",
+                            "minItems": 2,
+                            "maxItems": MAX_ASSOCIATION_IDS,
+                        },
+                        "relation": {
+                            "type": "string",
+                            "enum": ["co_occurs", "co_used_in_task"],
+                            "description": "Relation type: co_occurs (stronger) or co_used_in_task (weaker)",
+                            "default": "co_occurs",
+                        },
+                    },
+                    "required": ["memory_ids"],
+                },
+            },
+            handler=_graph_associate_h,
+            description="Associate memories via graph edges",
+            emoji="🔗",
+        )
+
+        # --- tool: srh_graph_retrieve ---
+        def _graph_retrieve_h(args: dict, **kwargs) -> str:
+            gm = _ensure_gm()
+            mids = args.get("memory_ids", [])[:20]
+            task_type = args.get("task_type", "reasoning")
+            max_res = min(args.get("max_results", 10), 100)
+            tier = args.get("tier", "list")
+            results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
+            return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier})
+
+        ctx.register_tool(
+            name="srh_graph_retrieve",
+            toolset="mem_reflection_hermes",
+            schema={
+                "name": "srh_graph_retrieve",
+                "description": "Retrieve graph-related memories via activation propagation. Given seed memory IDs, finds connected memories through graph edges with Hebbian weights. Progressive tiers: tier='count' (minimal), 'list' (summary, default), 'detail' (full with depth).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Seed memory IDs to start graph traversal from (max 20)",
+                            "minItems": 1,
+                            "maxItems": 20,
+                        },
+                        "task_type": {
+                            "type": "string",
+                            "enum": ["factual", "reasoning", "skill", "recent", "exploration", "personalized"],
+                            "description": "Retrieval strategy type",
+                            "default": "reasoning",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Max results to return",
+                            "default": 10,
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                        "tier": {
+                            "type": "string",
+                            "enum": ["count", "list", "detail"],
+                            "description": "Progressive disclosure tier: 'count' = minimal, 'list' = summary (default), 'detail' = full propagation info",
+                            "default": "list",
+                        },
+                    },
+                    "required": ["memory_ids"],
+                },
+            },
+            handler=_graph_retrieve_h,
+            description="Retrieve graph-related memories",
+            emoji="🕸️",
+        )
+
+        # --- tool: srh_graph_stats ---
+        def _graph_stats_h(args: dict, **kwargs) -> str:
+            gm = _ensure_gm()
+            return json.dumps(gm.get_stats())
+
+        ctx.register_tool(
+            name="srh_graph_stats",
+            toolset="mem_reflection_hermes",
+            schema={
+                "name": "srh_graph_stats",
+                "description": "Get graph memory statistics: node count, edge count, average edge weight, database path.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=_graph_stats_h,
+            description="Get graph memory statistics",
+            emoji="📊",
+        )
+
+        # --- hook: auto-associate on memory write ---
+        def _post_tool_associate(ctx_hook, context: dict) -> dict:
+            try:
+                tool_name = context.get("tool_name", "")
+                if tool_name not in ("srh_memory_write", "srh_memory_delete"):
+                    return context
+
+                gm = _ensure_gm()
+                args = context.get("tool_args", {})
+                result = context.get("result", {})
+
+                if tool_name == "srh_memory_write":
+                    # result may be raw JSON string (srh_memory_write returns json.dumps)
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except json.JSONDecodeError:
+                            result = {}
+                    # Guard: only create graph metadata for successful writes
+                    if not result.get("success") and not result.get("id"):
+                        return context
+                    memory_id = result.get("id")
+                    if not memory_id:
+                        return context
+                    zone = args.get("zone", "general")
+                    gm.store.ensure_meta(memory_id, zone=zone)
+                    gm.store.record_access(memory_id)
+                elif tool_name == "srh_memory_delete":
+                    # Clean up graph metadata and edges for this memory
+                    mem_id = args.get("id", "")
+                    if mem_id:
+                        gm.store._connect().execute(
+                            "DELETE FROM graph_memory_meta WHERE id=?",
+                            (mem_id,)
+                        )
+                        gm.store._connect().execute(
+                            "DELETE FROM graph_edges WHERE source_id=? OR target_id=?",
+                            (mem_id, mem_id)
+                        )
+                        gm.store._connect().commit()
+            except Exception as e:
+                logger.debug("ahe_graph auto-associate: %s", e)
+            return context
+
+        ctx.register_hook("post_tool_call", _post_tool_associate)
+
+        # --- slash command ---
+        def _slash_graph(raw_args: str) -> str:
+            gm = _ensure_gm()
+            parts = raw_args.strip().split()
+            cmd = parts[0] if parts else "stats"
+
+            if cmd == "stats":
+                s = gm.get_stats(tier="detail")
+                return (
+                    f"📊 **Graph Memory Stats**\n"
+                    f"- Nodes: {s['node_count']}\n"
+                    f"- Edges: {s['edge_count']}\n"
+                    f"- Avg Weight: {s['avg_weight']}\n"
+                    f"- DB: {s['db_path']}"
+                )
+            elif cmd == "decay":
+                gm.run_decay()
+                return "🧹 Decay cycle completed on all graph edges and memory strengths."
+            elif cmd == "associate" and len(parts) >= 3:
+                mids = parts[1:]
+                r = gm.associate_memories(mids)
+                return f"🔗 Associated {len(mids)} memories ({r['edges_created']} edges created/updated)"
+            else:
+                return "Usage: /graph [stats|decay|associate <id1> <id2> ...]"
+
+        ctx.register_command(
+            name="graph",
+            handler=_slash_graph,
+            description="Graph memory operations: stats, decay, associate",
+            args_hint="[stats|decay|associate <id1> <id2> ...]",
+        )
+
+        logger.info("ahe_graph integration registered (v0.6.1+)")
+    except ImportError as e:
+        logger.warning("ahe_graph not available (skip integration): %s", e)
+    except Exception as e:
+        logger.warning("ahe_graph integration error: %s", e)
+
+
+# ── Graph manager global singleton (set during plugin init) ─────────
+_gm_getter_func = None
+_gm_getter_path = None
+_gm_singleton = None
+_gm_singleton_lock = threading.Lock()
+
+
+def _get_graph_mgr():
+    """Get or create graph manager singleton (thread-safe, module-level)."""
+    global _gm_singleton
+    if _gm_singleton is None and _gm_getter_func is not None:
+        with _gm_singleton_lock:
+            if _gm_singleton is None:
+                _gm_singleton = _gm_getter_func(_gm_getter_path)
+    return _gm_singleton
+
+
+# ── Graph neighbor helper (used by search/palace tools) ───────────────────
+
+def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5,
+                         zone_filter: Optional[str] = None) -> List[Tuple[str, float]]:
+    """Look up graph neighbors for the given memory IDs.
+
+    Returns deduplicated (memory_id, weight) pairs, sorted by weight descending.
+    If zone_filter is provided, only returns neighbors whose zone matches.
+    Gracefully returns empty list if ahe_graph is not available or has no data.
+    """
+    try:
+        gm = _get_graph_mgr()
+        if gm is None:
+            return []
+        results = gm.store.propagate_activation(
+            seed_ids=memory_ids,
+            max_depth=1,
+            decay_factor=0.7,
+            min_weight=0.2,
+            limit=max_results,
+        )
+        # Deduplicate by memory_id, keep highest weight
+        seen = {}
+        for r in results:
+            mid = r.get("memory_id", "")
+            w = r.get("weight", 0.0)
+            if mid and (mid not in seen or w > seen[mid]):
+                seen[mid] = w
+        # Filter out seed IDs (prevent self-return)
+        seed_set = set(memory_ids)
+        deduped = [(mid, w) for mid, w in seen.items() if mid not in seed_set]
+        # Apply zone filter if specified (look up each neighbor's zone)
+        if zone_filter:
+            filtered = []
+            for mid, w in deduped:
+                meta = gm.store.get_meta(mid)
+                if meta and meta.get("zone") == zone_filter:
+                    filtered.append((mid, w))
+            deduped = filtered
+        deduped.sort(key=lambda x: -x[1])
+        return deduped[:max_results]
+    except Exception as e:
+        logger.debug("Graph neighbor lookup failed: %s", e)
+        return []
+
+
+def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int,
+                       zone_filter: Optional[str] = None) -> dict:
+    """Enrich search results with graph-neighbor memories (shared helper).
+
+    Always returns a dict with "results" and "graph_expanded" for uniform schema.
+    If zone_filter is provided, graph neighbors are restricted to that zone.
+    """
+    graph_expanded = _get_graph_neighbors(result_ids, max_results=k, zone_filter=zone_filter)
+    for neigh_id, _ in graph_expanded:
+        record_memory_stat(neigh_id, "accessed")
+    return {
+        "results": result_out,
+        "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
+    }
+
+
 
 def _slash_reflect(raw_args: str) -> str:
     return "🔍 Full reflection is now integrated with LLM. It runs automatically at session end, or you can trigger it via the srh_reflect_now tool."
@@ -3027,6 +3364,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
+                zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
             scope = cand.get("scope", "user")
@@ -3132,6 +3470,7 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             source="micro_reflection",
             confidence=best["confidence"],
             tags=tags,
+            zone="episode",
         )
         fm.supersedes = supersedes
         path = mem_store.put("user", fm, best["text"])
@@ -3347,6 +3686,7 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
+                zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
             scope = cand.get("scope", "user")
