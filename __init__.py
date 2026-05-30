@@ -1702,17 +1702,10 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
 
     # ── Graph-enhanced expansion ─────────────────────────
     # Enrich search results with graph-neighbor memories.
-    graph_expanded = _get_graph_neighbors([m.id() for m in results], max_results=k)
-    if graph_expanded:
-        # Log access for graph neighbors too
-        for neigh_id, _ in graph_expanded:
-            record_memory_stat(neigh_id, "accessed")
-        return json.dumps({
-            "results": out,
-            "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
-        }, ensure_ascii=False)
-
-    return json.dumps({"results": out}, ensure_ascii=False)
+    return json.dumps(
+        _enrich_with_graph([m.id() for m in results], out, k),
+        ensure_ascii=False,
+    )
 
 
 def _tool_srh_memory_write(args: dict, **kwargs) -> str:
@@ -1878,13 +1871,10 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     # ── Graph-enhanced expansion ─────────────────────────
     # Enrich palace recall results with graph-neighbor memories.
     result_mids = [m.id() for m in results]
-    graph_expanded = _get_graph_neighbors(result_mids, max_results=k)
-    if graph_expanded:
-        return json.dumps({
-            "results": out,
-            "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
-        }, ensure_ascii=False)
-    return json.dumps({"results": out}, ensure_ascii=False)
+    return json.dumps(
+        _enrich_with_graph(result_mids, out, k),
+        ensure_ascii=False,
+    )
 
 
 def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
@@ -2080,12 +2070,11 @@ def _on_session_end(**kwargs) -> None:
     # Run Ebbinghaus decay on graph edges every session end so weights
     # naturally fade for connections that are no longer reinforced.
     try:
-        from .ahe_graph import get_graph_manager as _get_gm
-        db_dir = Path(__import__("hermes_constants", fromlist=["get_hermes_home"]).get_hermes_home()) / "plugins" / "mem-reflection-hermes"
-        _gm = _get_gm(db_dir)
-        _gm.run_decay()
+        gm = _get_graph_mgr()
+        if gm is not None:
+            gm.run_decay()
     except Exception as e:
-        logger.debug("ahe_graph decay skipped: %s", e)
+        logger.warning("ahe_graph decay skipped: %s", e)
 
     if not messages:
         return
@@ -2384,17 +2373,27 @@ def register(ctx) -> None:
 
         # Lazy-init on first use
         _graph_db_dir = Path(ctx.hermes_home) / "plugins" / "mem-reflection-hermes"
+        # Set module-level globals so _on_session_end and _get_graph_neighbors
+        # use the same singleton (P1-2, P2-1)
+        global _gm_getter_func, _gm_getter_path
+        _gm_getter_func = _get_gm
+        _gm_getter_path = _graph_db_dir
         _gm_ref = {"instance": None}
+        _gm_lock = threading.Lock()
 
         def _ensure_gm():
             if _gm_ref["instance"] is None:
-                _gm_ref["instance"] = _get_gm(_graph_db_dir)
+                with _gm_lock:
+                    if _gm_ref["instance"] is None:
+                        _gm_ref["instance"] = _get_gm(_graph_db_dir)
             return _gm_ref["instance"]
 
         # --- tool: srh_associate ---
+        MAX_ASSOCIATION_IDS = 20
+
         def _graph_associate_h(ctx, args, **kw):
             gm = _ensure_gm()
-            mids = args.get("memory_ids", [])
+            mids = args.get("memory_ids", [])[:MAX_ASSOCIATION_IDS]
             ctx_str = args.get("context", "")
             rel = args.get("relation", "co_occurs")
             result = gm.associate_memories(mids, ctx_str, rel)
@@ -2412,7 +2411,8 @@ def register(ctx) -> None:
                         "memory_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of memory IDs to associate",
+                            "description": "List of memory IDs to associate (max 20)",
+                            "maxItems": MAX_ASSOCIATION_IDS,
                         },
                         "context": {
                             "type": "string",
@@ -2436,9 +2436,9 @@ def register(ctx) -> None:
         # --- tool: srh_graph_retrieve ---
         def _graph_retrieve_h(ctx, args, **kw):
             gm = _ensure_gm()
-            mids = args.get("memory_ids", [])
+            mids = args.get("memory_ids", [])[:20]
             task_type = args.get("task_type", "reasoning")
-            max_res = args.get("max_results", 10)
+            max_res = min(args.get("max_results", 10), 100)
             tier = args.get("tier", "list")
             results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
             return {"results": results, "count": len(results), "seed_ids": mids, "tier": tier}
@@ -2455,7 +2455,8 @@ def register(ctx) -> None:
                         "memory_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Seed memory IDs to start graph traversal from",
+                            "description": "Seed memory IDs to start graph traversal from (max 20)",
+                            "maxItems": 20,
                         },
                         "task_type": {
                             "type": "string",
@@ -2467,6 +2468,7 @@ def register(ctx) -> None:
                             "type": "integer",
                             "description": "Max results to return",
                             "default": 10,
+                            "maximum": 100,
                         },
                         "tier": {
                             "type": "string",
@@ -2574,6 +2576,23 @@ def register(ctx) -> None:
         logger.warning("ahe_graph integration error: %s", e)
 
 
+# ── Graph manager global singleton (set during plugin init) ─────────
+_gm_getter_func = None
+_gm_getter_path = None
+_gm_singleton = None
+_gm_singleton_lock = threading.Lock()
+
+
+def _get_graph_mgr():
+    """Get or create graph manager singleton (thread-safe, module-level)."""
+    global _gm_singleton
+    if _gm_singleton is None and _gm_getter_func is not None:
+        with _gm_singleton_lock:
+            if _gm_singleton is None:
+                _gm_singleton = _gm_getter_func(_gm_getter_path)
+    return _gm_singleton
+
+
 # ── Graph neighbor helper (used by search/palace tools) ───────────────────
 
 def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tuple[str, float]]:
@@ -2583,12 +2602,11 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tu
     Gracefully returns empty list if ahe_graph is not available or has no data.
     """
     try:
-        from .ahe_graph import get_graph_manager as _get_gm
-        db_dir = Path(__import__("hermes_constants", fromlist=["get_hermes_home"]).get_hermes_home()) / "plugins" / "mem-reflection-hermes"
-        gm = _get_gm(db_dir)
-        # propagate_activation returns dicts with memory_id and weight keys
+        gm = _get_graph_mgr()
+        if gm is None:
+            return []
         results = gm.store.propagate_activation(
-            seed_memory_ids=memory_ids,
+            seed_ids=memory_ids,
             max_depth=1,
             decay_factor=0.7,
             min_weight=0.2,
@@ -2601,7 +2619,7 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tu
             w = r.get("weight", 0.0)
             if mid and (mid not in seen or w > seen[mid]):
                 seen[mid] = w
-        # Filter out seed IDs
+        # Filter out seed IDs (prevent self-return)
         seed_set = set(memory_ids)
         deduped = [(mid, w) for mid, w in seen.items() if mid not in seed_set]
         deduped.sort(key=lambda x: -x[1])
@@ -2609,6 +2627,20 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5) -> List[Tu
     except Exception as e:
         logger.debug("Graph neighbor lookup failed: %s", e)
         return []
+
+
+def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int) -> dict:
+    """Enrich search results with graph-neighbor memories (shared helper).
+
+    Always returns a dict with "results" and "graph_expanded" for uniform schema.
+    """
+    graph_expanded = _get_graph_neighbors(result_ids, max_results=k)
+    for neigh_id, _ in graph_expanded:
+        record_memory_stat(neigh_id, "accessed")
+    return {
+        "results": result_out,
+        "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
+    }
 
 
 

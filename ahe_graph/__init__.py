@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,12 +66,13 @@ class GraphStore:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        self._known_meta: Set[str] = set()
 
     def _connect(self) -> sqlite3.Connection:
         """Get or create SQLite connection with WAL mode for concurrency."""
         if self._conn is None:
             try:
-                self._conn = sqlite3.connect(str(self.db_path))
+                self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
                 self._conn.row_factory = sqlite3.Row
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA busy_timeout=3000")
@@ -151,23 +153,27 @@ class GraphStore:
     def get_neighbors(self, memory_id: str, min_weight: float = 0.1,
                       limit: int = 20) -> List[dict]:
         """Get neighbor memories (directly connected)."""
-        conn = self._connect()
-        rows = conn.execute(
-            "SELECT source_id, target_id, relation, weight, co_occurrence "
-            "FROM graph_edges WHERE (source_id=? OR target_id=?) AND weight>=? "
-            "ORDER BY weight DESC LIMIT ?",
-            (memory_id, memory_id, min_weight, limit)
-        ).fetchall()
-        results = []
-        for r in rows:
-            neighbor = r["target_id"] if r["source_id"] == memory_id else r["source_id"]
-            results.append({
-                "memory_id": neighbor,
-                "relation": r["relation"],
-                "weight": r["weight"],
-                "co_occurrence": r["co_occurrence"],
-            })
-        return results
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT source_id, target_id, relation, weight, co_occurrence "
+                "FROM graph_edges WHERE (source_id=? OR target_id=?) AND weight>=? "
+                "ORDER BY weight DESC LIMIT ?",
+                (memory_id, memory_id, min_weight, limit)
+            ).fetchall()
+            results = []
+            for r in rows:
+                neighbor = r["target_id"] if r["source_id"] == memory_id else r["source_id"]
+                results.append({
+                    "memory_id": neighbor,
+                    "relation": r["relation"],
+                    "weight": r["weight"],
+                    "co_occurrence": r["co_occurrence"],
+                })
+            return results
+        except sqlite3.Error as e:
+            logger.exception("graph_store: get_neighbors error for %s: %s", memory_id, e)
+            return []
 
     def propagate_activation(self, seed_ids: List[str], max_depth: int = 2,
                              decay_factor: float = 0.5, min_weight: float = 0.1,
@@ -228,7 +234,9 @@ class GraphStore:
 
     def ensure_meta(self, memory_id: str, zone: str = "general",
                     importance: float = 0.5) -> None:
-        """Ensure a memory has an entry in the meta table."""
+        """Ensure a memory has an entry in the meta table (with in-memory cache)."""
+        if memory_id in self._known_meta:
+            return
         conn = self._connect()
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
@@ -238,6 +246,7 @@ class GraphStore:
             (memory_id, now, importance, zone)
         )
         conn.commit()
+        self._known_meta.add(memory_id)
 
     def record_access(self, memory_id: str, context: str = ""):
         """Record a memory access (for decay computation).
@@ -612,15 +621,18 @@ class GraphMemoryManager:
 # ======================================================================
 
 _graph_manager: Optional[GraphMemoryManager] = None
+_gm_lock = threading.Lock()
 
 
 def get_graph_manager(db_dir: Optional[Path] = None) -> GraphMemoryManager:
-    """Get or create the singleton GraphMemoryManager."""
+    """Get or create the singleton GraphMemoryManager (thread-safe)."""
     global _graph_manager
     if _graph_manager is None:
-        if db_dir is None:
-            db_dir = Path.home() / ".hermes" / "plugins" / "mem-reflection-hermes"
-        _graph_manager = GraphMemoryManager(db_dir)
+        with _gm_lock:
+            if _graph_manager is None:
+                if db_dir is None:
+                    db_dir = Path.home() / ".hermes" / "plugins" / "mem-reflection-hermes"
+                _graph_manager = GraphMemoryManager(db_dir)
     return _graph_manager
 
 
