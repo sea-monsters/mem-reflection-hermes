@@ -393,8 +393,8 @@ class AssociationEngine:
                                        weight_delta=self.hebbian_lr)
                 self.store.upsert_edge(mid_j, mid_i, "co_occurs",
                                        weight_delta=self.hebbian_lr)
-                self.store.log_access(mid_i, context)
-                self.store.log_access(mid_j, context)
+                self.store.record_access(mid_i, context)
+                self.store.record_access(mid_j, context)
                 count += 2
         return count
 
