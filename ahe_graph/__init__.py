@@ -26,11 +26,64 @@ logger = logging.getLogger(__name__)
 
 
 # ======================================================================
+# GraphStore Protocol — interface contract for graph memory consumers
+# ======================================================================
+# Prevents method-naming drift (copy-paste errors) across classes
+# that depend on GraphStore. Any new consumer must use the correct
+# method names from this interface.
+# ======================================================================
+
+
+class GraphStoreProtocol:
+    """Interface contract for graph storage consumers.
+
+    Subclasses MUST implement all methods listed here. Consumers
+    (GraphMemoryManager, AssociationEngine, etc.) MUST only call
+    methods declared on this interface.
+    """
+
+    def ensure_meta(self, memory_id: str, zone: str = "general",
+                    importance: float = 0.5) -> None:
+        """Ensure a memory has an entry in the meta table."""
+        raise NotImplementedError
+
+    def record_access(self, memory_id: str, context: str = "") -> None:
+        """Record a memory access (for decay computation)."""
+        raise NotImplementedError
+
+    def upsert_edge(self, source: str, target: str,
+                    relation: str = "co_occurs",
+                    weight_delta: float = 0.0) -> None:
+        """Create or update an edge between two memories."""
+        raise NotImplementedError
+
+    def propagate_activation(self, seed_ids: List[str],
+                             max_depth: int = 2,
+                             decay_factor: float = 0.5,
+                             min_weight: float = 0.1,
+                             limit: int = 10) -> List[dict]:
+        """Propagate activation along graph edges from seeds."""
+        raise NotImplementedError
+
+    def decay_edges(self, decay_rate: float = 0.01) -> None:
+        """Decay all association edge weights over time."""
+        raise NotImplementedError
+
+    def get_stats(self) -> dict:
+        """Return graph statistics."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Close database connection."""
+        raise NotImplementedError
+
+
+# ======================================================================
 # Graph Store — SQLite-backed association edges
 # ======================================================================
 
 
-class GraphStore:
+class GraphStore(GraphStoreProtocol):
     """SQLite-backed graph associations between memories.
 
     Each memory has an ID (its filename stem in the memory store).
@@ -267,7 +320,7 @@ class GraphStore:
             )
             conn.commit()
         except sqlite3.Error as e:
-            logger.exception("graph_store: log_access error: %s", e)
+            logger.exception("graph_store: record_access error: %s", e)
 
     def update_importance(self, memory_id: str, delta: float = 0.0) -> None:
         """Update memory importance (feedback-driven).
@@ -329,6 +382,24 @@ class GraphStore:
             )
         conn.commit()
 
+    def decay_edges(self, decay_rate: float = 0.01) -> None:
+        """Decay all association edge weights over time.
+
+        Long-term non-co-occurrence → weights gradually decrease.
+        Edge weights are clamped to a minimum of 0.01.
+
+        Args:
+            decay_rate: amount subtracted per decay cycle (default 0.01)
+        """
+        conn = self._connect()
+        for relation in ("co_occurs", "co_used_in_task"):
+            conn.execute(
+                "UPDATE graph_edges SET weight = MAX(0.01, weight - ?) "
+                "WHERE relation = ?",
+                (decay_rate, relation)
+            )
+        conn.commit()
+
     def stats(self) -> dict:
         """Return graph statistics with connection pool health."""
         try:
@@ -368,7 +439,7 @@ class AssociationEngine:
     Long separation → weight decays
     """
 
-    def __init__(self, store: GraphStore,
+    def __init__(self, store: GraphStoreProtocol,
                  hebbian_lr: float = 0.15,
                  decay_rate: float = 0.01):
         self.store = store
@@ -420,15 +491,9 @@ class AssociationEngine:
         """Decay all association edges over time.
 
         Long-term non-co-occurrence → weights gradually decrease.
+        Delegates to GraphStore.decay_edges() for proper encapsulation.
         """
-        conn = self.store._connect()
-        for relation in ("co_occurs", "co_used_in_task"):
-            conn.execute(
-                "UPDATE graph_edges SET weight = MAX(0.01, weight - ?) "
-                "WHERE relation = ?",
-                (self.decay_rate, relation)
-            )
-        conn.commit()
+        self.store.decay_edges(self.decay_rate)
 
 
 # ======================================================================

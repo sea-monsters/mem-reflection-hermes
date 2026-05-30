@@ -2063,6 +2063,7 @@ def _on_session_start(**kwargs) -> None:
     logger.debug("mem-reflection-hermes: session started")
 
 
+
 def _on_session_end(**kwargs) -> None:
     messages = kwargs.get("messages", [])
 
@@ -2154,7 +2155,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "k": {"type": "integer", "description": "Max results", "default": 5},
+                    "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
                     "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
                 },
                 "required": ["query"],
@@ -2176,9 +2177,9 @@ def register(ctx) -> None:
                     "body": {"type": "string", "description": "Memory content (one short fact)"},
                     "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "tags": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 20},
                     "pinned": {"type": "boolean", "default": False},
-                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 5},
                     "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
                 },
                 "required": ["body"],
@@ -2217,7 +2218,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 3},
+                    "k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 100},
                 },
                 "required": ["query"],
             },
@@ -2286,7 +2287,7 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "What to recall (e.g. 'editor preference', 'error handling convention')"},
-                    "limit": {"type": "integer", "description": "Max results", "default": 5},
+                    "limit": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 50},
                     "zone": {"type": "string", "description": "Optional: restrict to a specific zone"},
                 },
                 "required": ["topic"],
@@ -2425,11 +2426,8 @@ def register(ctx) -> None:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "List of memory IDs to associate (max 20)",
+                            "minItems": 2,
                             "maxItems": MAX_ASSOCIATION_IDS,
-                        },
-                        "context": {
-                            "type": "string",
-                            "description": "Optional context string describing why they co-occurred",
                         },
                         "relation": {
                             "type": "string",
@@ -2469,6 +2467,7 @@ def register(ctx) -> None:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Seed memory IDs to start graph traversal from (max 20)",
+                            "minItems": 1,
                             "maxItems": 20,
                         },
                         "task_type": {
@@ -2481,6 +2480,7 @@ def register(ctx) -> None:
                             "type": "integer",
                             "description": "Max results to return",
                             "default": 10,
+                            "minimum": 1,
                             "maximum": 100,
                         },
                         "tier": {
