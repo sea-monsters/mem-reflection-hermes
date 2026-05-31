@@ -2,17 +2,30 @@
 
 Ported from https://github.com/coder-brzhang/small-rust-hermes
 
+v0.8.0 Architecture (6 modules, ~5,900 lines):
+- core.py: MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths
+- embed.py: ONNX embedding engine, cosine similarity, intent classification
+- reflection.py: micro/full reflection pipelines, auto-rebalance, profile compilation
+- hooks.py: session hooks (on_session_start/end, pre_llm_call, post_tool_call)
+- tools.py: 17 SRH tool handlers exposed to Hermes Agent
+- __init__.py: registration, exports, backward compat, standalone bootstrap
+
 Features:
 - Structured memories: Markdown + YAML frontmatter (id, created, source,
-  confidence, pinned, tags, supersedes)
+  confidence, pinned, tags, supersedes, zone, rank, version)
 - Dual scope: user (~/.hermes/memories/) and project (./.hermes/memories/)
-- TF-IDF relevance search (zero-dependency, fast)
-- Optional embedding search (via ONNX Runtime, lazy-loaded)
-- Conflict detection on write
-- Micro-reflection: lightweight per-turn background reflection
-- Full reflection: session-end structured JSON pipeline with human approval
-- Skill auto-matching: token-overlap + optional embedding hybrid
-- Context layering: Pinned → Active Index → Triggered Skills
+- Memory Palace: zone-based organization (core, work, episode, general, project:*)
+- TF-IDF / BM25 search with effectiveness boosting (zero-dependency, ~0.8ms/50 mems)
+- Semantic search: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
+- Conflict detection on write with supersedes chains and version lineage
+- Effectiveness tracking: per-memory scoring with exponential time decay
+- Micro-reflection: lightweight per-turn background reflection with backpressure queue
+- Full reflection: session-end structured JSON pipeline with human approval for skills
+- Skill auto-matching: token-overlap + optional embedding hybrid, always-active skills
+- Context layering: Pinned → Active Index → Triggered Skills → Always-Active Skills
+- Profile compilation: LLM-driven compilation of all memories into structured profile docs
+- ahe_graph integration: graph memory with associate/retrieve/stats/viz tools
+- CJK adaptive threshold, LRU embed cache, zone rebalance, memory history tracing
 
 All data lives in flat files for transparency and version-control friendliness.
 """
@@ -913,12 +926,29 @@ class SkillStore:
         self.user_root = user_root
         self.project_root = project_root
         self._cache: Optional[List[LoadedSkill]] = None  # Lazy cache (skills are static per session)
+        self._disabled_project_skills: Set[str] = set()  # P2-12: user-disabled project skill names
+
+    def disable_project_skill(self, name: str) -> None:
+        """Explicitly disable a project skill by name (user override)."""
+        self._disabled_project_skills.add(name)
+        self.invalidate_cache()
+
+    def enable_project_skill(self, name: str) -> None:
+        """Re-enable a previously disabled project skill."""
+        self._disabled_project_skills.discard(name)
+        self.invalidate_cache()
+
+    def list_disabled(self) -> List[str]:
+        """Return list of disabled project skill names."""
+        return sorted(self._disabled_project_skills)
 
     def list(self) -> List[LoadedSkill]:
         if self._cache is not None:
             return self._cache
         user_skills = self._list_scope(self.user_root, "user")
         project_skills = self._list_scope(self.project_root, "project") if self.project_root else []
+        # P2-12: filter out disabled project skills
+        project_skills = [s for s in project_skills if s.frontmatter.name not in self._disabled_project_skills]
         project_names = {s.frontmatter.name for s in project_skills}
         user_skills = [s for s in user_skills if s.frontmatter.name not in project_names]
         out = user_skills + project_skills

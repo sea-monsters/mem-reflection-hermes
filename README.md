@@ -1,21 +1,24 @@
 # mem-reflection-hermes
 
-Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements and a full-featured dashboard.
+Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
+
+**Current version: v0.8.0** — 6-module architecture, 17 SRH tools, ahe_graph integration.
 
 ## Features
 
-- **Structured Memories**: Markdown + YAML frontmatter (id, created, source, confidence, pinned, tags, supersedes, zone, rank)
+- **Structured Memories**: Markdown + YAML frontmatter (id, created, source, confidence, pinned, tags, supersedes, zone, rank, version)
 - **Dual Scope**: User-level (`~/.hermes/memories/`) and project-level (`./.hermes/memories/`)
 - **Memory Palace**: Zone-based organization (core, work, episode, general, project:*) with tool-driven navigation
-- **TF-IDF Search**: Pure Python implementation, zero external dependencies, ~0.8ms for 50 memories
+- **TF-IDF / BM25 Search**: Pure Python implementation, zero external dependencies, ~0.8ms for 50 memories
 - **Semantic Search**: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
-- **Conflict Detection**: Automatic similarity checking on write with supersedes chains
-- **Effectiveness Tracking**: Per-memory effectiveness scoring with time decay
-- **Micro-Reflection**: Per-turn background reflection with CJK-aware token estimation
+- **Conflict Detection**: Automatic similarity checking on write with supersedes chains and version lineage
+- **Effectiveness Tracking**: Per-memory effectiveness scoring with exponential time decay
+- **Micro-Reflection**: Per-turn background reflection with backpressure queue and CJK-aware token estimation
 - **Full Reflection**: Session-end structured summary with human approval for skills
 - **Skill Auto-Matching**: Token overlap + optional embedding hybrid for context injection
 - **Context Layering**: Pinned → Active Index → Triggered Skills → Always-Active Skills
 - **Profile Compilation**: LLM-driven compilation of all memories into structured profile documents
+- **Graph Memory (ahe_graph)**: Associate memories, retrieve via graph traversal, stats, and visualization
 - **Dashboard Memory Manager**: Full CRUD + reorder UI with search, zone filter, and sort controls
 
 ## Architecture
@@ -28,25 +31,58 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 │    ├── Inject palace index (zone map)                 │
 │    ├── Inject compiled profile                        │
 │    ├── Inject triggered/always skills                 │
-│    └── Trigger micro-reflection                       │
+│    └── Inject pinned memories                         │
+├──────────────────────────────────────────────────────┤
+│  post_tool_call hook                                  │
+│    ├── Record tool effectiveness                      │
+│    ├── Update memory stats                            │
+│    └── Build ahe_graph associations                   │
 ├──────────────────────────────────────────────────────┤
 │  on_session_end hook                                  │
-│    └── Run full reflection                            │
+│    ├── Full reflection pipeline                       │
+│    ├── Generate skill candidates                      │
+│    └── Write session summary                          │
 ├──────────────────────────────────────────────────────┤
-│  Tools (9)                                            │
-│    ├── srh_memory_search                              │
-│    ├── srh_memory_write                               │
-│    ├── srh_memory_delete                              │
-│    ├── srh_skill_search                               │
-│    ├── srh_reflect_now                                │
-│    ├── srh_palace_zones                               │
-│    ├── srh_palace_read_zone                           │
-│    ├── srh_palace_recall                              │
-│    └── srh_compile_profile                            │
-├──────────────────────────────────────────────────────┤
-│  Slash Commands (7)                                   │
-│    ├── /memories                                      │
-│    ├── /skills                                        │
+│  Background Tasks                                     │
+│    ├── Micro-reflection queue (backpressure)          │
+│    ├── Async memory write thread                      │
+│    └── Async stat flush thread                        │
+└──────────────────────────────────────────────────────┘
+```
+
+### Module Layout (v0.8.0)
+
+| Module | Lines | Responsibility |
+|--------|-------|----------------|
+| `core.py` | ~791 | MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths |
+| `embed.py` | ~484 | ONNX embedding engine, cosine similarity, intent classification |
+| `reflection.py` | ~1,248 | Micro/full reflection, auto-rebalance, profile compilation |
+| `hooks.py` | ~335 | Session hooks (on_session_start/end, pre_llm_call, post_tool_call) |
+| `tools.py` | ~945 | 17 SRH tool handlers exposed to Hermes Agent |
+| `__init__.py` | ~1,588 | Registration, exports, backward compat, standalone bootstrap |
+
+### v0.8.0 — Module Split + ahe_graph Integration
+- **6-way module split**: `__init__.py` reduced from ~4,500 to ~1,588 lines; logic moved to `core`, `embed`, `reflection`, `hooks`, `tools`
+- **17 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`, `srh_associate/graph_retrieve/graph_stats/graph_viz`
+- **ahe_graph integration**: Graph memory with `srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`
+- **Backpressure queue**: Micro-reflection bounded queue (max 20) with overflow logging
+- **CJK adaptive threshold**: Per-language similarity threshold (CJK 0.55, Latin 0.65)
+- **LRU embed cache**: 128-entry LRU cache for embedding vectors
+- **Zone rebalance**: Automatic zone split/merge with dry-run mode
+- **Memory history**: `srh_memory_history` traces supersedes chains
+- **Codex review fixes**: P0/P1/P2 issues resolved with audit script verification
+
+### v0.7.0 — ahe_graph Deep Integration
+- Graph memory layer with associate/retrieve/stats/viz tools
+- `post_tool_call` hook builds tool result associations
+- Intent classification via embedding similarity
+
+### v0.6.1 — Atomic Store Refactor
+- **Atomic `MemoryStore.update()`**: Single method handles file write, cache invalidation, and index rebuild. Prevents 5 classes of cache inconsistency bugs.
+- **Atomic `MemoryStore.reorder()`**: Assigns explicit `rank` values instead of manipulating timestamps. Stable across filtering and sorting modes.
+- **`rank` field**: New `rank: int = 0` in `MemoryFrontmatter`. Higher rank = earlier in default sort. Backward compatible.
+- **Simplified HTTP layer**: `plugin_api.py` delegates all mutation logic to Store methods — HTTP layer only validates and translates errors.
+- **Post-review fixes**: Plugin registration API compat (`__HERMES_PLUGINS__.register`), atomic write via `os.replace()`, reflections field name fix, scope validation, zone list refresh.
 │    ├── /pending-skills                                │
 │    ├── /approve-skill <id>                            │
 │    ├── /reject-skill <id>                             │
@@ -208,6 +244,7 @@ plugins:
     embeddings: false         # TF-IDF only (fast, zero deps)
     micro_reflection: true    # Auto-reflect per turn
     palace_mode: true         # Memory Palace navigation
+    profile_mode: false       # LLM-compiled profile injection
 EOF
 
 # 3. Restart Hermes Agent
@@ -286,9 +323,12 @@ Once enabled, the plugin works automatically:
 
 ### Tools
 
-```
+```python
+# Memory search
 srh_memory_search(query="Python error handling", k=5)
+srh_memory_search(query="部署流程", k=5, zone="work")  # zone filter
 
+# Memory write
 srh_memory_write(
     body="Always use anyhow for app-level error handling",
     tags=["rust", "error-handling"],
@@ -296,11 +336,32 @@ srh_memory_write(
     pinned=true
 )
 
+# Memory management
 srh_memory_delete(memory_id="mem_abc123")
+srh_memory_history(memory_id="mem_abc123")  # version lineage
 
+# Skill search
 srh_skill_search(query="rust async", k=3)
 
+# Reflection
 srh_reflect_now(mode="full")
+
+# Palace navigation
+srh_palace_zones()                          # list all zones
+srh_palace_read_zone(zone="work")           # read zone summary
+srh_palace_recall(topic="editor preference") # topic-based recall
+srh_palace_search(query="Docker")           # cross-zone search
+srh_palace_rebalance(dry_run=true)          # auto split/merge
+
+# Profile compilation
+srh_compile_profile(mode="profile")         # compile to profile.md
+srh_compile_profile(mode="palace_index")    # compile to palace index
+
+# Graph memory (ahe_graph)
+srh_associate(source_id="mem_abc", target_id="mem_def", relation="supersedes")
+srh_graph_retrieve(seed_id="mem_abc", depth=2)
+srh_graph_stats()
+srh_graph_viz()
 ```
 
 ### Slash Commands
@@ -337,7 +398,16 @@ Always use anyhow for app-level error handling in Rust.
 ```
 
 **Fields:**
-- `rank` (v0.6.1+): Explicit ordering. Higher rank = appears earlier. Default 0. Modified via dashboard reorder or `MemoryStore.reorder()`.
+- `id`: Unique identifier (auto-generated)
+- `created`: ISO 8601 timestamp
+- `source`: Origin (`micro_reflection`, `full_reflection`, `manual`, etc.)
+- `confidence`: `low` | `medium` | `high`
+- `pinned`: Whether to always inject into context
+- `tags`: List of searchable tags
+- `zone`: Memory Palace zone (`core`, `work`, `episode`, `general`, `project:*`)
+- `rank` (v0.6.1+): Explicit ordering. Higher rank = appears earlier. Default 0
+- `supersedes`: List of memory IDs this memory replaces (version lineage)
+- `version` (v0.8.0+): Optional version string for tracking iterations
 
 ## File Structure
 
@@ -354,7 +424,12 @@ Always use anyhow for app-level error handling in Rust.
 │   └── memory-stats.jsonl           # Effectiveness tracking
 ├── plugins/
 │   └── mem-reflection-hermes/
-│       ├── __init__.py              # Main plugin (~3,500 lines)
+│       ├── __init__.py              # Registration, exports, bootstrap (~1,588 lines)
+│       ├── core.py                  # MemoryStore, SkillStore, models (~791 lines)
+│       ├── embed.py                 # ONNX embedding engine (~484 lines)
+│       ├── reflection.py            # Micro/full reflection, rebalance (~1,248 lines)
+│       ├── hooks.py                 # Session hooks (~335 lines)
+│       ├── tools.py                 # 17 SRH tool handlers (~945 lines)
 │       ├── plugin.yaml              # Plugin manifest
 │       ├── README.md                # This file
 │       ├── bench_latency.py         # Performance benchmark
@@ -377,6 +452,20 @@ Always use anyhow for app-level error handling in Rust.
 cd ~/.hermes/plugins/mem-reflection-hermes
 python bench_latency.py
 ```
+
+### Module Import Order
+
+When adding new functionality, respect the module boundaries:
+
+1. **core.py**: Data models, store logic, config — no Hermes dependencies
+2. **embed.py**: Embedding engine — imports from core only
+3. **reflection.py**: Reflection pipelines — imports from core + embed
+4. **hooks.py**: Session hooks — imports from core + embed + reflection
+5. **tools.py**: Tool handlers — imports from all above modules
+6. **__init__.py**: Registration and exports — imports from all modules
+
+Avoid circular dependencies. Use function-level late-binding if cross-module
+references are needed at import time.
 
 ## License
 
