@@ -34,6 +34,19 @@ def _jd(obj, **kw) -> str:
         kw["ensure_ascii"] = False
     return json.dumps(obj, default=str, **kw)
 
+# Late-binding imports cached at module level to avoid repeated dict lookups
+# (P2-23: was doing import on every call; P2-30: unified with hooks.py pattern)
+_late_bindings: Dict[str, Any] = {}
+
+def _lb(name: str):
+    """Get a late-bound function, caching the lookup."""
+    fn = _late_bindings.get(name)
+    if fn is None:
+        from mem_reflection_hermes import __dict__ as _mod
+        fn = _mod[name]
+        _late_bindings[name] = fn
+    return fn
+
 __all__ = [
     "register",
     "_auto_rebalance_zones",
@@ -57,52 +70,40 @@ __all__ = [
 
 
 def _get_mem_store():
-    from mem_reflection_hermes import _get_mem_store as _f
-    return _f()
+    return _lb("_get_mem_store")()
 
 def _get_skill_store():
-    from mem_reflection_hermes import _get_skill_store as _f
-    return _f()
+    return _lb("_get_skill_store")()
 
 def _build_context_block(query=""):
-    from mem_reflection_hermes import _build_context_block as _f
-    return _f(query)
+    return _lb("_build_context_block")(query)
 
 def _auto_rebalance_zones():
-    from mem_reflection_hermes import _auto_rebalance_zones as _f
-    return _f()
+    return _lb("_auto_rebalance_zones")()
 
 def _normalize_zone(z):
-    from mem_reflection_hermes import _normalize_zone as _f
-    return _f(z)
+    return _lb("_normalize_zone")(z)
 
 def _estimate_tokens(text):
-    from mem_reflection_hermes import _estimate_tokens as _f
-    return _f(text)
+    return _lb("_estimate_tokens")(text)
 
 def _palace_mode_enabled():
-    from mem_reflection_hermes import _palace_mode_enabled as _f
-    return _f()
+    return _lb("_palace_mode_enabled")()
 
 def _profile_mode_enabled():
-    from mem_reflection_hermes import _profile_mode_enabled as _f
-    return _f()
+    return _lb("_profile_mode_enabled")()
 
 def _get_graph_mgr():
-    from mem_reflection_hermes import _get_graph_mgr as _f
-    return _f()
+    return _lb("_get_graph_mgr")()
 
 def _get_graph_neighbors(*a, **kw):
-    from mem_reflection_hermes import _get_graph_neighbors as _f
-    return _f(*a, **kw)
+    return _lb("_get_graph_neighbors")(*a, **kw)
 
 def _enrich_with_graph(*a, **kw):
-    from mem_reflection_hermes import _enrich_with_graph as _f
-    return _f(*a, **kw)
+    return _lb("_enrich_with_graph")(*a, **kw)
 
 def build_palace_index(*a, **kw):
-    from mem_reflection_hermes import build_palace_index as _f
-    return _f(*a, **kw)
+    return _lb("build_palace_index")(*a, **kw)
 
 # Tool handlers
 # ---------------------------------------------------------------------------

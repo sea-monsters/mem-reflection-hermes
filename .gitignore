@@ -22,3 +22,5 @@ Thumbs.db
 
 # Sync script (local only)
 sync-to-github.sh
+memory-stats.jsonl
+palace-index.md

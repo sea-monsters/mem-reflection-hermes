@@ -162,7 +162,12 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
             if isinstance(query, str):
                 break
             query = ""
-    context = _build_context_block(query)
+    try:
+        context = _build_context_block(query)
+    except Exception as e:
+        # P2-22: phase failure should silently skip rather than fail the whole hook
+        logger.warning("Context block build failed in pre_llm_call, skipping injection: %s", e)
+        context = None
     if context:
         return {"context": context}
     return None
