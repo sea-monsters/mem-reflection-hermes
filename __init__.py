@@ -29,11 +29,50 @@ import sys
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Import from submodules: models, constants, BM25, frontmatter, IO
+from .core import (  # noqa: F401
+    hermes_home, load_config, plugin_config, plugin_data_dir,
+    user_memories_dir, project_memories_dir, user_skills_dir, project_skills_dir,
+    embeddings_enabled, micro_reflection_enabled, palace_mode_enabled, profile_mode_enabled,
+    normalize_zone, is_valid_zone, fast_hash,
+    palace_index_path, zone_cache_dir, sanitize_zone_filename,
+    MemoryFrontmatter, LoadedMemory, MemoryStatEntry, MemoryEffectiveness,
+    SkillFrontmatter, LoadedSkill,
+    parse_frontmatter, serialize_frontmatter, read_memory,
+    async_write_memory, record_memory_stat, batch_record_stats, load_effectiveness,
+    is_cjk, cjk_ratio, adaptive_conflict_threshold,
+    _tokenise, _memory_tokens, _bm25_search, _bm25_search_scored, _cosine_similarity,
+    _ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL,
+    _VALID_ZONES, _PROJECT_ZONE_PREFIX,
+    _ZONE_SPLIT_THRESHOLD, _ZONE_MERGE_THRESHOLD,
+    _write_queue, _pending_writes,
+)
+
+# Backward-compat aliases (old underscore names used by remaining __init__.py code)
+_hermes_home = hermes_home
+_load_config = load_config
+_get_config = plugin_config
+_plugin_data_dir = plugin_data_dir
+_user_memories_dir = user_memories_dir
+_project_memories_dir = project_memories_dir
+_user_skills_dir = user_skills_dir
+_project_skills_dir = project_skills_dir
+_embeddings_enabled = embeddings_enabled
+_micro_reflection_enabled = micro_reflection_enabled
+_palace_mode_enabled = palace_mode_enabled
+_profile_mode_enabled = profile_mode_enabled
+_palace_index_path = palace_index_path
+_zone_cache_dir = zone_cache_dir
+_sanitize_zone_filename = sanitize_zone_filename
+_normalize_zone = normalize_zone
+_async_write_memory = async_write_memory
+_stats_path = lambda: plugin_data_dir() / "memory-stats.jsonl"
 
 logger = logging.getLogger(__name__)
 
@@ -49,121 +88,7 @@ if __name__ != "__main__" and __name__ not in sys.modules:
     sys.modules[mod_name] = sys.modules.get(mod_name) or sys.modules.get(__name__) or types.ModuleType(mod_name)
 
 # ---------------------------------------------------------------------------
-# Config & paths (with caching)
-# ---------------------------------------------------------------------------
-
-# Cached config to avoid repeated YAML parsing
-_cached_config: Optional[Dict[str, Any]] = None
-_cached_config_mtime: float = 0.0
-
-# Configuration keys (centralized for easy customization)
-_CONFIG_SECTION = "mem_reflection_hermes"
-_CONFIG_KEY_EMBEDDINGS = "embeddings"
-_CONFIG_KEY_MICRO_REFLECTION = "micro_reflection"
-_CONFIG_KEY_REFLECTION_MODE = "reflection_mode"
-_CONFIG_KEY_PALACE_MODE = "palace_mode"
-_CONFIG_KEY_PROFILE_MODE = "profile_mode"
-_CONFIG_KEY_PALACE_INSTRUCTIONS = "palace_instructions"
-_CONFIG_KEY_ACTIVE_MEMORY_CAP = "active_memory_index_cap"
-_CONFIG_KEY_SKILL_INDEX_CAP = "skill_index_cap"
-_CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
-_CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
-
-
-def _hermes_home() -> Path:
-    """Resolve Hermes home directory.
-
-    Priority:
-    1. HERMES_HOME environment variable
-    2. hermes_constants.get_hermes_home() (if available)
-    3. ~/.hermes (default)
-    """
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        return Path(env_home)
-    try:
-        from hermes_constants import get_hermes_home
-        return get_hermes_home()
-    except Exception:
-        return Path.home() / ".hermes"
-
-
-def _load_config() -> Dict[str, Any]:
-    """Load Hermes config.yaml with caching (reloads if file changed)."""
-    global _cached_config, _cached_config_mtime
-    cfg_path = _hermes_home() / "config.yaml"
-    if not cfg_path.exists():
-        return {}
-    try:
-        mtime = cfg_path.stat().st_mtime
-        if _cached_config is not None and mtime == _cached_config_mtime:
-            return _cached_config
-        import yaml
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            _cached_config = yaml.safe_load(f) or {}
-        _cached_config_mtime = mtime
-        return _cached_config
-    except Exception:
-        return {}
-
-
-def _plugin_config() -> Dict[str, Any]:
-    """Get plugin-specific configuration section."""
-    cfg = _load_config()
-    plugins_cfg = cfg.get("plugins", {})
-    return plugins_cfg.get(_CONFIG_SECTION, {})
-
-
-def _embeddings_enabled() -> bool:
-    """Check if embeddings are enabled in config."""
-    return bool(_plugin_config().get(_CONFIG_KEY_EMBEDDINGS, True))
-
-
-def _micro_reflection_enabled() -> bool:
-    """Check if micro-reflection is enabled in config."""
-    return bool(_plugin_config().get(_CONFIG_KEY_MICRO_REFLECTION, False))
-
-
-def _reflection_mode() -> str:
-    """Reflection mode: 'embedding' (local, default), 'llm' (expensive), or 'hybrid'."""
-    return str(_plugin_config().get(_CONFIG_KEY_REFLECTION_MODE, "embedding"))
-
-
-def _palace_mode_enabled() -> bool:
-    """Check if Memory Palace mode is enabled (zone-based, tool-driven retrieval)."""
-    return bool(_plugin_config().get(_CONFIG_KEY_PALACE_MODE, True))
-
-
-def _profile_mode_enabled() -> bool:
-    """Check if compiled profile mode is enabled (LLM-compiled, all-in-one injection)."""
-    return bool(_plugin_config().get(_CONFIG_KEY_PROFILE_MODE, False))
-
-
-def _palace_instructions_enabled() -> bool:
-    """Check if palace usage instructions should be included in context."""
-    return bool(_plugin_config().get(_CONFIG_KEY_PALACE_INSTRUCTIONS, True))
-
-
-def _active_memory_cap() -> int:
-    """Max episodic memories in the Active memory index section (default 50)."""
-    return int(_plugin_config().get(_CONFIG_KEY_ACTIVE_MEMORY_CAP, 50))
-
-
-def _skill_index_cap() -> int:
-    """Max skills in the Available skills index (default 50)."""
-    return int(_plugin_config().get(_CONFIG_KEY_SKILL_INDEX_CAP, 50))
-
-
-def _relevant_memory_cap() -> int:
-    """Max per-turn memory bodies injected in legacy mode (default 3)."""
-    return int(_plugin_config().get(_CONFIG_KEY_RELEVANT_MEMORY_CAP, 3))
-
-
-def _triggered_skill_cap() -> int:
-    """Max skills expanded per turn (default 3)."""
-    return int(_plugin_config().get(_CONFIG_KEY_TRIGGERED_SKILL_CAP, 3))
-
-
+# AI instruction docstring (injected into register() palace_instructions)
 # ---------------------------------------------------------------------------
 # CJK-aware token estimation (mirrors small-rust-hermes compaction.rs)
 # ---------------------------------------------------------------------------
@@ -199,36 +124,15 @@ Session summaries go to `episode` zone. User identity/preferences go to `core`.
 Current work focus goes to `work`. Everything else goes to `general`.
 Don't guess about preferences or conventions — load the relevant zone first."""
 
-
 # ---------------------------------------------------------------------------
-# Palace Index & Zone Cache (mirrors small-rust-hermes palace.rs)
+# Palace Index & Zone Cache
 # ---------------------------------------------------------------------------
-
-def _palace_index_path() -> Path:
-    """Path to palace-index.md cache file."""
-    return _plugin_data_dir() / "palace-index.md"
-
-
-def _zone_cache_dir() -> Path:
-    """Path to zone-cache directory for per-zone summaries."""
-    d = _plugin_data_dir() / "zone-cache"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _sanitize_zone_filename(zone: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", zone)
-
-
-def _fast_hash(text: str) -> str:
-    """Fast non-crypto hash for write-on-change comparison (P0-1)."""
-    return hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
-
 
 def build_palace_index(memories: List[LoadedMemory]) -> str:
     """Generate a code-based palace index (no LLM needed).
 
     Groups memories by zone, shows counts and first-line previews.
+    If ahe_graph is active, appends intra-zone graph cluster density.
     Typically ~200-400 tokens.
     """
     groups: Dict[str, List[LoadedMemory]] = {}
@@ -240,6 +144,24 @@ def build_palace_index(memories: List[LoadedMemory]) -> str:
 
     total = len(memories)
     buf = f"## Memory Palace\n{total} memories across {len(groups)} zones. Use srh_palace_read_zone to load details.\n"
+
+    # ── Scheme B: Query graph density per zone ────────────────
+    intra_zone_edges: Dict[str, int] = {}
+    try:
+        gm = _get_graph_mgr()
+        if gm is not None:
+            for zone, mems in groups.items():
+                mids = set(m.id() for m in mems)
+                edge_count = 0
+                for m in mems:
+                    neighbors = gm.store.get_neighbors(m.id(), min_weight=0.1, limit=50)
+                    for n in neighbors:
+                        if n["memory_id"] in mids:
+                            edge_count += 1
+                # Each edge counted twice (once per direction), divide by 2
+                intra_zone_edges[zone] = edge_count // 2
+    except Exception:
+        pass  # Graceful degradation: no graph data
 
     # Zones in consistent order: core > work > episode > general > custom
     zone_order = ["core", "work", "episode", "general"]
@@ -254,7 +176,12 @@ def build_palace_index(memories: List[LoadedMemory]) -> str:
             idx = zone_order.index(zone)
         else:
             idx = 99
-        buf += f"\n### {zone} ({len(mems)})\n"
+        # Append graph cluster annotation if dense
+        edge_count = intra_zone_edges.get(zone, 0)
+        cluster_tag = ""
+        if edge_count >= 2:
+            cluster_tag = f"  [关联簇: {edge_count}个连接]"
+        buf += f"\n### {zone} ({len(mems)}){cluster_tag}\n"
         for m in mems[:5]:
             line = m.body.split("\n")[0].strip()[:80]
             buf += f"- {line}\n"
@@ -307,395 +234,6 @@ def _project_memories_dir() -> Optional[Path]:
     if p.resolve() == user.resolve():
         return None
     return p
-
-
-def _user_skills_dir() -> Path:
-    """User-level skills directory."""
-    return _hermes_home() / "skills"
-
-
-def _project_skills_dir() -> Optional[Path]:
-    """Project-level skills directory (only if .hermes/ exists in cwd)."""
-    p = Path.cwd() / ".hermes" / "skills"
-    return p if p.exists() else None
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-# Predefined memory zones — mirrors small-rust-hermes zone taxonomy
-_ZONE_CORE = "core"
-_ZONE_WORK = "work"
-_ZONE_EPISODE = "episode"
-_ZONE_GENERAL = "general"
-_VALID_ZONES = frozenset({_ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL})
-# Project zones: any string starting with "project:" is valid
-_PROJECT_ZONE_PREFIX = "project:"
-
-def _normalize_zone(zone: Optional[str]) -> str:
-    """Normalize a zone string to a valid zone."""
-    if not zone:
-        return _ZONE_GENERAL
-    zone = zone.strip().lower()
-    if zone in _VALID_ZONES or zone.startswith(_PROJECT_ZONE_PREFIX):
-        return zone
-    return _ZONE_GENERAL
-
-
-@dataclass
-class MemoryFrontmatter:
-    id: str
-    created: str  # ISO-8601
-    source: str  # reflection | user | imported
-    confidence: str  # low | medium | high
-    pinned: bool = False
-    tags: List[str] = field(default_factory=list)
-    supersedes: List[str] = field(default_factory=list)
-    zone: str = "general"  # core | work | episode | general | project:<name>
-    rank: int = 0  # Explicit display order (higher = earlier in list). 0 = default (sorted by created desc)
-
-    @staticmethod
-    def new(source: str = "reflection", confidence: str = "medium", tags: Optional[List[str]] = None,
-            zone: str = "general") -> "MemoryFrontmatter":
-        return MemoryFrontmatter(
-            id=f"mem_{uuid.uuid4().hex[:16]}",
-            created=datetime.now(timezone.utc).isoformat(),
-            source=source,
-            confidence=confidence,
-            pinned=False,
-            tags=tags or [],
-            supersedes=[],
-            zone=_normalize_zone(zone),
-        )
-
-
-@dataclass
-class LoadedMemory:
-    frontmatter: MemoryFrontmatter
-    body: str
-    source_path: Path
-    scope: str  # "user" | "project"
-
-    def id(self) -> str:
-        return self.frontmatter.id
-
-
-# ---------------------------------------------------------------------------
-# Memory Effectiveness Tracking (mirrors small-rust-hermes stats.rs)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class MemoryStatEntry:
-    """A single memory usage event."""
-    memory_id: str
-    event: str  # "loaded" | "referenced" | "accessed"
-    at: str  # ISO-8601 timestamp
-
-
-@dataclass
-class MemoryEffectiveness:
-    """Per-memory effectiveness summary — computed from stats.jsonl."""
-    loaded: int = 0
-    referenced: int = 0
-    accessed: int = 0
-    last_event_at: Optional[str] = None
-
-    def factor(self) -> float:
-        """Effectiveness factor in [0.5, 1.0].
-
-        Memories with no data default to 1.0. Low referenced/loaded
-        ratio pulls the factor down toward 0.5.
-        """
-        if self.loaded == 0:
-            return 1.0
-        ratio = self.referenced / self.loaded
-        return 0.5 + 0.5 * ratio
-
-    def decay_factor(self, now: Optional[datetime] = None) -> float:
-        """Decay factor based on time since last access. 30-day half-life, floor 0.3."""
-        if self.last_event_at is None:
-            return 1.0
-        now_dt = now or datetime.now(timezone.utc)
-        try:
-            last_dt = datetime.fromisoformat(self.last_event_at)
-            days = max(0, (now_dt - last_dt).days)
-            return max(0.3, 0.5 ** (days / 30.0))
-        except Exception:
-            return 1.0
-
-
-def _stats_path() -> Path:
-    """Path to memory-stats.jsonl."""
-    return _plugin_data_dir() / "memory-stats.jsonl"
-
-
-def record_memory_stat(memory_id: str, event: str) -> None:
-    """Append a memory stat entry to stats.jsonl. Best-effort."""
-    _batch_record_stats([(memory_id, event)])
-
-
-def _batch_record_stats(entries: List[Tuple[str, str]]) -> None:
-    """Append multiple stat entries in a single file open. Best-effort."""
-    _stat_queue.put(entries)  # P1-2: async flush via background thread
-
-
-# P1-2: Background stat writer — avoids blocking the hot path on JSONL fsync
-import atexit as _atexit
-
-_stat_queue: "queue.Queue[List[Tuple[str, str]]]" = queue.Queue()
-
-def _stat_flush_worker() -> None:
-    """Drain the stat queue and append to JSONL in a single file open per batch."""
-    while True:
-        try:
-            batch = _stat_queue.get(timeout=1)
-        except Exception:
-            continue  # Timeout, loop again
-        if batch is None:
-            break  # Shutdown signal
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            sp = _stats_path()
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            with open(sp, "a", encoding="utf-8") as f:
-                for memory_id, event in batch:
-                    f.write(json.dumps({
-                        "memory_id": memory_id,
-                        "event": event,
-                        "at": now,
-                    }, ensure_ascii=False) + "\n")
-        except Exception:
-            logger.debug("Failed to batch record %d memory stats", len(batch))
-
-_stat_thread = threading.Thread(target=_stat_flush_worker, daemon=True)
-_stat_thread.start()
-
-def _shutdown_stat_writer() -> None:
-    """Flush remaining stats on process exit."""
-    _stat_queue.put(None)  # Signal shutdown
-    _stat_thread.join(timeout=2)
-
-_atexit.register(_shutdown_stat_writer)
-
-
-def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
-    """Load effectiveness stats for all memories from stats.jsonl.
-
-    Returns a dict mapping memory_id → MemoryEffectiveness.
-    """
-    sp = _stats_path()
-    if not sp.exists():
-        return {}
-    eff: Dict[str, MemoryEffectiveness] = {}
-    try:
-        with open(sp, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                mid = entry.get("memory_id", "")
-                if not mid:
-                    continue
-                e = eff.setdefault(mid, MemoryEffectiveness())
-                ev = entry.get("event", "")
-                if ev == "loaded":
-                    e.loaded += 1
-                elif ev == "referenced":
-                    e.referenced += 1
-                elif ev == "accessed":
-                    e.accessed += 1
-                at = entry.get("at")
-                if at and (e.last_event_at is None or at > e.last_event_at):
-                    e.last_event_at = at
-    except Exception:
-        logger.debug("Failed to load effectiveness stats")
-    return eff
-
-
-@dataclass
-class SkillFrontmatter:
-    name: str
-    description: str
-    triggers: List[str] = field(default_factory=list)
-    version: Optional[str] = None
-    license: Optional[str] = None
-    always_active: bool = False  # If True, inject full body into session prompt unconditionally
-
-
-@dataclass
-class LoadedSkill:
-    frontmatter: SkillFrontmatter
-    body: str
-    source_path: Path
-    scope: str
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter IO
-# ---------------------------------------------------------------------------
-
-def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
-    """Parse --- yaml --- body from raw text.
-
-    Uses msgspec for fast YAML parsing if available (8x faster than PyYAML),
-    with fallback to PyYAML for edge cases.
-    """
-    s = raw.strip()
-    if s.startswith("\ufeff"):
-        s = s[1:]
-    if not s.startswith("---"):
-        return {}, raw
-    after_open = s[3:].lstrip("-\n")
-    close_idx = after_open.find("\n---")
-    if close_idx == -1:
-        return {}, raw
-    yaml_part = after_open[:close_idx]
-    body_part = after_open[close_idx + 4:].lstrip("-\n")
-
-    # Try msgspec first (fast path)
-    try:
-        import msgspec
-
-        class _FrontmatterStruct(msgspec.Struct):
-            id: str = ""
-            created: str = ""
-            source: str = "conversation"
-            confidence: str = "medium"
-            pinned: bool = False
-            tags: List[str] = []
-            supersedes: List[str] = []
-            zone: str = "general"
-            always_active: bool = False
-            rank: int = 0
-
-        # msgspec doesn't auto-parse datetime strings, so we pre-process
-        decoded = msgspec.yaml.decode(yaml_part, type=_FrontmatterStruct)
-        data = {
-            "id": decoded.id,
-            "created": decoded.created,
-            "source": decoded.source,
-            "confidence": decoded.confidence,
-            "pinned": decoded.pinned,
-            "tags": decoded.tags,
-            "supersedes": decoded.supersedes,
-            "zone": decoded.zone or "general",
-            "always_active": decoded.always_active,
-            "rank": decoded.rank,
-        }
-        return data, body_part
-    except Exception:
-        pass
-
-    # Fallback to PyYAML
-    try:
-        import yaml
-        data = yaml.safe_load(yaml_part) or {}
-    except Exception:
-        data = {}
-    return data, body_part
-
-
-def _serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
-    try:
-        import yaml
-        yaml_text = yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
-    except Exception:
-        yaml_text = ""
-    yaml_text = yaml_text.strip()
-    body_clean = body.strip()
-    return f"---\n{yaml_text}\n---\n\n{body_clean}\n"
-
-
-def _read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data, body = _parse_frontmatter(raw)
-        fm = MemoryFrontmatter(
-            id=data.get("id", ""),
-            created=data.get("created", ""),
-            source=data.get("source", "user"),
-            confidence=data.get("confidence", "medium"),
-            pinned=bool(data.get("pinned", False)),
-            tags=data.get("tags", []),
-            supersedes=data.get("supersedes", []),
-            zone=_normalize_zone(data.get("zone", "general")),
-            rank=int(data.get("rank", 0)),
-        )
-        return LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
-    except Exception as e:
-        logger.warning("Failed to read memory %s: %s", path, e)
-        return None
-
-
-def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "id": fm.id,
-        "created": fm.created,
-        "source": fm.source,
-        "confidence": fm.confidence,
-        "pinned": fm.pinned,
-        "tags": fm.tags,
-        "supersedes": fm.supersedes,
-        "zone": fm.zone,
-        "rank": fm.rank,
-    }
-    path.write_text(_serialize_frontmatter(data, body), encoding="utf-8")
-
-
-# P2-2: Async file writer — avoids blocking agent on disk I/O
-_write_queue: "queue.Queue[Tuple[Path, str]]" = queue.Queue()
-_pending_writes: Set[Path] = set()  # Track files being written (for delete safety)
-
-def _file_flush_worker() -> None:
-    """Drain write queue in background, writing files to disk."""
-    while True:
-        try:
-            item = _write_queue.get(timeout=1)
-        except Exception:
-            continue
-        if item is None:
-            break
-        path, content = item
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        except Exception:
-            logger.debug("Async write failed for %s", path)
-        finally:
-            _pending_writes.discard(path)
-
-_write_thread = threading.Thread(target=_file_flush_worker, daemon=True)
-_write_thread.start()
-
-def _async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
-    """Submit memory file write to background thread (P2-2)."""
-    data = {
-        "id": fm.id,
-        "created": fm.created,
-        "source": fm.source,
-        "confidence": fm.confidence,
-        "pinned": fm.pinned,
-        "tags": fm.tags,
-        "supersedes": fm.supersedes,
-        "zone": fm.zone,
-        "rank": fm.rank,
-    }
-    content = _serialize_frontmatter(data, body)
-    _pending_writes.add(path)
-    _write_queue.put((path, content))
-
-def _shutdown_file_writer() -> None:
-    """Flush remaining file writes on process exit."""
-    _write_queue.put(None)
-    _write_thread.join(timeout=5)
-
-_atexit.register(_shutdown_file_writer)
 
 
 # ---------------------------------------------------------------------------
@@ -854,7 +392,11 @@ class MemoryStore:
             # P2-2: if file is still pending async write, just remove from queue tracking
             _pending_writes.discard(path)
             if path.exists():
-                path.unlink()
+                try:
+                    path.unlink()
+                except OSError as e:
+                    logger.warning("Failed to delete memory file %s: %s", path, e)
+                    return False
             self._id_to_path.pop(mem_id, None)
             self._update_cache_for_delete(mem_id)
             self._try_remove_index(mem_id)
@@ -982,7 +524,95 @@ class MemoryStore:
             return self.project_root
         raise ValueError(f"Unknown scope: {scope}")
 
-    # -- search ---------------------------------------------------------------
+    # -- Fusion search (BM25 + Graph + Supersedes) ---------------------------------------
+
+    def _calc_supersedes_depth(self, memory_id: str, visited: Optional[Set[str]] = None,
+                               max_depth: int = 10) -> int:
+        """Follow supersedes chain recursively to compute depth.
+
+        depth=0: never superseded
+        depth=1: supersedes one other memory
+        depth=N: chain of N supersedes
+        Guarded against cycles via visited set and max_depth.
+        """
+        if visited is None:
+            visited = set()
+        if memory_id in visited or len(visited) >= max_depth:
+            return len(visited)
+        visited.add(memory_id)
+        m = self.get(memory_id)
+        if m is None:
+            return len(visited) - 1
+        supers = m.frontmatter.supersedes
+        if not supers:
+            return len(visited) - 1
+        # Follow the first supersedes link (linear chain assumption)
+        return self._calc_supersedes_depth(supers[0], visited, max_depth)
+
+    def fusion_search(self, query: str, k: int = 5,
+                      zone: Optional[str] = None,
+                      alpha: float = 0.7,
+                      beta: float = 0.3) -> List[LoadedMemory]:
+        """Unified fusion search: BM25 × Graph × Supersedes.
+
+        final_score = α * bm25_norm + β * (graph_activation / (1 + supersedes_depth))
+
+        This replaces the old two-stage "BM25 → graph_expanded as extra" pattern
+        with a single fused ranking.
+        """
+        active = self.list_active()
+        if not active:
+            return []
+
+        # Step 1: Get BM25 scores with effectiveness
+        effectiveness = self._get_effectiveness()
+        doc_tokens = self._ensure_doc_tokens(active)
+        scored = _bm25_search_scored(active, query, k * 2, effectiveness, doc_tokens)
+        if not scored:
+            return []
+
+        # Step 2: Normalize BM25 scores to [0, 1]
+        max_bm25 = max(s for _, s in scored)
+        if max_bm25 <= 0:
+            max_bm25 = 1.0
+
+        # Step 3: Get graph activation scores
+        gm = _get_graph_mgr()
+        has_graph = gm is not None
+
+        fused: List[Tuple[float, LoadedMemory]] = []
+        for mem, bm25_score in scored:
+            bm25_norm = bm25_score / max_bm25
+            graph_score = 0.0
+            supersedes_depth = 0
+
+            if has_graph:
+                # Get graph activation (1-hop BFS weight sum)
+                try:
+                    neighbors = gm.store.get_neighbors(mem.id(), min_weight=0.1, limit=20)
+                    graph_score = sum(n.get("weight", 0) for n in neighbors) / max(len(neighbors), 1)
+                    # Clamp to [0, 1]
+                    graph_score = min(1.0, graph_score)
+                except Exception:
+                    pass
+
+            # Calculate supersedes depth
+            supersedes_depth = self._calc_supersedes_depth(mem.id())
+
+            # Combined score: α * bm25 + β * (graph / (1 + depth))
+            sup_factor = 1.0 / (1.0 + supersedes_depth)
+            final_score = alpha * bm25_norm + beta * graph_score * sup_factor
+            fused.append((final_score, mem))
+
+        # Step 4: Re-sort by fused score
+        fused.sort(key=lambda x: x[0], reverse=True)
+        results = [m for _, m in fused[:k * 2]]
+
+        # Apply zone filter
+        if zone:
+            results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone)]
+
+        return results[:k]
 
     def _get_effectiveness(self) -> Dict[str, MemoryEffectiveness]:
         """Lazy-load effectiveness stats from JSONL. Cached per store instance."""
@@ -1010,19 +640,33 @@ class MemoryStore:
         # Try embedding first if available
         embed_results = self._embed_search(query, k)
         if embed_results is not None:
+            logger.debug("search: using embedding strategy for query=%r k=%d zone=%s", query, k, zone)
             id_set = {mid for mid, _ in embed_results}
             results = [m for m in active if m.id() in id_set]
             if zone:
                 results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone)]
             return results[:k]
         # Load effectiveness and cached doc_tokens
+        logger.debug("search: using BM25 strategy for query=%r k=%d zone=%s", query, k, zone)
         effectiveness = self._get_effectiveness()
         doc_tokens = self._ensure_doc_tokens(active)
-        return _tfidf_search(active, query, k, effectiveness, doc_tokens)
+        return _bm25_search(active, query, k, effectiveness, doc_tokens)
 
-    def check_conflict(self, body: str, threshold: float = 0.85) -> Optional[Tuple[str, float]]:
+    def check_conflict(self, body: str, threshold: Optional[float] = None) -> Optional[Tuple[str, float]]:
+        """Check for conflicting memories using BM25 similarity.
+
+        Complexity (P2-10): O(n·m) where n=active memories, m=query tokens.
+        At ~200 memories this is ~20ms — acceptable. Consider indexing if
+        exceeding 1000 memories.
+
+        Args:
+            body: text to check for conflicts
+            threshold: override (None = adaptive: 0.75 for CJK, 0.85 for Latin)
+        """
+        if threshold is None:
+            threshold = _adaptive_conflict_threshold(body)
         active = self.list_active()
-        scored = _tfidf_search_scored(active, body, 1)
+        scored = _bm25_search_scored(active, body, 1)
         if scored:
             m, score = scored[0]
             if score > threshold:
@@ -1115,6 +759,40 @@ def _is_cjk(c: str) -> bool:
     return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
 
 
+def _cjk_ratio(text: str) -> float:
+    """Return fraction of alphabet-like chars that are CJK in text.
+
+    Skips whitespace, digits, punctuation. Returns 0.0 for empty/short text.
+    Used for adaptive conflict threshold: CJK BM25 scores are more polarized
+    (0.65-0.75 for related vs 0.85-0.95 for Latin text).
+    """
+    letter_count = 0
+    cjk_count = 0
+    for c in text:
+        if c.isalpha():
+            letter_count += 1
+            if _is_cjk(c):
+                cjk_count += 1
+    if letter_count == 0:
+        return 0.0
+    return cjk_count / letter_count
+
+
+def _adaptive_conflict_threshold(body: str) -> float:
+    """Return conflict threshold based on CJK ratio.
+
+    CJK-dominant text (>40% CJK) → 0.75 (lower threshold catches more collisions)
+    Latin-dominant text → 0.85 (standard)
+    Mixed text (10-40%) → 0.80 (interpolated)
+    """
+    ratio = _cjk_ratio(body)
+    if ratio > 0.40:
+        return 0.75
+    elif ratio > 0.10:
+        return 0.80
+    return 0.85
+
+
 def _tokenise(s: str) -> List[str]:
     lower = s.lower()
     tokens = []
@@ -1139,42 +817,75 @@ def _memory_tokens(m: LoadedMemory) -> List[str]:
     return tokens
 
 
-def _tfidf_search(memories: List[LoadedMemory], query: str, k: int,
+def _bm25_search(memories: List[LoadedMemory], query: str, k: int,
                   effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
                   doc_tokens: Optional[List[Tuple[str, List[str]]]] = None) -> List[LoadedMemory]:
-    scored = _tfidf_search_scored(memories, query, k, effectiveness, doc_tokens)
+    scored = _bm25_search_scored(memories, query, k, effectiveness, doc_tokens)
     return [m for m, _ in scored]
 
 
-def _tfidf_search_scored(memories: List[LoadedMemory], query: str, k: int,
+def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int,
                          effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
                          doc_tokens: Optional[List[Tuple[str, List[str]]]] = None
                          ) -> List[Tuple[LoadedMemory, float]]:
+    """BM25 retrieval with effectiveness boosting.
+
+    BM25 formula (Robertson & Zaragoza, 2009):
+      score(D,Q) = Σ IDF(q_i) * TF_okapi(q_i,D) * (k1+1)/(TF_okapi(q_i,D)+k1*(1-b+b*|D|/avgdl))
+    
+    k1=1.5 (saturation), b=0.75 (length normalization) optimized for CJK mixed text.
+    Falls back gracefully for empty/singleton corpus.
+    """
+    k1, b = 1.5, 0.75
     if k == 0 or not memories:
         return []
     q_tokens = _tokenise(query)
     if not q_tokens:
         return []
     n = len(memories)
+
+    # Compute doc frequencies + doc lengths in one pass
     df: Dict[str, int] = Counter()
-    # Use pre-computed doc_tokens cache or compute on the fly
+    doc_lens: List[int] = []
     raw_doc_tokens: List[List[str]]
     if doc_tokens is not None:
         raw_doc_tokens = [tokens for _, tokens in doc_tokens]
     else:
         raw_doc_tokens = [_memory_tokens(m) for m in memories]
     for tokens in raw_doc_tokens:
+        doc_lens.append(len(tokens))
         for t in set(tokens):
             df[t] += 1
+
+    avgdl = sum(doc_lens) / max(n, 1)
+    
+    # BM25 IDF: log(1 + (N - df(q) + 0.5) / (df(q) + 0.5))
     q_tf = Counter(q_tokens)
-    q_vec = {t: (c / len(q_tokens)) * ((n / df[t]) + 1) for t, c in q_tf.items() if df.get(t)}
+    idf_cache: Dict[str, float] = {}
+    for t in q_tf:
+        df_t = df.get(t, 0)
+        if df_t == 0:
+            continue  # skip unseen terms
+        idf_cache[t] = (n - df_t + 0.5) / (df_t + 0.5) + 1.0  # add-one smoothing
+
+    if not idf_cache:
+        return []
+
     scored: List[Tuple[float, LoadedMemory]] = []
-    for tokens, m in zip(raw_doc_tokens, memories):
+    for i, (tokens, m) in enumerate(zip(raw_doc_tokens, memories)):
+        doc_len = doc_lens[i]
         m_tf = Counter(tokens)
-        m_vec = {t: (c / len(tokens)) * ((n / df[t]) + 1) for t, c in m_tf.items() if df.get(t)}
-        score = _cosine_similarity(q_vec, m_vec)
+        score = 0.0
+        for t, q_count in q_tf.items():
+            idf = idf_cache.get(t)
+            if idf is None:
+                continue
+            tf = m_tf.get(t, 0)
+            # BM25 term: (k1+1)*TF / (k1*(1-b+b*|D|/avgdl) + TF)
+            norm = k1 * (1 - b + b * doc_len / max(avgdl, 1))
+            score += idf * (tf * (k1 + 1)) / (tf + norm) * q_count  # q_count for multi-occur query terms
         if score > 0:
-            # Apply effectiveness factor if available
+            # Apply effectiveness boosting if available
             if effectiveness:
                 eff = effectiveness.get(m.id())
                 if eff:
@@ -1303,232 +1014,8 @@ def match_skills(skills: List[LoadedSkill], query: str, k: int = 3) -> List[Load
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return [s for _, _, s in scored[:k]]
 
-
-# ---------------------------------------------------------------------------
-# Reflection log
-# ---------------------------------------------------------------------------
-
-REFLECT_LOG_PATH = _plugin_data_dir() / "reflect-log.jsonl"
-
-
-def _append_reflect_log(entry: Dict[str, Any]) -> None:
-    try:
-        REFLECT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(REFLECT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
-def _recent_reflect_outcomes(n: int = 10) -> List[Dict[str, Any]]:
-    try:
-        if not REFLECT_LOG_PATH.exists():
-            return []
-        lines = REFLECT_LOG_PATH.read_text(encoding="utf-8").strip().split("\n")
-        out = []
-        for line in lines[-n:]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-        return out
-    except Exception:
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Reflection prompts
-# ---------------------------------------------------------------------------
-
-_FULL_REFLECT_SYSTEM = """You are a reflection module for a self-evolving agent. After each completed
-session you are given the full transcript plus the agent's current skill /
-memory inventory. Your job is to identify three things, and only when each
-case truly meets the bar:
-
-1. SKILL CANDIDATES — reusable procedures the agent worked out, with clear
-triggers and a self-contained body of instructions in markdown. Only
-propose if you would genuinely want the same procedure applied next
-time the same situation appears. Skip anything that was a one-shot
-exploration.
-
-2. MEMORY CANDIDATES — durable facts, conventions, preferences, or
-constraints the agent discovered that should persist across sessions.
-One claim per memory. Default `scope` to `user`; pick `project` only
-when the fact is specific to the current repo / codebase.
-
-3. CONFLICTS — when a new memory candidate contradicts, duplicates, or
-subsumes an existing memory, report a conflict referencing the existing
-memory id and proposing resolution options. Use kind "stale" when an
-existing memory is factually wrong or outdated.
-
-CRITICAL — the agent's user sees every candidate and must decide. Spammy
-proposals erode trust. Default to empty arrays. Prefer false negatives over
-false positives. Confidence = "high" should be rare.
-
-Reply with EXACTLY ONE JSON object matching this schema. No prose. No
-markdown fences. No commentary.
-
-{
-  "summary": "<one sentence summarising what the session accomplished>",
-  "skill_candidates": [
-    {
-      "name": "kebab-case-name",
-      "description": "one-line description for matcher",
-      "triggers": ["keyword", "phrase"],
-      "body": "## Title\n\nFull markdown instructions, multi-line.",
-      "rationale": "why this is reusable enough to keep",
-      "confidence": "low" | "medium" | "high"
-    }
-  ],
-  "memory_candidates": [
-    {
-      "fact": "one short statement; one fact per memory",
-      "tags": ["rust", "convention"],
-      "scope": "user" | "project",
-      "confidence": "low" | "medium" | "high",
-      "rationale": "why this should persist",
-      "supersedes": ["mem_xxxx"]
-    }
-  ],
-  "conflicts": [
-    {
-      "with": "mem_xxxx",
-      "kind": "contradiction" | "redundancy" | "scope_overlap" | "stale",
-      "explain": "what the disagreement is",
-      "options": ["keep_old", "keep_new", "merge", "scope_split"]
-    }
-  ]
-}"""
-
-_MICRO_REFLECT_SYSTEM = """You are a micro-reflection module. You just observed ONE turn of conversation (user request + assistant response). Decide if anything from this turn is worth persisting as a memory or skill, and whether any existing memory is now stale.
-
-Rules:
-- Default to empty arrays. Most turns produce nothing.
-- Only propose a memory if the user stated a durable preference, convention, or fact.
-- Only propose a skill if the assistant followed a multi-step procedure that would be reusable verbatim next time.
-- Never propose more than 1 memory and 1 skill per micro-reflection.
-- Confidence should be "low" or "medium" — never "high" for micro-reflection.
-- If the conversation reveals that an existing memory is WRONG or OUTDATED, produce a memory_candidates entry with the corrected fact and set `supersedes` to the old memory's id, plus a conflicts entry with kind "stale".
-
-Reply with EXACTLY ONE JSON object:
-{
-  "summary": "<one sentence>",
-  "skill_candidates": [],
-  "memory_candidates": [{"fact": "<short statement>", "tags": [], "scope": "user", "confidence": "low|medium", "rationale": "<why>", "supersedes": ["mem_xxx"]}],
-  "conflicts": [{"with": "mem_xxx", "kind": "stale", "explain": "<why old memory is wrong>", "options": ["keep_new", "keep_old"]}]
-}"""
-
-
 # ---------------------------------------------------------------------------
 # Reflection runner
-# ---------------------------------------------------------------------------
-
-def _strip_code_fence(s: str) -> str:
-    s = s.strip()
-    for prefix in ("```json", "```"):
-        if s.startswith(prefix):
-            rest = s[len(prefix):].strip()
-            if "```" in rest:
-                rest = rest[:rest.rfind("```")]
-            return rest.strip()
-    if "{" in s:
-        return s[s.find("{"):]
-    return s
-
-
-def _repair_truncated_json(s: str) -> Optional[str]:
-    s = s.strip()
-    if not s.startswith("{"):
-        return None
-    curly = square = 0
-    in_str = escape = False
-    last_safe = None
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if escape:
-            escape = False
-            i += 1
-            continue
-        if ch == "\\" and in_str:
-            escape = True
-            i += 1
-            continue
-        if ch == '"':
-            in_str = not in_str
-            i += 1
-            continue
-        if in_str:
-            i += 1
-            continue
-        if ch == "{":
-            curly += 1
-        elif ch == "}":
-            curly -= 1
-            if curly == 1:
-                rest = s[i + 1:].lstrip()
-                if rest.startswith(","):
-                    last_safe = i + 2
-                elif rest.startswith("}"):
-                    last_safe = i + 1
-        elif ch == "[":
-            square += 1
-        elif ch == "]":
-            square -= 1
-            if square == 0 and curly == 1:
-                rest = s[i + 1:].lstrip()
-                if rest.startswith(","):
-                    last_safe = i + 2
-                elif rest.startswith("}"):
-                    last_safe = i + 1
-        i += 1
-    if curly <= 0 and square <= 0:
-        return None
-    repaired = s[:last_safe].rstrip() if last_safe is not None else s
-    if repaired.endswith(","):
-        repaired = repaired[:-1]
-    # Recount
-    c2 = s2 = 0
-    in_str = False
-    for ch in repaired:
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == "{":
-            c2 += 1
-        elif ch == "}":
-            c2 -= 1
-        elif ch == "[":
-            s2 += 1
-        elif ch == "]":
-            s2 -= 1
-    for _ in range(max(s2, 0)):
-        repaired += "]"
-    for _ in range(max(c2, 0)):
-        repaired += "}"
-    return repaired
-
-
-def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
-    json_str = _strip_code_fence(text)
-    try:
-        return json.loads(json_str)
-    except Exception as first_err:
-        repaired = _repair_truncated_json(json_str)
-        if repaired:
-            try:
-                return json.loads(repaired)
-            except Exception:
-                pass
-        logger.warning("Reflection JSON parse failed: %s", first_err)
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Plugin state
 # ---------------------------------------------------------------------------
@@ -1564,7 +1051,18 @@ def _build_context_block(query: str = "") -> str:
     1. Palace mode: inject palace index (zone map), agent uses tools for retrieval
     2. Profile mode: inject compiled profile.md if available, no per-turn injection
     3. Legacy mode: pinned + active index + per-turn TF-IDF relevance injection
+
+    Note (P2-22): Entire function is wrapped in try/except so a failure in any
+    stage degrades gracefully to empty context rather than failing the hook.
     """
+    try:
+        return _build_context_block_inner(query)
+    except Exception as e:
+        logger.warning("Context block build failed: %s", e, exc_info=True)
+        return ""
+
+
+def _build_context_block_inner(query: str = "") -> str:
     mem_store = _get_mem_store()
     skill_store = _get_skill_store()
     parts: List[str] = []
@@ -1678,653 +1176,6 @@ def _build_context_block(query: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool handlers
-# ---------------------------------------------------------------------------
-
-def _tool_srh_memory_search(args: dict, **kwargs) -> str:
-    query = args.get("query", "")
-    k = int(args.get("k", 5))
-    zone_filter = args.get("zone")  # Optional zone scope
-    mem_store = _get_mem_store()
-    results = mem_store.search(query, k)
-    # Apply zone filter if specified
-    if zone_filter:
-        results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone_filter)][:k]
-    out = []
-    for m in results:
-        out.append({
-            "id": m.id(),
-            "scope": m.scope,
-            "confidence": m.frontmatter.confidence,
-            "pinned": m.frontmatter.pinned,
-            "tags": m.frontmatter.tags,
-            "zone": m.frontmatter.zone,
-            "body": m.body[:500],
-        })
-        record_memory_stat(m.id(), "accessed")
-
-    # ── Graph-enhanced expansion ─────────────────────────
-    # Enrich search results with graph-neighbor memories.
-    return json.dumps(
-        _enrich_with_graph([m.id() for m in results], out, k, zone_filter=_normalize_zone(zone_filter) if zone_filter else None),
-        ensure_ascii=False,
-    )
-
-
-def _tool_srh_memory_write(args: dict, **kwargs) -> str:
-    mem_store = _get_mem_store()
-    body = args.get("body", "").strip()
-    if not body:
-        return json.dumps({"error": "body is required"})
-    scope = args.get("scope", "user")
-    confidence = args.get("confidence", "medium")
-    tags = args.get("tags", [])
-    pinned = bool(args.get("pinned", False))
-    supersedes = args.get("supersedes", [])
-    zone = _normalize_zone(args.get("zone"))
-
-    # Conflict check
-    conflict = mem_store.check_conflict(body)
-    if conflict:
-        existing_id, score = conflict
-        return json.dumps({
-            "error": f"Conflict detected with {existing_id} (similarity {score:.2f}). Use supersedes to override.",
-            "conflict_with": existing_id,
-            "similarity": score,
-        })
-
-    fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags, zone=zone)
-    fm.pinned = pinned
-    fm.supersedes = supersedes
-    path = mem_store.put(scope, fm, body)
-    return json.dumps({
-        "success": True,
-        "id": fm.id,
-        "path": str(path),
-    })
-
-
-def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
-    mem_store = _get_mem_store()
-    mem_id = args.get("id", "")
-    scope = args.get("scope", "user")
-    if not mem_id:
-        return json.dumps({"error": "id is required"})
-    ok = mem_store.delete(scope, mem_id)
-    return json.dumps({"success": ok, "id": mem_id})
-
-
-def _tool_srh_skill_search(args: dict, **kwargs) -> str:
-    query = args.get("query", "")
-    k = int(args.get("k", 3))
-    skill_store = _get_skill_store()
-    skills = match_skills(skill_store.list(), query, k)
-    out = []
-    for s in skills:
-        out.append({
-            "name": s.frontmatter.name,
-            "description": s.frontmatter.description,
-            "triggers": s.frontmatter.triggers,
-            "scope": s.scope,
-        })
-    return json.dumps({"results": out}, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# Palace tools (zone-based memory navigation)
-# ---------------------------------------------------------------------------
-
-def _tool_srh_palace_zones(args: dict, **kwargs) -> str:
-    """List all Memory Palace zones with memory counts."""
-    mem_store = _get_mem_store()
-    groups = mem_store.group_by_zone()
-    if not groups:
-        return json.dumps({"zones": [], "total": 0, "message": "Memory Palace is empty — no memories yet."})
-    zones = []
-    total = 0
-    for zone, mems in sorted(groups.items()):
-        zones.append({"zone": zone, "count": len(mems)})
-        total += len(mems)
-    return json.dumps({"zones": zones, "total": total}, ensure_ascii=False)
-
-
-def _tool_srh_palace_read_zone(args: dict, **kwargs) -> str:
-    """Load all memories from a specific zone. Returns cached summary if available."""
-    zone = _normalize_zone(args.get("zone"))
-    mem_store = _get_mem_store()
-
-    # Try cached summary first
-    cached = load_zone_summary(zone)
-    if cached:
-        return json.dumps({
-            "zone": zone,
-            "source": "cache",
-            "content": cached,
-        }, ensure_ascii=False)
-
-    # Load raw memories from the zone
-    zone_mems = mem_store.list_by_zone(zone)
-    if not zone_mems:
-        return json.dumps({
-            "zone": zone,
-            "source": "live",
-            "memories": [],
-            "message": f"Zone '{zone}' is empty or does not exist.",
-        }, ensure_ascii=False)
-
-    # Record access stats
-    for m in zone_mems:
-        record_memory_stat(m.id(), "accessed")
-
-    memories = []
-    for m in zone_mems:
-        memories.append({
-            "id": m.id(),
-            "confidence": m.frontmatter.confidence,
-            "pinned": m.frontmatter.pinned,
-            "tags": m.frontmatter.tags,
-            "body": m.body[:500],
-        })
-    return json.dumps({
-        "zone": zone,
-        "source": "live",
-        "count": len(memories),
-        "memories": memories,
-    }, ensure_ascii=False)
-
-
-def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
-    """Search memories by topic, optionally scoped to a zone."""
-    query = args.get("topic", "")
-    if not query:
-        return json.dumps({"error": "topic is required"})
-    k = int(args.get("limit", 5))
-    zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
-
-    mem_store = _get_mem_store()
-    results = mem_store.search(query, k=k * 3)  # Over-fetch for zone filtering
-
-    # Apply zone filter if specified
-    if zone:
-        results = [m for m in results if m.frontmatter.zone == zone][:k]
-    else:
-        results = results[:k]
-
-    if not results:
-        scope_msg = f" in zone '{zone}'" if zone else ""
-        return json.dumps({
-            "results": [],
-            "message": f"No memories matching '{query}'{scope_msg}",
-        }, ensure_ascii=False)
-
-    # Record access stats
-    for m in results:
-        record_memory_stat(m.id(), "accessed")
-
-    out = []
-    for i, m in enumerate(results):
-        out.append({
-            "rank": i + 1,
-            "id": m.id(),
-            "zone": m.frontmatter.zone,
-            "confidence": m.frontmatter.confidence,
-            "tags": m.frontmatter.tags,
-            "body": m.body[:500],
-        })
-    # ── Graph-enhanced expansion ─────────────────────────
-    # Enrich palace recall results with graph-neighbor memories.
-    result_mids = [m.id() for m in results]
-    return json.dumps(
-        _enrich_with_graph(result_mids, out, k, zone_filter=zone),
-        ensure_ascii=False,
-    )
-
-
-def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
-    """Trigger a full reflection on the current session messages."""
-    ctx = args.get("ctx")
-    messages = args.get("messages", [])
-    if not ctx:
-        return json.dumps({
-            "error": "Reflection requires ctx with LLM access. Run via /reflect slash command or wait for session-end auto-reflection.",
-            "recent_outcomes": _recent_reflect_outcomes(5),
-        })
-    if not messages:
-        return json.dumps({"error": "No messages to reflect on"})
-    try:
-        result = _run_full_reflection(ctx, messages)
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-# ---------------------------------------------------------------------------
-# Profile Compilation (LLM-compiled memory summary, mirrors small-rust-hermes compile.rs)
-# ---------------------------------------------------------------------------
-
-_COMPILE_PROFILE_SYSTEM = """You are a memory curator. Given a list of individual memory entries about a user accumulated over multiple conversations, compile them into a structured profile document.
-
-Rules:
-- Use ## markdown headers to organize by topic (categories emerge naturally from the content)
-- Merge overlapping or redundant memories into single concise entries
-- Use bullet points, one line per point
-- Preserve the user's language (Chinese / English as found in entries)
-- Drop entries that are trivially obvious or redundant after merging
-- Output ONLY the profile markdown, no preamble or explanation"""
-
-_COMPILE_PALACE_INDEX_SYSTEM = """You are a memory curator organizing a Memory Palace index. Given memories grouped by zone, produce a concise zone map.
-
-Rules:
-- Use ## Memory Palace as the top header
-- Show total memory count and zone count in the first line
-- For each zone, use ### zone_name (count) as header
-- Under each zone, list 2-3 bullet points summarizing key content
-- Keep the entire output under 300 tokens
-- Preserve the user's language (Chinese / English as found in entries)
-- Output ONLY the index markdown, no preamble"""
-
-_COMPILE_ZONE_SYSTEM = """You are a memory curator. Given all memories from a single zone, compile them into a concise summary.
-
-Rules:
-- Use bullet points, one line per point
-- Merge overlapping or redundant memories
-- Preserve the user's language (Chinese / English as found in entries)
-- Keep the output under 400 tokens
-- Output ONLY the summary markdown, no preamble"""
-
-
-def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
-    """Compile active memories into a structured markdown document via LLM.
-
-    Args:
-        ctx: Hermes agent context with ctx.llm access
-        mode: "profile" (profile.md), "palace_index" (palace-index.md), or "zone" (zone-cache/*)
-
-    Returns:
-        Dict with 'success', 'path', 'mode', 'token_count' or 'error'
-    """
-    if not hasattr(ctx, "llm"):
-        return {"error": "No LLM available for compilation"}
-
-    mem_store = _get_mem_store()
-    active = mem_store.list_active()
-    if not active:
-        return {"error": "No active memories to compile"}
-
-    try:
-        if mode == "profile":
-            system = _COMPILE_PROFILE_SYSTEM
-            prompt = _build_compile_profile_prompt(active)
-            save_path = _plugin_data_dir() / "profile.md"
-        elif mode == "palace_index":
-            system = _COMPILE_PALACE_INDEX_SYSTEM
-            prompt = _build_compile_palace_prompt(active)
-            save_path = _palace_index_path()
-        elif mode == "zone":
-            # Compile all zones
-            results = {}
-            groups = mem_store.group_by_zone()
-            for zone, mems in groups.items():
-                prompt = _build_compile_zone_prompt(zone, mems)
-                result = ctx.llm.complete_structured(
-                    instructions=prompt,
-                    input=[{"type": "text", "text": prompt}],
-                    system_prompt=_COMPILE_ZONE_SYSTEM,
-                    purpose=f"compile_zone_{_sanitize_zone_filename(zone)}",
-                    max_tokens=1024,
-                )
-                if result and not result.error:
-                    text = result.text.strip() if hasattr(result, 'text') else str(result)
-                    save_zone_summary(zone, text)
-                    results[zone] = {"tokens": len(text.split())}
-                else:
-                    results[zone] = {"error": str(result.error) if result and hasattr(result, 'error') else "unknown"}
-            return {"success": True, "mode": "zone", "zones": results}
-        else:
-            return {"error": f"Unknown compilation mode: {mode}"}
-
-        result = ctx.llm.complete_structured(
-            instructions=prompt,
-            input=[{"type": "text", "text": prompt}],
-            system_prompt=system,
-            purpose=f"compile_{mode}",
-            max_tokens=4096,
-        )
-
-        if not result or result.error:
-            return {"error": f"LLM compilation failed: {getattr(result, 'error', 'unknown')}"}
-
-        text = result.text.strip() if hasattr(result, 'text') else str(result)
-        if not text:
-            return {"error": "LLM returned empty response"}
-
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path.write_text(text, encoding="utf-8")
-
-        return {
-            "success": True,
-            "mode": mode,
-            "path": str(save_path),
-            "token_count": len(text.split()),
-        }
-    except Exception as e:
-        logger.warning("Profile compilation failed: %s", e)
-        return {"error": str(e)}
-
-
-def _build_compile_profile_prompt(memories: List[LoadedMemory]) -> str:
-    """Build user prompt for profile compilation."""
-    buf = "Compile the following memory entries into a structured profile:\n\n"
-    for m in memories:
-        pin = "pinned, " if m.frontmatter.pinned else ""
-        conf = m.frontmatter.confidence
-        buf += f"- [{m.id()}] ({pin}{conf}, zone={m.frontmatter.zone}) {m.body.strip()}\n"
-    return buf
-
-
-def _build_compile_palace_prompt(memories: List[LoadedMemory]) -> str:
-    """Build user prompt for palace index compilation."""
-    groups: Dict[str, List[LoadedMemory]] = {}
-    for m in memories:
-        groups.setdefault(m.frontmatter.zone, []).append(m)
-    buf = "Organize these memories into a palace index:\n\n"
-    for zone, mems in sorted(groups.items()):
-        buf += f"### {zone} ({len(mems)} memories)\n"
-        for m in mems:
-            buf += f"- {m.body.strip()}\n"
-        buf += "\n"
-    return buf
-
-
-def _build_compile_zone_prompt(zone: str, memories: List[LoadedMemory]) -> str:
-    """Build user prompt for zone summary compilation."""
-    buf = f"Summarize zone '{zone}' ({len(memories)} memories):\n\n"
-    for m in memories:
-        buf += f"- ({m.frontmatter.confidence}) {m.body.strip()}\n"
-    return buf
-
-
-def _tool_srh_compile_profile(args: dict, **kwargs) -> str:
-    """Compile memories into a structured profile via LLM."""
-    ctx = args.get("ctx")
-    if not ctx:
-        return json.dumps({
-            "error": "Compilation requires ctx with LLM access. Use /compile-profile slash command.",
-        })
-    mode = args.get("mode", "profile")
-    result = _compile_profile_via_llm(ctx, mode)
-    return json.dumps(result, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# Hooks
-# ---------------------------------------------------------------------------
-
-def _on_session_start(**kwargs) -> None:
-    global _turns_since_reflect
-    _turns_since_reflect = 0
-    logger.debug("mem-reflection-hermes: session started")
-
-
-
-def _on_session_end(**kwargs) -> None:
-    messages = kwargs.get("messages", [])
-
-    # ── Periodic graph decay ──────────────────────────────
-    # Run Ebbinghaus decay on graph edges every session end so weights
-    # naturally fade for connections that are no longer reinforced.
-    try:
-        gm = _get_graph_mgr()
-        if gm is not None:
-            gm.run_decay()
-    except Exception as e:
-        logger.warning("ahe_graph decay skipped: %s", e)
-
-    if not messages:
-        return
-    # Attempt full reflection via LLM if available
-    ctx = kwargs.get("ctx")
-    if ctx is not None:
-        try:
-            _run_full_reflection(ctx, messages)
-        except Exception as e:
-            logger.warning("Full reflection failed: %s", e)
-    else:
-        logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
-
-
-def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
-    """Inject layered context into the user message; also trigger micro-reflection."""
-    messages = kwargs.get("messages", [])
-    ctx = kwargs.get("ctx")
-
-    # Extract latest user query and assistant response for micro-reflection
-    user_msg = ""
-    assistant_msg = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant" and not assistant_msg:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                assistant_msg = content
-        elif msg.get("role") == "user" and not user_msg:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                user_msg = content
-        if user_msg and assistant_msg:
-            break
-
-    # Trigger micro-reflection: explicit intent always, otherwise every 3 turns
-    # (mirrors small-rust-hermes simplified heuristic)
-    if _micro_reflection_enabled() and user_msg and assistant_msg:
-        global _turns_since_reflect
-        has_intent = _is_explicit_memory_intent(user_msg)
-        if has_intent or _turns_since_reflect >= 3:
-            try:
-                _run_micro_reflection(ctx, user_msg, assistant_msg)
-                _turns_since_reflect = 0
-            except Exception as e:
-                logger.debug("Micro-reflection failed: %s", e)
-        else:
-            _turns_since_reflect += 1
-
-    # Build context block
-    query = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user" and msg.get("content"):
-            query = msg.get("content", "")
-            if isinstance(query, str):
-                break
-            query = ""
-    context = _build_context_block(query)
-    if context:
-        return {"context": context}
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Register
-# ---------------------------------------------------------------------------
-
-def register(ctx) -> None:
-    """Register the mem-reflection-hermes plugin."""
-    # Register tools
-    ctx.register_tool(
-        name="srh_memory_search",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_search",
-            "description": "Search active memories by TF-IDF relevance (or embedding if available). Use 'zone' parameter to filter by zone.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
-                    "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
-                },
-                "required": ["query"],
-            },
-        },
-        handler=_tool_srh_memory_search,
-        description="Search memories by relevance",
-        emoji="🧠",
-    )
-    ctx.register_tool(
-        name="srh_memory_write",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_write",
-            "description": "Write a new structured memory with YAML frontmatter. Checks for conflicts. Specify zone to organize memories.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "body": {"type": "string", "description": "Memory content (one short fact)"},
-                    "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
-                    "confidence": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 20},
-                    "pinned": {"type": "boolean", "default": False},
-                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 5},
-                    "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
-                },
-                "required": ["body"],
-            },
-        },
-        handler=_tool_srh_memory_write,
-        description="Write a structured memory",
-        emoji="📝",
-    )
-    ctx.register_tool(
-        name="srh_memory_delete",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_delete",
-            "description": "Delete a memory by id from a scope.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Memory id"},
-                    "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
-                },
-                "required": ["id"],
-            },
-        },
-        handler=_tool_srh_memory_delete,
-        description="Delete a memory",
-        emoji="🗑️",
-    )
-    ctx.register_tool(
-        name="srh_skill_search",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_skill_search",
-            "description": "Search skills by token overlap relevance.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 100},
-                },
-                "required": ["query"],
-            },
-        },
-        handler=_tool_srh_skill_search,
-        description="Search skills by relevance",
-        emoji="🔧",
-    )
-    ctx.register_tool(
-        name="srh_reflect_now",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_reflect_now",
-            "description": "Trigger or check status of reflection pipeline.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        handler=_tool_srh_reflect_now,
-        description="Trigger reflection",
-        emoji="🔍",
-    )
-
-    # Palace tools (zone-based memory navigation)
-    ctx.register_tool(
-        name="srh_palace_zones",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_zones",
-            "description": "List all Memory Palace zones with memory counts. Use this to discover what zones exist before reading details.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        handler=_tool_srh_palace_zones,
-        description="List memory zones",
-        emoji="🏰",
-    )
-    ctx.register_tool(
-        name="srh_palace_read_zone",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_read_zone",
-            "description": "Load all memories from a specific zone. Returns cached zone summary if available, otherwise raw memory bodies.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "zone": {"type": "string", "description": "Zone name (core, work, episode, general, or project:<name>)"},
-                },
-                "required": ["zone"],
-            },
-        },
-        handler=_tool_srh_palace_read_zone,
-        description="Read a memory zone",
-        emoji="📂",
-    )
-    ctx.register_tool(
-        name="srh_palace_recall",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_recall",
-            "description": "Search memories by topic, optionally scoped to a zone. More focused than srh_memory_search — use this for palace navigation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "What to recall (e.g. 'editor preference', 'error handling convention')"},
-                    "limit": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 50},
-                    "zone": {"type": "string", "description": "Optional: restrict to a specific zone"},
-                },
-                "required": ["topic"],
-            },
-        },
-        handler=_tool_srh_palace_recall,
-        description="Recall by topic",
-        emoji="🔎",
-    )
-
-    # Profile compilation tool (LLM-driven)
-    ctx.register_tool(
-        name="srh_compile_profile",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_compile_profile",
-            "description": "Compile all active memories into a structured profile document via LLM. Modes: 'profile' (profile.md), 'palace_index' (palace index), 'zone' (per-zone summaries).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "default": "profile", "description": "Compilation mode"},
-                },
-            },
-        },
-        handler=_tool_srh_compile_profile,
-        description="Compile memories into profile",
-        emoji="📋",
-    )
-
-    # Register hooks
-    ctx.register_hook("on_session_start", _on_session_start)
-    ctx.register_hook("on_session_end", _on_session_end)
-    ctx.register_hook("pre_llm_call", _pre_llm_call)
-
     # Register slash commands
     ctx.register_command(
         name="reflect",
@@ -2376,18 +1227,35 @@ def register(ctx) -> None:
         try:
             from .ahe_graph import get_graph_manager as _get_gm
         except ImportError:
+            logger.debug("Relative import of ahe_graph failed (expected for standalone plugin load), trying importlib fallback")
             # Standalone plugin load: __package__ may be empty, so relative
             # import fails. Fallback to importlib-based absolute load.
             import importlib.util as _iutil
             import sys as _sys
             _ahe_path = str(Path(__file__).parent / "ahe_graph" / "__init__.py")
-            _ahe_spec = _iutil.spec_from_file_location(
-                "mem_reflection_hermes.ahe_graph", _ahe_path
-            )
-            _ahe_mod = _iutil.module_from_spec(_ahe_spec)
-            _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
-            _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
-            _get_gm = _ahe_mod.get_graph_manager
+            if not Path(_ahe_path).exists():
+                logger.warning("ahe_graph module not found at %s — graph features disabled", _ahe_path)
+                _get_gm = None  # type: ignore
+            else:
+                _ahe_spec = _iutil.spec_from_file_location(
+                    "mem_reflection_hermes.ahe_graph", _ahe_path
+                )
+                if _ahe_spec is None or _ahe_spec.loader is None:
+                    logger.warning("ahe_graph spec could not be loaded — graph features disabled")
+                    _get_gm = None  # type: ignore
+                else:
+                    try:
+                        _ahe_mod = _iutil.module_from_spec(_ahe_spec)
+                        _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
+                        _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
+                        _get_gm = _ahe_mod.get_graph_manager
+                        logger.info("ahe_graph loaded successfully via importlib fallback")
+                    except Exception as _ahe_err:
+                        logger.warning(
+                            "ahe_graph loaded but raised %s: %s — graph features disabled",
+                            type(_ahe_err).__name__, _ahe_err,
+                        )
+                        _get_gm = None  # type: ignore
 
         # ── Common graph setup (runs regardless of import path) ──
         # Lazy-init on first use
@@ -2456,8 +1324,30 @@ def register(ctx) -> None:
             task_type = args.get("task_type", "reasoning")
             max_res = min(args.get("max_results", 10), 100)
             tier = args.get("tier", "list")
+            # Auto-detect strategy from seed memory zones when task_type is default
+            if task_type == "reasoning" and mids and gm.store:
+                try:
+                    zones = set()
+                    for mid in mids:
+                        meta = gm.store.get_meta(mid)
+                        if meta and meta.get("zone"):
+                            zones.add(meta.get("zone"))
+                    # Map seed zones to best strategy
+                    zone_strategy_map = {
+                        "core": "factual",
+                        "work": "reasoning",
+                        "episode": "recent",
+                        "general": "exploration",
+                    }
+                    for z in zones:
+                        inferred = zone_strategy_map.get(z)
+                        if inferred:
+                            task_type = inferred
+                            break
+                except Exception:
+                    pass  # fallback to "reasoning"
             results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
-            return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier})
+            return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier, "strategy": task_type})
 
         ctx.register_tool(
             name="srh_graph_retrieve",
@@ -2521,6 +1411,50 @@ def register(ctx) -> None:
             emoji="📊",
         )
 
+        # ── P2-3: srh_graph_viz — graph visualization data ──
+        def _graph_viz_h(args: dict, **kwargs) -> str:
+            """Return full graph data for dashboard visualization."""
+            gm = _ensure_gm()
+            tier = args.get("tier", "summary")
+            stats = gm.get_stats(tier="detail")
+            if stats.get("node_count", 0) == 0:
+                return json.dumps({"nodes": [], "edges": [], "stats": stats})
+            try:
+                conn = gm.store._connect()
+                nodes = conn.execute(
+                    "SELECT id, zone, importance, strength, status, access_count FROM graph_memory_meta "
+                    "WHERE strength > 0 ORDER BY importance DESC LIMIT 200"
+                ).fetchall()
+                edges = conn.execute(
+                    "SELECT source_id, target_id, relation, weight FROM graph_edges "
+                    "WHERE weight >= 0.1 ORDER BY weight DESC LIMIT 500"
+                ).fetchall()
+                return json.dumps({
+                    "nodes": [dict(r) for r in nodes],
+                    "edges": [dict(r) for r in edges],
+                    "stats": stats,
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e), "stats": stats})
+
+        ctx.register_tool(
+            name="srh_graph_viz",
+            toolset="mem_reflection_hermes",
+            schema={
+                "name": "srh_graph_viz",
+                "description": "Get full graph visualization data (nodes + edges) for dashboard rendering. tier='summary' returns counts only; 'detail' returns full node/edge lists.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tier": {"type": "string", "enum": ["summary", "detail"], "default": "summary"},
+                    },
+                },
+            },
+            handler=_graph_viz_h,
+            description="Graph viz data for dashboard",
+            emoji="🕸️",
+        )
+
         # --- hook: auto-associate on memory write ---
         def _post_tool_associate(ctx_hook, context: dict) -> dict:
             try:
@@ -2548,19 +1482,41 @@ def register(ctx) -> None:
                     zone = args.get("zone", "general")
                     gm.store.ensure_meta(memory_id, zone=zone)
                     gm.store.record_access(memory_id)
+
+                    # ── Scheme A-1: Supersedes-aware edge migration ──────────
+                    supersedes_ids = args.get("supersedes", [])
+                    if supersedes_ids and isinstance(supersedes_ids, list):
+                        for old_id in supersedes_ids:
+                            # Mark old memory as inactive in graph
+                            gm.store.update_importance(old_id, delta=-0.9)
+                            gm.store._connect().execute(
+                                "UPDATE graph_memory_meta SET strength=0, status='superseded' WHERE id=?",
+                                (old_id,)
+                            )
+                            # Migrate old edges to new memory (weight * 0.3)
+                            old_edges = gm.store.get_edges(old_id)
+                            for edge in old_edges:
+                                src, tgt = edge["source_id"], edge["target_id"]
+                                neigh = tgt if src == old_id else src
+                                rel = edge.get("relation", "co_occurs")
+                                old_w = edge.get("weight", 0.5)
+                                # Copy edge from new memory to neighbor with decayed weight
+                                gm.store.set_edge_weight(memory_id, neigh, relation=rel,
+                                                     weight=old_w * 0.3)
+                            conn = gm.store._connect()
+                            conn.commit()
                 elif tool_name == "srh_memory_delete":
                     # Clean up graph metadata and edges for this memory
                     mem_id = args.get("id", "")
                     if mem_id:
+                        # ── Scheme A-2: Soft-delete (mark inactive) instead of hard delete ──
+                        gm.store.update_importance(mem_id, delta=-0.9)
                         gm.store._connect().execute(
-                            "DELETE FROM graph_memory_meta WHERE id=?",
+                            "UPDATE graph_memory_meta SET strength=0, status='deleted' WHERE id=?",
                             (mem_id,)
                         )
-                        gm.store._connect().execute(
-                            "DELETE FROM graph_edges WHERE source_id=? OR target_id=?",
-                            (mem_id, mem_id)
-                        )
-                        gm.store._connect().commit()
+                        # Decay connected edges heavily
+                        gm.store.decay_edges(decay_rate=0.9)
             except Exception as e:
                 logger.debug("ahe_graph auto-associate: %s", e)
             return context
@@ -2606,1303 +1562,10 @@ def register(ctx) -> None:
         logger.warning("ahe_graph integration error: %s", e)
 
 
-# ── Graph manager global singleton (set during plugin init) ─────────
-_gm_getter_func = None
-_gm_getter_path = None
-_gm_singleton = None
-_gm_singleton_lock = threading.Lock()
-
-
-def _get_graph_mgr():
-    """Get or create graph manager singleton (thread-safe, module-level)."""
-    global _gm_singleton
-    if _gm_singleton is None and _gm_getter_func is not None:
-        with _gm_singleton_lock:
-            if _gm_singleton is None:
-                _gm_singleton = _gm_getter_func(_gm_getter_path)
-    return _gm_singleton
-
-
-# ── Graph neighbor helper (used by search/palace tools) ───────────────────
-
-def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5,
-                         zone_filter: Optional[str] = None) -> List[Tuple[str, float]]:
-    """Look up graph neighbors for the given memory IDs.
-
-    Returns deduplicated (memory_id, weight) pairs, sorted by weight descending.
-    If zone_filter is provided, only returns neighbors whose zone matches.
-    Gracefully returns empty list if ahe_graph is not available or has no data.
-    """
-    try:
-        gm = _get_graph_mgr()
-        if gm is None:
-            return []
-        results = gm.store.propagate_activation(
-            seed_ids=memory_ids,
-            max_depth=1,
-            decay_factor=0.7,
-            min_weight=0.2,
-            limit=max_results,
-        )
-        # Deduplicate by memory_id, keep highest weight
-        seen = {}
-        for r in results:
-            mid = r.get("memory_id", "")
-            w = r.get("weight", 0.0)
-            if mid and (mid not in seen or w > seen[mid]):
-                seen[mid] = w
-        # Filter out seed IDs (prevent self-return)
-        seed_set = set(memory_ids)
-        deduped = [(mid, w) for mid, w in seen.items() if mid not in seed_set]
-        # Apply zone filter if specified (look up each neighbor's zone)
-        if zone_filter:
-            filtered = []
-            for mid, w in deduped:
-                meta = gm.store.get_meta(mid)
-                if meta and meta.get("zone") == zone_filter:
-                    filtered.append((mid, w))
-            deduped = filtered
-        deduped.sort(key=lambda x: -x[1])
-        return deduped[:max_results]
-    except Exception as e:
-        logger.debug("Graph neighbor lookup failed: %s", e)
-        return []
-
-
-def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int,
-                       zone_filter: Optional[str] = None) -> dict:
-    """Enrich search results with graph-neighbor memories (shared helper).
-
-    Always returns a dict with "results" and "graph_expanded" for uniform schema.
-    If zone_filter is provided, graph neighbors are restricted to that zone.
-    """
-    graph_expanded = _get_graph_neighbors(result_ids, max_results=k, zone_filter=zone_filter)
-    for neigh_id, _ in graph_expanded:
-        record_memory_stat(neigh_id, "accessed")
-    return {
-        "results": result_out,
-        "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
-    }
-
-
-
-def _slash_reflect(raw_args: str) -> str:
-    return "🔍 Full reflection is now integrated with LLM. It runs automatically at session end, or you can trigger it via the srh_reflect_now tool."
-
-
-def _slash_pending_skills(raw_args: str) -> str:
-    """Show pending skill candidates for approval."""
-    return _format_pending_skills_for_display()
-
-
-def _slash_approve_skill(raw_args: str) -> str:
-    """Approve a pending skill candidate by ID."""
-    pending_id = raw_args.strip()
-    if not pending_id:
-        return "Usage: /approve-skill <pending_id>"
-    result = _approve_skill(pending_id)
-    if result and result.get("success"):
-        return f"✅ Approved skill '{result['name']}' and saved to {result['path']}"
-    return f"❌ Failed to approve: {result.get('error', 'Unknown error')}" if result else "❌ Failed to approve"
-
-
-def _slash_reject_skill(raw_args: str) -> str:
-    """Reject a pending skill candidate by ID."""
-    parts = raw_args.strip().split(None, 1)
-    if not parts:
-        return "Usage: /reject-skill <pending_id> [reason]"
-    pending_id = parts[0]
-    reason = parts[1] if len(parts) > 1 else ""
-    if _reject_skill(pending_id, reason):
-        return f"❌ Rejected skill candidate {pending_id}"
-    return f"❌ Failed to reject skill candidate {pending_id}"
-
-
-def _slash_memories(raw_args: str) -> str:
-    query = raw_args.strip()
-    mem_store = _get_mem_store()
-    if query:
-        results = mem_store.search(query, k=10)
-    else:
-        results = mem_store.list_active()
-    lines = [f"🧠 Active memories ({len(results)}):"]
-    for m in results:
-        pin = "📌" if m.frontmatter.pinned else "  "
-        lines.append(f"{pin} [{m.id()}] {m.body[:120]}")
-    return "\n".join(lines) if lines else "No memories found."
-
-
-def _slash_skills(raw_args: str) -> str:
-    query = raw_args.strip()
-    skill_store = _get_skill_store()
-    if query:
-        skills = match_skills(skill_store.list(), query, k=10)
-    else:
-        skills = skill_store.list()
-    lines = [f"🔧 Skills ({len(skills)}):"]
-    for s in skills:
-        lines.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
-    return "\n".join(lines) if lines else "No skills found."
-
-
-def _slash_compile_profile(raw_args: str) -> str:
-    """Handle /compile-profile [mode] slash command."""
-    mode = raw_args.strip() or "profile"
-    if mode not in ("profile", "palace_index", "zone"):
-        return f"⚠️ Unknown mode: {mode}. Use: profile, palace_index, or zone."
-    # This requires ctx — can only work when called from a session with LLM access
-    return (
-        f"📋 Compile Profile command received (mode={mode}).\n"
-        f"Use the srh_compile_profile tool with ctx access to execute, "
-        f"or wait for session-end auto-compilation."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Embedding engine (ONNX Runtime — fast, lightweight)
-# ---------------------------------------------------------------------------
-# Lazy-loaded ONNX embedding components
-# ---------------------------------------------------------------------------
-
-_onnx_session: Optional[Any] = None
-_onnx_tokenizer: Optional[Any] = None
-_embed_model_lock = threading.Lock()
-
-# LRU cache for embeddings: text_hash -> vector (max 500 entries)
-_embed_cache: Dict[str, Any] = {}
-_embed_cache_lock = threading.Lock()
-_EMBED_CACHE_MAX = 500
-
-
-def _embed_cache_key(text: str) -> str:
-    """Hash text for cache key."""
-    import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
-
-
-def _get_cached_embed(text: str) -> Optional[Any]:
-    """Get cached embedding if available."""
-    key = _embed_cache_key(text)
-    with _embed_cache_lock:
-        return _embed_cache.get(key)
-
-
-def _set_cached_embed(text: str, vec: Any) -> None:
-    """Cache embedding with LRU eviction."""
-    key = _embed_cache_key(text)
-    with _embed_cache_lock:
-        if len(_embed_cache) >= _EMBED_CACHE_MAX:
-            # Simple eviction: clear half the cache
-            items = list(_embed_cache.items())
-            _embed_cache.clear()
-            _embed_cache.update(items[_EMBED_CACHE_MAX // 2:])
-        _embed_cache[key] = vec
-
-
-def _get_onnx_session() -> Tuple[Optional[Any], Optional[Any]]:
-    """Lazy-load ONNX Runtime session and tokenizer.
-
-    Uses all-MiniLM-L6-v2 in ONNX format for minimal memory footprint
-    and fast inference.
-
-    Model resolution priority:
-    1. SRH_MODEL_DIR environment variable
-    2. ~/.hermes/models/all-MiniLM-L6-v2-onnx/
-    3. sentence-transformers fallback (auto-download)
-    """
-    global _onnx_session, _onnx_tokenizer
-    if _onnx_session is not None and _onnx_tokenizer is not None:
-        return _onnx_session, _onnx_tokenizer
-
-    with _embed_model_lock:
-        if _onnx_session is not None and _onnx_tokenizer is not None:
-            return _onnx_session, _onnx_tokenizer
-
-        # Resolve model directory
-        env_model_dir = os.environ.get("SRH_MODEL_DIR")
-        if env_model_dir:
-            model_dir = Path(env_model_dir)
-        else:
-            model_dir = _hermes_home() / "models" / "all-MiniLM-L6-v2-onnx"
-        model_path = model_dir / "model.onnx"
-
-        # Fallback: try sentence-transformers if ONNX model not available
-        if not model_path.exists():
-            logger.warning("ONNX model not found at %s, falling back to sentence-transformers", model_path)
-            return _get_st_model()
-
-        try:
-            import onnxruntime as ort
-            from tokenizers import Tokenizer
-
-            _onnx_session = ort.InferenceSession(
-                str(model_path),
-                providers=["CPUExecutionProvider"],
-            )
-            _onnx_tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
-            _onnx_tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
-            _onnx_tokenizer.enable_truncation(max_length=512)
-            logger.info("Loaded ONNX embedding model from %s (lightweight tokenizer)", model_dir)
-            return _onnx_session, _onnx_tokenizer
-        except Exception as e:
-            logger.warning("Failed to load ONNX model: %s", e)
-            return _get_st_model()
-
-
-def _get_st_model() -> Tuple[Optional[Any], Optional[Any]]:
-    """Fallback to sentence-transformers if ONNX unavailable."""
-    global _onnx_session, _onnx_tokenizer
-    try:
-        from sentence_transformers import SentenceTransformer
-        _onnx_session = SentenceTransformer("all-MiniLM-L6-v2")
-        _onnx_tokenizer = None  # ST has built-in tokenization
-        logger.info("Loaded sentence-transformers fallback model")
-        return _onnx_session, _onnx_tokenizer
-    except Exception as e:
-        logger.warning("Failed to load fallback embedding model: %s", e)
-        return None, None
-
-
-def _embed_texts(texts: List[str]) -> Optional[Any]:
-    """Encode a list of texts into normalized embedding vectors."""
-    if not texts:
-        return None
-
-    # Check cache for all texts
-    cached_results = []
-    uncached_texts = []
-    uncached_indices = []
-    for i, text in enumerate(texts):
-        cached = _get_cached_embed(text)
-        if cached is not None:
-            cached_results.append((i, cached))
-        else:
-            uncached_texts.append(text)
-            uncached_indices.append(i)
-
-    # If all cached, return directly
-    if not uncached_texts:
-        return [vec for _, vec in sorted(cached_results, key=lambda x: x[0])]
-
-    # Encode uncached texts
-    session, tokenizer = _get_onnx_session()
-    if session is None:
-        return None
-
-    embeddings = None
-
-    # sentence-transformers fallback path
-    if tokenizer is None and hasattr(session, "encode"):
-        try:
-            import numpy as np
-            embeddings = session.encode(uncached_texts, convert_to_numpy=True, normalize_embeddings=True)
-        except Exception as e:
-            logger.debug("ST encoding failed: %s", e)
-            return None
-    else:
-        # ONNX Runtime + tokenizers path
-        try:
-            import numpy as np
-
-            # Tokenize
-            encodings = tokenizer.encode_batch(uncached_texts)
-            max_len = max(len(e.ids) for e in encodings)
-
-            input_ids = np.array(
-                [e.ids + [0] * (max_len - len(e.ids)) for e in encodings],
-                dtype=np.int64,
-            )
-            attention_mask = np.array(
-                [e.attention_mask + [0] * (max_len - len(e.attention_mask)) for e in encodings],
-                dtype=np.int64,
-            )
-            token_type_ids = np.zeros_like(input_ids)
-
-            # Run inference
-            outputs = session.run(
-                None,
-                {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "token_type_ids": token_type_ids,
-                },
-            )
-            last_hidden_state = outputs[0]  # (batch, seq_len, hidden_dim)
-
-            # Mean pooling with attention mask
-            mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
-            sum_embeddings = np.sum(last_hidden_state * mask_expanded, axis=1)
-            sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-            embeddings = sum_embeddings / sum_mask
-
-            # L2 normalize
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            embeddings = embeddings / norms
-
-        except Exception as e:
-            logger.debug("ONNX encoding failed: %s", e)
-            return None
-
-    # Cache new embeddings
-    for text, vec in zip(uncached_texts, embeddings):
-        _set_cached_embed(text, vec)
-
-    # Merge cached + new results
-    all_results = cached_results + list(zip(uncached_indices, embeddings))
-    all_results.sort(key=lambda x: x[0])
-    return [vec for _, vec in all_results]
-
-
-def _embed_single(text: str) -> Optional[Any]:
-    """Encode a single text into an embedding vector."""
-    embs = _embed_texts([text])
-    if embs is not None:
-        return embs[0]
-    return None
-
-
-def _cosine_sim(a, b) -> float:
-    """Cosine similarity between two normalized vectors."""
-    try:
-        import numpy as np
-        return float(np.dot(a, b))
-    except Exception:
-        return 0.0
-
-
-def _extract_keywords(text: str, top_k: int = 5) -> List[str]:
-    """Extract distinctive keywords from text using TF-IDF-like heuristics."""
-    tokens = _tokenise(text)
-    if not tokens:
-        return []
-    # Filter out very common stopwords
-    stops = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "must", "shall", "can", "need", "dare",
-        "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
-        "from", "as", "into", "through", "during", "before", "after",
-        "above", "below", "between", "under", "and", "but", "or", "yet",
-        "so", "if", "because", "although", "though", "while", "where",
-        "when", "that", "which", "who", "whom", "whose", "what", "this",
-        "these", "those", "i", "you", "he", "she", "it", "we", "they",
-        "me", "him", "her", "us", "them", "my", "your", "his", "its",
-        "our", "their", "mine", "yours", "hers", "ours", "theirs",
-        "myself", "yourself", "himself", "herself", "itself", "ourselves",
-        "themselves", "what", "which", "who", "whom", "this", "that",
-        "these", "those", "am", "is", "are", "was", "were", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will",
-        "would", "shall", "should", "may", "might", "can", "could",
-        "must", "ought", "need", "dare", "used", "here", "there",
-        "now", "then", "today", "tomorrow", "yesterday", "just", "only",
-        "also", "even", "back", "after", "again", "further", "once",
-        "about", "up", "out", "down", "off", "over", "under", "again",
-    }
-    # Count and score by rarity (rarer = higher score)
-    tf = Counter(tokens)
-    scored = []
-    for t, c in tf.items():
-        if t in stops or len(t) < 3:
-            continue
-        # Prefer longer, less frequent tokens
-        score = c * len(t) / (1 + sum(1 for x in tokens if x == t))
-        scored.append((score, t))
-    scored.sort(reverse=True)
-    seen = set()
-    out = []
-    for _, t in scored:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-            if len(out) >= top_k:
-                break
-    return out
-
-
-def _is_explicit_memory_intent(text: str) -> bool:
-    """Detect if user explicitly wants to remember something."""
-    lower = text.lower()
-    markers = [
-        "记住", "以后", "偏好", "总是", "remember", "always", "prefer",
-        "不是", "不对", "错了", "don't", "wrong", "actually", "no,",
-        "important", "note", "remind", "save this", "keep in mind",
-        "我的", "我喜欢", "我讨厌", "i like", "i prefer", "i hate",
-        "never", "always", "usually", "typically", "customarily",
-    ]
-    return any(m in lower for m in markers)
-
-
-def _is_correction(text: str) -> bool:
-    """Detect if user is correcting a previous statement."""
-    lower = text.lower()
-    markers = [
-        "不对", "错了", "不是", "应该", "actually", "wrong", "correct",
-        "instead", "rather", "meant", "mean", "更正", "纠正",
-        "no,", "nope", "incorrect", "mistake", "fix", "修正",
-    ]
-    return any(m in lower for m in markers)
-
-
-def _is_procedure(text: str) -> bool:
-    """Detect if text describes a multi-step procedure."""
-    lower = text.lower()
-    markers = [
-        "步骤", "流程", "首先", "然后", "最后", "step", "first", "then",
-        "next", "finally", "procedure", "process", "workflow", "how to",
-        "guide", "tutorial", "instruction", "1.", "2.", "3.",
-    ]
-    return any(m in lower for m in markers)
-
-
-def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory]) -> float:
-    """Compute how novel a text is compared to existing memories (0-1, higher = more novel).
-
-    Uses pre-computed memory embeddings from the store's embed_index when available
-    for O(1) per-memory lookup instead of O(n) re-encoding.
-    """
-    if not existing_memories:
-        return 1.0
-    new_emb = _embed_single(new_text)
-    if new_emb is None:
-        # Fallback to TF-IDF
-        return 1.0 - _tfidf_max_similarity(new_text, existing_memories)
-
-    # Try to use store's embed_index for fast vector lookup
-    store = _get_mem_store()
-    max_sim = 0.0
-    if store._embed_index is not None:
-        vectors = store._embed_index.get("vectors", {})
-        for m in existing_memories:
-            m_emb = vectors.get(m.id())
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                max_sim = max(max_sim, sim)
-            else:
-                # Fallback: encode on demand
-                m_emb = _embed_single(m.body)
-                if m_emb is not None:
-                    sim = _cosine_sim(new_emb, m_emb)
-                    max_sim = max(max_sim, sim)
-    else:
-        # No embed index: encode each memory on demand
-        for m in existing_memories:
-            m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                max_sim = max(max_sim, sim)
-
-    # Scale: 0.9 similarity = 0.1 novelty, 0.0 similarity = 1.0 novelty
-    novelty = max(0.0, 1.0 - max_sim)
-    return novelty
-
-
-def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], threshold: float = 0.75) -> Optional[Tuple[LoadedMemory, float]]:
-    """Find a semantically similar but potentially conflicting memory.
-
-    Uses pre-computed memory embeddings from the store's embed_index when available.
-    """
-    new_emb = _embed_single(new_text)
-    if new_emb is None:
-        return None
-
-    store = _get_mem_store()
-    best: Optional[Tuple[LoadedMemory, float]] = None
-
-    if store._embed_index is not None:
-        vectors = store._embed_index.get("vectors", {})
-        for m in existing:
-            m_emb = vectors.get(m.id())
-            if m_emb is None:
-                m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                if sim > threshold:
-                    if best is None or sim > best[1]:
-                        best = (m, sim)
-    else:
-        for m in existing:
-            m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                if sim > threshold:
-                    if best is None or sim > best[1]:
-                        best = (m, sim)
-    return best
-
-
-def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str, Any]]:
-    """Extract potential fact statements from a conversation turn using heuristics."""
-    facts = []
-    combined = f"{user_msg} {assistant_msg}"
-
-    # Heuristic 1: Explicit memory intent
-    if _is_explicit_memory_intent(user_msg):
-        # Extract the sentence containing the intent marker
-        sentences = re.split(r'[。！？.!?\n]+', user_msg)
-        for s in sentences:
-            if _is_explicit_memory_intent(s):
-                s = s.strip()
-                if len(s) > 10:
-                    facts.append({
-                        "text": s,
-                        "confidence": "high",
-                        "rationale": "User explicitly requested to remember",
-                        "source": "explicit_intent",
-                    })
-
-    # Heuristic 2: Corrections
-    if _is_correction(user_msg):
-        sentences = re.split(r'[。！？.!?\n]+', user_msg)
-        for s in sentences:
-            if _is_correction(s) and len(s) > 10:
-                facts.append({
-                    "text": s.strip(),
-                    "confidence": "medium",
-                    "rationale": "User corrected a previous statement",
-                    "source": "correction",
-                })
-
-    # Heuristic 3: Preference statements
-    pref_patterns = [
-        r"(?:我|i)\s+(?:喜欢|prefer|like|want|想|要)\s+(.{5,80})",
-        r"(?:我|i)\s+(?:不喜欢|hate|dislike|不想)\s+(.{5,80})",
-        r"(?:我|i)\s+(?:总是|always|usually|never)\s+(.{5,80})",
-        r"(?:用|use)\s+(.{3,40})\s+(?:因为|because)",
-    ]
-    for pat in pref_patterns:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            text = m.group(0).strip()
-            if len(text) > 10:
-                facts.append({
-                    "text": text,
-                    "confidence": "medium",
-                    "rationale": "Detected preference statement",
-                    "source": "preference",
-                })
-
-    # Heuristic 4: Convention / config statements
-    conv_patterns = [
-        r"(?:配置|config|setting|设置)\s*[：:]\s*(.{5,80})",
-        r"(?:默认|default)\s*[：:]\s*(.{5,80})",
-        r"(?:约定|convention)\s*[：:]\s*(.{5,80})",
-        r"(?:规则|rule)\s*[：:]\s*(.{5,80})",
-    ]
-    for pat in conv_patterns:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            text = m.group(0).strip()
-            if len(text) > 10:
-                facts.append({
-                    "text": text,
-                    "confidence": "medium",
-                    "rationale": "Detected configuration or convention",
-                    "source": "convention",
-                })
-
-    # Deduplicate by text similarity
-    deduped = []
-    seen_texts = []
-    for f in facts:
-        is_dup = False
-        for st in seen_texts:
-            if _text_similarity(f["text"], st) > 0.8:
-                is_dup = True
-                break
-        if not is_dup:
-            seen_texts.append(f["text"])
-            deduped.append(f)
-
-    return deduped
-
-
-def _text_similarity(a: str, b: str) -> float:
-    """Quick text similarity using token overlap."""
-    ta = set(_tokenise(a))
-    tb = set(_tokenise(b))
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    return inter / max(len(ta), len(tb))
-
-
-def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Run a full reflection using local embeddings + rule engine (zero LLM cost).
-
-    This replaces the expensive LLM-based reflection with:
-    1. Semantic novelty detection via embeddings
-    2. Heuristic fact extraction from conversation
-    3. Conflict detection via embedding similarity
-    4. Conservative candidate generation
-    """
-    mem_store = _get_mem_store()
-    skill_store = _get_skill_store()
-    active_memories = mem_store.list_active()
-    all_skills = skill_store.list()
-
-    # Build transcript
-    transcript = _format_messages_for_reflection(messages)
-    if not transcript.strip():
-        return {"summary": "Empty transcript", "accepted_memories": [], "skill_candidates": [], "conflicts": []}
-
-    # Compute overall novelty of this session vs existing memories
-    session_novelty = _compute_novelty_score(transcript, active_memories)
-    logger.debug("Session novelty score: %.3f", session_novelty)
-
-    # Extract potential facts from each turn
-    memory_candidates = []
-    conflicts = []
-
-    # Process the full transcript as one unit for efficiency
-    # (per-turn processing is done in micro-reflection)
-    user_msgs = []
-    assistant_msgs = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            content = " ".join(texts)
-        if role == "user":
-            user_msgs.append(content)
-        elif role == "assistant":
-            assistant_msgs.append(content)
-
-    full_user = " ".join(user_msgs)
-    full_assistant = " ".join(assistant_msgs)
-
-    # Extract facts
-    facts = _extract_facts_from_turn(full_user, full_assistant)
-
-    for fact in facts:
-        text = fact["text"]
-        # Check novelty
-        novelty = _compute_novelty_score(text, active_memories)
-        if novelty < 0.3:
-            logger.debug("Fact too similar to existing memory (novelty %.3f), skipping: %s", novelty, text[:60])
-            continue
-
-        # Check for conflicts
-        conflict_mem = _find_conflicting_memory(text, active_memories)
-        tags = _extract_keywords(text, top_k=3)
-
-        if conflict_mem:
-            mem, sim = conflict_mem
-            # If very similar but user is correcting, mark as stale
-            if _is_correction(full_user) and sim > 0.8:
-                conflicts.append({
-                    "with": mem.id(),
-                    "kind": "stale",
-                    "explain": f"User corrected previous information. Similarity: {sim:.2f}",
-                    "options": ["keep_new", "keep_old"],
-                })
-                memory_candidates.append({
-                    "fact": text,
-                    "tags": tags,
-                    "scope": "user",
-                    "confidence": fact["confidence"],
-                    "rationale": fact["rationale"],
-                    "supersedes": [mem.id()],
-                })
-            else:
-                # Just similar, not necessarily conflicting - skip to avoid duplication
-                logger.debug("Similar to existing memory %s (%.3f), skipping", mem.id(), sim)
-                continue
-        else:
-            memory_candidates.append({
-                "fact": text,
-                "tags": tags,
-                "scope": "user",
-                "confidence": fact["confidence"],
-                "rationale": fact["rationale"],
-                "supersedes": [],
-            })
-
-    # Also check if the overall session contains novel concepts not captured by explicit facts
-    if session_novelty > 0.5 and len(memory_candidates) == 0:
-        # Generate a summary memory from the session
-        summary = _generate_session_summary(transcript)
-        if summary and len(summary) > 20:
-            tags = _extract_keywords(summary, top_k=3)
-            memory_candidates.append({
-                "fact": summary,
-                "tags": tags,
-                "scope": "user",
-                "confidence": "low",
-                "rationale": "Session contained novel concepts not matching existing memories",
-                "supersedes": [],
-            })
-
-    # Skill detection: look for reusable procedures
-    skill_candidates = []
-    if _is_procedure(full_assistant) and len(full_assistant) > 200:
-        # Check if similar skill already exists
-        novel_skill = True
-        emb_assistant = _embed_single(full_assistant)
-        if emb_assistant is not None:
-            for sk in all_skills:
-                sk_emb = _embed_single(sk.body)
-                if sk_emb is not None:
-                    sim = _cosine_sim(emb_assistant, sk_emb)
-                    if sim > 0.85:
-                        novel_skill = False
-                        break
-        if novel_skill:
-            name = _generate_skill_name(full_assistant)
-            skill_candidates.append({
-                "name": name,
-                "description": f"Procedure extracted from session: {summary[:80] if summary else 'multi-step workflow'}",
-                "triggers": tags[:3] if tags else ["procedure"],
-                "body": f"## {name}\n\n{full_assistant[:800]}",
-                "rationale": "Assistant provided a multi-step procedure that may be reusable",
-                "confidence": "low",
-            })
-
-    # Store memory candidates
-    accepted_memories = []
-    for cand in memory_candidates:
-        try:
-            fm = MemoryFrontmatter.new(
-                source="reflection",
-                confidence=cand.get("confidence", "medium"),
-                tags=cand.get("tags", []),
-                zone="episode",
-            )
-            fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
-            # Final conflict check
-            conflict = mem_store.check_conflict(body)
-            if conflict:
-                existing_id, score = conflict
-                logger.info("Embedding reflection: memory conflicts with %s (%.2f), skipping", existing_id, score)
-                continue
-            path = mem_store.put(scope, fm, body)
-            accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
-        except Exception as e:
-            logger.warning("Failed to store embedding reflection memory: %s", e)
-
-    # Save skill candidates for approval
-    if skill_candidates:
-        logger.info("Embedding reflection produced %d skill candidates (manual approval required)", len(skill_candidates))
-        _save_pending_skill_candidates(skill_candidates)
-
-    # Build summary
-    summary = f"Session novelty: {session_novelty:.2f}. Extracted {len(facts)} facts, accepted {len(accepted_memories)} memories, {len(skill_candidates)} skills pending, {len(conflicts)} conflicts."
-
-    _append_reflect_log({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mode": "embedding",
-        "summary": summary,
-        "skill_candidates": len(skill_candidates),
-        "memory_candidates": len(memory_candidates),
-        "accepted_memories": len(accepted_memories),
-        "conflicts": len(conflicts),
-        "novelty": session_novelty,
-    })
-
-    logger.info(
-        "Embedding reflection complete: %d memories accepted, %d skills pending, %d conflicts",
-        len(accepted_memories), len(skill_candidates), len(conflicts),
-    )
-
-    return {
-        "summary": summary,
-        "accepted_memories": accepted_memories,
-        "skill_candidates": skill_candidates,
-        "conflicts": conflicts,
-    }
-
-
-def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    """Run a micro-reflection using local embeddings (zero LLM cost).
-
-    Much faster than LLM-based micro-reflection (~50ms vs ~2000ms).
-    """
-    mem_store = _get_mem_store()
-    active_memories = mem_store.list_active()
-
-    combined = f"{user_msg} {assistant_msg}"
-
-    # Extract facts first - if user has explicit intent, always process
-    facts = _extract_facts_from_turn(user_msg, assistant_msg)
-    has_explicit_intent = _is_explicit_memory_intent(user_msg)
-
-    # Quick novelty check - but skip if user explicitly wants to remember
-    novelty = _compute_novelty_score(combined, active_memories)
-    if not has_explicit_intent and novelty < 0.25:
-        logger.debug("Micro-reflection: turn too similar to existing memories (%.3f), skipping", novelty)
-        return None
-
-    if not facts:
-        # Even without heuristic facts, if novelty is high and user said something substantive,
-        # create a generic memory
-        if novelty > 0.6 and len(user_msg) > 20:
-            facts = [{
-                "text": user_msg[:200],
-                "confidence": "low",
-                "rationale": "Novel user message with no explicit intent markers",
-                "source": "novelty",
-            }]
-        else:
-            return None
-
-    # Only take the highest-confidence fact
-    facts.sort(key=lambda f: 0 if f["confidence"] == "high" else (1 if f["confidence"] == "medium" else 2))
-    best = facts[0]
-
-    # Check conflict
-    conflict_mem = _find_conflicting_memory(best["text"], active_memories)
-    tags = _extract_keywords(best["text"], top_k=3)
-
-    supersedes = []
-    if conflict_mem:
-        mem, sim = conflict_mem
-        if _is_correction(user_msg) and sim > 0.7:
-            supersedes = [mem.id()]
-        elif has_explicit_intent and sim > 0.85:
-            # Very similar and user explicitly stated - likely an update
-            supersedes = [mem.id()]
-        else:
-            logger.debug("Micro-reflection: similar to %s (%.3f), skipping", mem.id(), sim)
-            return None
-
-    try:
-        fm = MemoryFrontmatter.new(
-            source="micro_reflection",
-            confidence=best["confidence"],
-            tags=tags,
-            zone="episode",
-        )
-        fm.supersedes = supersedes
-        path = mem_store.put("user", fm, best["text"])
-        accepted = {"id": fm.id, "body": best["text"], "path": str(path)}
-
-        _append_reflect_log({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "mode": "embedding_micro",
-            "summary": f"Micro-reflection accepted: {best['text'][:60]}",
-            "accepted_memory": accepted,
-            "novelty": novelty,
-        })
-
-        return {
-            "summary": f"Detected {best['source']}: {best['text'][:60]}",
-            "memory_candidates": [{"fact": best["text"], "tags": tags, "scope": "user", "confidence": best["confidence"]}],
-            "skill_candidates": [],
-            "conflicts": [],
-        }
-    except Exception as e:
-        logger.debug("Micro-reflection storage failed: %s", e)
-        return None
-
-
-def _generate_session_summary(transcript: str) -> str:
-    """Generate a brief summary of the session from the transcript.
-
-    Uses simple heuristics (first/last user messages) rather than LLM.
-    """
-    lines = [l for l in transcript.split("\n") if l.strip() and not l.startswith("[")]
-    if not lines:
-        return ""
-    # Take the first substantial line
-    for line in lines:
-        clean = line.strip()
-        if len(clean) > 20:
-            return clean[:200]
-    return lines[0][:200] if lines else ""
-
-
-def _generate_skill_name(text: str) -> str:
-    """Generate a kebab-case skill name from text heuristics."""
-    keywords = _extract_keywords(text, top_k=3)
-    if keywords:
-        return "-".join(keywords[:3])
-    # Fallback: use first few words
-    words = re.findall(r"[a-zA-Z]+", text.lower())
-    if words:
-        return "-".join(words[:3])
-    return "extracted-procedure"
-
-
-# ---------------------------------------------------------------------------
-# LLM-powered reflection (kept as fallback for hybrid mode)
-# ---------------------------------------------------------------------------
-
-def _build_reflect_schema() -> Dict[str, Any]:
-    """Build JSON schema for reflection structured output."""
-    return {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "skill_candidates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "triggers": {"type": "array", "items": {"type": "string"}},
-                        "body": {"type": "string"},
-                        "rationale": {"type": "string"},
-                        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-                    },
-                    "required": ["name", "description", "triggers", "body", "rationale", "confidence"],
-                },
-            },
-            "memory_candidates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "fact": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "scope": {"type": "string", "enum": ["user", "project"]},
-                        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-                        "rationale": {"type": "string"},
-                        "supersedes": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["fact", "tags", "scope", "confidence", "rationale"],
-                },
-            },
-            "conflicts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "with": {"type": "string"},
-                        "kind": {"type": "string", "enum": ["contradiction", "redundancy", "scope_overlap", "stale"]},
-                        "explain": {"type": "string"},
-                        "options": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["with", "kind", "explain", "options"],
-                },
-            },
-        },
-        "required": ["summary", "skill_candidates", "memory_candidates", "conflicts"],
-    }
-
-
-def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
-    """Format message list into a transcript string for reflection."""
-    lines = []
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Extract text from multi-modal content
-            texts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(part.get("text", ""))
-            content = "\n".join(texts)
-        lines.append(f"[{role}] {content}")
-    return "\n\n".join(lines)
-
-
-def _format_inventory() -> str:
-    """Format current memory and skill inventory for reflection context."""
-    mem_store = _get_mem_store()
-    skill_store = _get_skill_store()
-    lines = ["=== Current Memory Inventory ==="]
-    for m in mem_store.list_active():
-        lines.append(f"- [{m.id()}] {m.body[:120]} (tags: {m.frontmatter.tags}, confidence: {m.frontmatter.confidence})")
-    lines.append("")
-    lines.append("=== Current Skill Inventory ===")
-    for s in skill_store.list():
-        lines.append(f"- {s.frontmatter.name}: {s.frontmatter.description} (triggers: {s.frontmatter.triggers})")
-    return "\n".join(lines)
-
-
-def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Run a full reflection. Uses embedding-based reflection by default;
-    falls back to LLM only if reflection_mode is 'llm' or 'hybrid'."""
-    mode = _reflection_mode()
-
-    # Default to embedding-based (local, zero cost)
-    if mode in ("embedding", "local"):
-        return _run_embedding_reflection(messages)
-
-    # Hybrid: try embedding first, if no candidates found, try LLM
-    if mode == "hybrid":
-        emb_result = _run_embedding_reflection(messages)
-        if emb_result.get("accepted_memories") or emb_result.get("skill_candidates"):
-            return emb_result
-        logger.info("Hybrid mode: embedding found no candidates, trying LLM fallback")
-        # Fall through to LLM
-
-    # LLM mode (expensive, kept for compatibility)
-    if not hasattr(ctx, "llm"):
-        logger.warning("No ctx.llm available for full reflection")
-        return {"error": "No LLM available"}
-
-    transcript = _format_messages_for_reflection(messages)
-    inventory = _format_inventory()
-
-    instructions = (
-        "Analyze the following conversation transcript and current agent inventory. "
-        "Identify skill candidates, memory candidates, and conflicts. "
-        "Be conservative — only propose high-quality candidates."
-    )
-
-    inputs = [
-        {"type": "text", "text": f"=== TRANSCRIPT ===\n\n{transcript}\n\n{inventory}"},
-    ]
-
-    try:
-        result = ctx.llm.complete_structured(
-            instructions=instructions,
-            input=inputs,
-            json_schema=_build_reflect_schema(),
-            json_mode=True,
-            system_prompt=_FULL_REFLECT_SYSTEM,
-            purpose="full_reflection",
-            max_tokens=4096,
-        )
-    except Exception as e:
-        logger.warning("LLM reflection call failed: %s", e)
-        return {"error": str(e)}
-
-    parsed = result.parsed if result else None
-    if not parsed:
-        logger.warning("Reflection produced no parsed output")
-        return {"error": "No parsed output"}
-
-    # Log the reflection outcome
-    _append_reflect_log({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mode": "full_llm",
-        "summary": parsed.get("summary", ""),
-        "skill_candidates": len(parsed.get("skill_candidates", [])),
-        "memory_candidates": len(parsed.get("memory_candidates", [])),
-        "conflicts": len(parsed.get("conflicts", [])),
-        "raw": result.text,
-    })
-
-    # Store memory candidates automatically (they're conservative)
-    mem_store = _get_mem_store()
-    accepted_memories = []
-    for cand in parsed.get("memory_candidates", []):
-        try:
-            fm = MemoryFrontmatter.new(
-                source="reflection",
-                confidence=cand.get("confidence", "medium"),
-                tags=cand.get("tags", []),
-                zone="episode",
-            )
-            fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
-            # Conflict check
-            conflict = mem_store.check_conflict(body)
-            if conflict:
-                existing_id, score = conflict
-                logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
-                continue
-            path = mem_store.put(scope, fm, body)
-            accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
-        except Exception as e:
-            logger.warning("Failed to store memory candidate: %s", e)
-
-    # Log skill candidates (require manual approval)
-    skill_candidates = parsed.get("skill_candidates", [])
-    if skill_candidates:
-        logger.info("Reflection produced %d skill candidates (manual approval required)", len(skill_candidates))
-        # Save pending skill candidates for user approval
-        _save_pending_skill_candidates(skill_candidates)
-
-    logger.info(
-        "Full reflection complete: %d memories accepted, %d skills pending approval, %d conflicts noted",
-        len(accepted_memories), len(skill_candidates), len(parsed.get("conflicts", [])),
-    )
-
-    return {
-        "summary": parsed.get("summary", ""),
-        "accepted_memories": accepted_memories,
-        "skill_candidates": skill_candidates,
-        "conflicts": parsed.get("conflicts", []),
-    }
-
-
-def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    """Run a micro-reflection. Uses embedding-based by default; falls back to LLM only in 'llm' mode."""
-    mode = _reflection_mode()
-
-    if mode in ("embedding", "local", "hybrid"):
-        return _run_embedding_micro_reflection(user_msg, assistant_msg)
-
-    # LLM mode (expensive)
-    if not hasattr(ctx, "llm"):
-        return None
-
-    instructions = (
-        "You just observed ONE turn of conversation. "
-        "Decide if anything is worth persisting as a memory or skill."
-    )
-
-    inputs = [
-        {"type": "text", "text": f"[user] {user_msg}\n\n[assistant] {assistant_msg}"},
-    ]
-
-    try:
-        result = ctx.llm.complete_structured(
-            instructions=instructions,
-            input=inputs,
-            json_schema=_build_reflect_schema(),
-            json_mode=True,
-            system_prompt=_MICRO_REFLECT_SYSTEM,
-            purpose="micro_reflection",
-            max_tokens=2048,
-        )
-    except Exception as e:
-        logger.debug("Micro-reflection LLM call failed: %s", e)
-        return None
-
-    parsed = result.parsed if result else None
-    if not parsed:
-        return None
-
-    # Store at most 1 memory from micro-reflection (auto-accepted for micro)
-    mem_store = _get_mem_store()
-    accepted = None
-    for cand in parsed.get("memory_candidates", [])[:1]:
-        try:
-            fm = MemoryFrontmatter.new(
-                source="micro_reflection",
-                confidence=cand.get("confidence", "low"),
-                tags=cand.get("tags", []),
-            )
-            fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
-            conflict = mem_store.check_conflict(body)
-            if conflict:
-                continue
-            path = mem_store.put(scope, fm, body)
-            accepted = {"id": fm.id, "body": body, "path": str(path)}
-        except Exception:
-            pass
-
-    if accepted:
-        _append_reflect_log({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "mode": "micro_llm",
-            "summary": parsed.get("summary", ""),
-            "accepted_memory": accepted,
-        })
-
-    return parsed
-
-
-# ---------------------------------------------------------------------------
-# Pending skill candidate approval system
-# ---------------------------------------------------------------------------
-
-PENDING_SKILLS_PATH = _plugin_data_dir() / "pending-skills.json"
-
-
-def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
-    """Save skill candidates to pending approval file."""
-    try:
-        PENDING_SKILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing = []
-        if PENDING_SKILLS_PATH.exists():
-            with open(PENDING_SKILLS_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        # Add timestamp and unique id to each candidate
-        for cand in candidates:
-            cand["_pending_id"] = f"pending_{uuid.uuid4().hex[:12]}"
-            cand["_submitted_at"] = datetime.now(timezone.utc).isoformat()
-            cand["_status"] = "pending"
-        existing.extend(candidates)
-        with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save pending skill candidates: %s", e)
-
-
-def _load_pending_skill_candidates() -> List[Dict[str, Any]]:
-    """Load all pending skill candidates."""
-    try:
-        if not PENDING_SKILLS_PATH.exists():
-            return []
-        with open(PENDING_SKILLS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def _update_pending_skill_status(pending_id: str, status: str, reason: str = "") -> bool:
-    """Update the status of a pending skill candidate."""
-    try:
-        candidates = _load_pending_skill_candidates()
-        for cand in candidates:
-            if cand.get("_pending_id") == pending_id:
-                cand["_status"] = status
-                cand["_resolved_at"] = datetime.now(timezone.utc).isoformat()
-                cand["_resolve_reason"] = reason
-                with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
-                    json.dump(candidates, f, ensure_ascii=False, indent=2)
-                return True
-        return False
-    except Exception as e:
-        logger.warning("Failed to update pending skill status: %s", e)
-        return False
-
-
-def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
-    """Approve a pending skill candidate and write it to the skill store."""
-    candidates = _load_pending_skill_candidates()
-    for cand in candidates:
-        if cand.get("_pending_id") == pending_id:
-            if cand.get("_status") != "pending":
-                return {"error": f"Skill already {cand['_status']}"}
-            try:
-                # Write skill to user skills directory
-                skill_name = cand["name"]
-                skill_dir = _user_skills_dir() / skill_name
-                skill_dir.mkdir(parents=True, exist_ok=True)
-
-                fm_data = {
-                    "name": skill_name,
-                    "description": cand.get("description", ""),
-                    "triggers": cand.get("triggers", []),
-                    "version": "1.0.0",
-                    "license": "MIT",
-                }
-                body = cand.get("body", "")
-                skill_md = _serialize_frontmatter(fm_data, body)
-                (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
-
-                _update_pending_skill_status(pending_id, "approved", "User approved via UI")
-                return {
-                    "success": True,
-                    "name": skill_name,
-                    "path": str(skill_dir),
-                }
-            except Exception as e:
-                logger.warning("Failed to approve skill %s: %s", pending_id, e)
-                return {"error": str(e)}
-    return {"error": "Pending skill not found"}
-
-
-def _reject_skill(pending_id: str, reason: str = "") -> bool:
-    """Reject a pending skill candidate."""
-    return _update_pending_skill_status(pending_id, "rejected", reason or "User rejected via UI")
-
-
-def _format_pending_skills_for_display() -> str:
-    """Format pending skills for TUI/gateway display."""
-    candidates = [c for c in _load_pending_skill_candidates() if c.get("_status") == "pending"]
-    if not candidates:
-        return "No pending skill candidates."
-
-    lines = [f"🔧 Pending Skill Candidates ({len(candidates)}):", ""]
-    for i, cand in enumerate(candidates, 1):
-        lines.append(f"{i}. {cand['name']}")
-        lines.append(f"   Description: {cand.get('description', 'N/A')}")
-        lines.append(f"   Triggers: {', '.join(cand.get('triggers', []))}")
-        lines.append(f"   Confidence: {cand.get('confidence', 'medium')}")
-        lines.append(f"   Rationale: {cand.get('rationale', 'N/A')}")
-        lines.append(f"   Pending ID: {cand['_pending_id']}")
-        lines.append("")
-    lines.append("Use /approve-skill <pending_id> or /reject-skill <pending_id> to act on these.")
-    return "\n".join(lines)
+# Tool handlers extracted to tools.py
+# Tool handlers extracted to tools.py
+
+# Sub-module imports
+from .reflection import *  # noqa: F401, F403
+from .tools import *  # noqa: F401, F403
+from .hooks import *  # noqa: F401, F403

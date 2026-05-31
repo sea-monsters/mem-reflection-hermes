@@ -62,7 +62,12 @@ class GraphStoreProtocol:
                              decay_factor: float = 0.5,
                              min_weight: float = 0.1,
                              limit: int = 10) -> List[dict]:
-        """Propagate activation along graph edges from seeds."""
+        """Propagate activation along graph edges from seeds.
+
+        Complexity (P2-17): BFS O(b^d) where b=max_neighbors(20) and
+        d=max_depth(2-3). At depth=3: ~8000 nodes visited — ~50-100ms SQLite
+        latency. Acceptable for typical usage.
+        """
         raise NotImplementedError
 
     def decay_edges(self, decay_rate: float = 0.01) -> None:
@@ -141,6 +146,37 @@ class GraphStore(GraphStoreProtocol):
             self._conn = None
 
     # -- Edge operations --
+
+    def set_edge_weight(self, source_id: str, target_id: str,
+                        relation: str = "co_occurs",
+                        weight: float = 0.5) -> None:
+        """Set absolute edge weight (unlike upsert_edge which uses delta)."""
+        if not source_id or not target_id:
+            return
+        try:
+            conn = self._connect()
+            now = datetime.now(timezone.utc).isoformat()
+            existing = conn.execute(
+                "SELECT weight FROM graph_edges "
+                "WHERE source_id=? AND target_id=? AND relation=?",
+                (source_id, target_id, relation)
+            ).fetchone()
+            w = min(1.0, max(0.01, weight))
+            if existing:
+                conn.execute(
+                    "UPDATE graph_edges SET weight=?, last_activated=? "
+                    "WHERE source_id=? AND target_id=? AND relation=?",
+                    (w, now, source_id, target_id, relation)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO graph_edges (source_id, target_id, relation, weight, co_occurrence, created_at, last_activated) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (source_id, target_id, relation, w, now, now)
+                )
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.exception("graph_store: set_edge_weight error: %s", e)
 
     def upsert_edge(self, source_id: str, target_id: str,
                     relation: str = "co_occurs",
@@ -382,14 +418,16 @@ class GraphStore(GraphStoreProtocol):
             )
         conn.commit()
 
-    def decay_edges(self, decay_rate: float = 0.01) -> None:
+    def decay_edges(self, decay_rate: float = 0.01, prune_threshold: float = 0.005) -> None:
         """Decay all association edge weights over time.
 
         Long-term non-co-occurrence → weights gradually decrease.
         Edge weights are clamped to a minimum of 0.01.
+        Edges below prune_threshold are deleted (P2-18: dead edge cleanup).
 
         Args:
             decay_rate: amount subtracted per decay cycle (default 0.01)
+            prune_threshold: edges with weight below this are removed (default 0.005)
         """
         conn = self._connect()
         for relation in ("co_occurs", "co_used_in_task"):
@@ -397,6 +435,11 @@ class GraphStore(GraphStoreProtocol):
                 "UPDATE graph_edges SET weight = MAX(0.01, weight - ?) "
                 "WHERE relation = ?",
                 (decay_rate, relation)
+            )
+            # P2-18: prune edges that have decayed below threshold
+            conn.execute(
+                "DELETE FROM graph_edges WHERE weight < ? AND relation = ?",
+                (prune_threshold, relation)
             )
         conn.commit()
 

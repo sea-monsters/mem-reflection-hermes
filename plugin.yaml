@@ -1,20 +1,24 @@
 name: mem-reflection-hermes
-version: 0.7.0
-description: "Self-evolving memory & reflection system ported from small-rust-hermes. Memory Palace with zone-based organization, effectiveness tracking with decay, palace navigation tools, TF-IDF search with effectiveness boosting, LLM-compiled profile generation, always-active skills, supersedes chains, micro/full reflection pipelines, ahe_graph graph memory integration. v0.7: ahe_graph deep integration (srh_associate, srh_graph_retrieve, srh_graph_stats), graph-enhanced search/recall, session-end decay. v0.6: Dashboard Memory Manager with full CRUD + reorder, atomic store operations, explicit rank field, Python 3.11 importlib fix, duplicate scanning fix. v0.5: P0-P2 performance optimizations."
+version: 0.8.0
+description: "Self-evolving memory & reflection system ported from small-rust-hermes. Memory Palace with zone-based organization, effectiveness tracking with decay, palace navigation tools, BM25 search with effectiveness boosting, LLM-compiled profile generation, always-active skills, supersedes chains, micro/full reflection pipelines, ahe_graph graph memory integration. v0.8: Module split (core/search/store/tools), 17 tools, backpressure queues, CJK adaptive threshold, embedding intent classification, LRU embed cache, zone rebalance, memory history/supersedes lineage, graph viz API. v0.7: ahe_graph deep integration."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:
   - srh_memory_search
   - srh_memory_write
   - srh_memory_delete
+  - srh_memory_history
   - srh_skill_search
   - srh_reflect_now
   - srh_palace_zones
   - srh_palace_read_zone
   - srh_palace_recall
+  - srh_palace_search
+  - srh_palace_rebalance
   - srh_compile_profile
   - srh_associate
   - srh_graph_retrieve
   - srh_graph_stats
+  - srh_graph_viz
 provides_hooks:
   - on_session_start
   - on_session_end
