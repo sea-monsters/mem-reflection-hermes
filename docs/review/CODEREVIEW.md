@@ -1,6 +1,7 @@
 # mem-reflection-hermes — 深度代码审查报告
 
 **版本**: v0.7.0 | **审查日期**: 2026-05-31
+**备注**: 这是历史审查报告。当前代码主线已演进到 v0.9.2-beta，当前工具与 Dashboard 路由请以 `README.md`、`docs/ARCHITECTURE.md` 和 `docs/DASHBOARD.md` 为准。
 **审查人**: Hermes Agent (deepseek-v4-flash)
 **代码量**: ~5,800 lines over 8 modules + plugin.yaml
 
@@ -20,6 +21,7 @@
    - 3.7 tools.py — 工具处理器
 4. [跨模块问题汇总](#4-跨模块问题汇总)
 5. [CI/CD 参考框架](#5-cicd-参考框架)
+6. [2026-06-01 再审快照](#6-2026-06-01-再审快照)
 
 ---
 
@@ -471,3 +473,180 @@ architecture:
 
 --- 
 *Generated as part of mem-reflection-hermes Phase 5/6 code review pipeline. References: [CODEREVIEW.md](CODEREVIEW.md), [memory-architecture-comparison.md](/home/ubuntu/memory-architecture-comparison.md)*
+
+---
+
+## 6. 2026-06-01 再审快照
+
+这部分是当前仓库主线 `v0.9.2-beta` 的复审结论，覆盖当前代码和已更新文档。
+
+### 当前面
+
+- 当前对外暴露的 SRH 工具是 **16 个**，其中 `tools.py` 提供 12 个 handler，`__init__.py` 另外注册 4 个图工具：`srh_associate`、`srh_graph_retrieve`、`srh_graph_stats`、`srh_graph_viz`。
+- Dashboard API 当前是 **13 个路由**，并且不再提供 `GET /memories/{id}` 单独读取路由。
+- `core.py`、`embed.py`、`hooks.py`、`reflection.py`、`tools.py`、`ahe_graph/__init__.py`、`cluqi.py`、`query_cache.py`、`cross_zone.py`、`pagerank.py`、`dashboard/plugin_api.py`、`__init__.py` 都已对齐到当前代码树。
+
+### 逐模块复审
+
+#### core.py
+
+- 已修复: `fsync` crash-safe 写入、BM25 修正、CJK 自适应冲突阈值、搜索策略日志、delete O(1) 索引、嵌入索引增量维护。
+- 已修复: frontmatter 解析现在支持嵌套 YAML；写入和删除通过路径锁与写代号串行化，避免删除后写回；`record_memory_stat()` 现在同步落盘，`_effectiveness_cache` 会随统计文件 mtime 自动刷新。
+
+#### embed.py
+
+- 已修复: `_cosine_sim` 维度检查、意图统计、ONNX/ST fallback 更稳。
+- 已修复: 意图原型改成双语多候选嵌入，并支持配置覆盖与热重载，降低语言/模型漂移偏置。
+
+#### __init__.py
+
+- 已修复: 单例锁、搜索策略日志、delete 验证、项目技能禁用列表、graph 工具注册、ahe_graph 失败降级、graph schema 上限、palace index write-on-change。
+
+#### ahe_graph/__init__.py
+
+- 已修复: `get_neighbors()` 错误保护、edge decay 剪枝、graph singleton 锁、graph route 复杂度文档化。
+- 已修复: `GraphStore` 全部读写路径已由重入锁串行化，共享 SQLite 连接不再暴露写入竞态。
+
+#### hooks.py
+
+- 已修复: `_on_session_end` / `_pre_llm_call` 的容错边界、late-binding 缓存、graph neighbor lookup 防护。
+- 结论: 当前没有阻断级问题。
+
+#### reflection.py
+
+- 已修复: 反射输出 JSON 修复、超长 transcript 截断、pending skill 归档、反射日志轮转、微反思/LLM fallback 更稳。
+- 结论: 当前没有阻断级问题。
+
+#### tools.py
+
+- 已修复: `_tool_srh_memory_delete` 的结果验证、`srh_compile_profile` 的 profile-mode 快速路径、工具注册与参数上限。
+- 结论: 当前没有阻断级问题。
+
+#### dashboard/plugin_api.py
+
+- 已修复: 路由数与当前工具面一致，图谱页、CLUQI 查询、跨区分析和 13 个路由均与实现对齐。
+- 结论: 当前没有阻断级问题。
+
+### 当前监控项
+
+- 暂无已知阻断级残余问题。
+- 后续如果记忆规模继续扩大，仍建议监控 `effectiveness` 文件体积、图边数量和反射日志增长速度。
+
+### 复审结论
+
+- 原 `CODEREVIEW.md` 中列出的 P0、P1 以及当前复审快照中的 P2 问题已全部修复或降为可接受设计备注。
+- 这份文档现在应被视为“历史审查 + 当前复审快照”的组合，当前没有新的阻断级问题。
+
+---
+
+## 7. 2026-06-01 v0.9.2-beta 宿主对照二次审查
+
+本轮按用户要求加入 Hermes Agent 宿主仓库 `D:\Codex_lib\code_reference\hermes-agent` 对照，重点检查 mem-reflection-hermes 作为通用插件时，记忆增强功能是否能通过宿主的真实插件契约正常执行。
+
+### 7.1 对照基线
+
+Hermes Agent 当前通用插件契约如下：
+
+| 宿主契约 | Hermes Agent 证据 | 对 mem-reflection-hermes 的含义 |
+|---|---|---|
+| 目录插件必须暴露顶层 `register(ctx)` | `hermes_cli/plugins.py` 说明插件目录需要 `plugin.yaml` 和 `__init__.py` 的 `register(ctx)` | 包顶层导出的 `register` 必须一次性完成工具、hook、slash 命令注册 |
+| 工具通过 `ctx.register_tool(name, toolset, schema, handler, ...)` 注册 | `hermes_cli/plugins.py` `PluginContext.register_tool()` 直接代理到 `tools.registry.register()` | 插件工具必须属于可解析 toolset，schema/handler 必须在宿主 registry 中可调度 |
+| `pre_llm_call` 返回 `{"context": "..."}` 或字符串，宿主注入到用户消息 | `agent/conversation_loop.py` 在每轮调用 `invoke_hook("pre_llm_call", user_message=..., conversation_history=...)` | 插件不能依赖系统提示注入；必须从 `user_message` / `conversation_history` 提取查询 |
+| `on_session_end` 当前传 `session_id/completed/interrupted/model/platform` | `agent/conversation_loop.py` session 结束处没有传 `messages` 或 `ctx` | full reflection 不能假设 session-end hook 直接拿到完整消息和 LLM facade |
+| `post_tool_call` 当前传 `tool_name/args/result/task_id/session_id/tool_call_id/duration_ms` | `model_tools.py` 在 registry dispatch 后调用 hook | 图关联必须通过这个参数集解析工具结果；不能依赖宿主传 memory store 对象 |
+
+### 7.2 新增发现
+
+#### P0-1: 包顶层 `register(ctx)` 未注册 v0.9 图工具、Dashboard/Slash 相关入口
+
+- 插件文件: `__init__.py`
+- 相关位置: `__init__.py` 只有 `_register_slash_commands(ctx)`，没有顶层 `def register(ctx)`；文件末尾 `from .tools import *` 使包顶层导出的 `register` 实际来自 `tools.py`。
+- 宿主影响: Hermes Agent 只会调用包顶层 `register(ctx)`。最小 fake `PluginContext` 验证显示实际只注册 12 个基础工具和 3 个 hooks：`srh_memory_search/write/delete/history`、`srh_skill_search`、`srh_reflect_now`、`srh_palace_*`、`srh_compile_profile`；未注册 `srh_associate`、`srh_graph_retrieve`、`srh_graph_stats`、`srh_graph_viz`，也没有 `/graph`、`/reflect`、`/memories`、`/skills` 等 slash 命令。
+- 文献/设计对比: `REFERENCES.md` 将 Hebbian graph、CLUQI、Dashboard graph integration 标为 v0.9/v0.9.2 增强点；当前入口断开后，这些增强在 Hermes 宿主中不可达。
+- 结论: v0.9.2-beta 对外宣称的 16/17 工具口径与宿主真实注册面不一致，图记忆增强不能正常执行。
+
+#### P0-2: `pre_llm_call` hook 参数契约与 Hermes Agent 当前实现不匹配
+
+- 插件文件: `hooks.py`
+- 相关位置: `_pre_llm_call(**kwargs)` 读取 `messages = kwargs.get("messages", [])` 和 `ctx = kwargs.get("ctx")`。
+- 宿主影响: Hermes Agent 当前传入 `user_message`、`conversation_history`、`is_first_turn`、`model`、`platform`、`sender_id`，不传 `messages` 或 `ctx`。因此插件无法从当前用户消息构建查询，`_build_context_block(query)` 得到空查询或跳过，微反思也拿不到最近 user/assistant 对。
+- 文献/设计对比: 插件相对 Mem0/Letta/Zep 的核心差异是“上下文分层注入 + micro reflection”；该差异必须依赖 `pre_llm_call` 正确读取宿主消息。当前契约错位会让记忆增强退化为注册了工具但自动注入不生效。
+- 结论: 核心记忆召回注入路径在 Hermes Agent 当前 hook 契约下不可认为正常执行。
+
+#### P0-3: `on_session_end` full reflection 与宿主生命周期不对齐
+
+- 插件文件: `hooks.py`
+- 相关位置: `_on_session_end(**kwargs)` 只从 `kwargs.get("messages", [])` 读取消息，并期待 `kwargs.get("ctx")` 可用于 `_run_full_reflection(ctx, messages)`。
+- 宿主影响: Hermes Agent 当前 session-end hook 没有传 `messages` 或 `ctx`。插件会在 `messages` 为空时直接返回，full reflection 不会运行。
+- 文献/设计对比: `REFERENCES.md` 将 “micro/full reflection pipeline” 作为本插件区别于 Mem0/Letta/Zep/Memary/Cognee 的独特优势；宿主不传完整消息时，插件需要改走可用的 session DB、conversation snapshot 或 `pre_llm_call` 自维护 buffer。
+- 结论: v0.9.2-beta 在 Hermes Agent 当前生命周期中无法自动完成 session-end 全量反思。
+
+#### P1-1: hook 模块 late-binding 使用固定包名，Hermes 命名空间加载下可能失败
+
+- 插件文件: `hooks.py`
+- 相关位置: `_lb(name)` 使用 `from mem_reflection_hermes import __dict__ as _mod`。
+- 宿主影响: Hermes Agent 的目录插件加载器会把插件加载到宿主自有命名空间，而不是保证包名叫 `mem_reflection_hermes`。如果没有额外 alias，`_lb()` 在 hook 执行期会 `ModuleNotFoundError` 或拿不到当前插件模块。
+- 对照验证: 用 `hermes_plugins.mem_reflection_hermes` 模拟宿主命名空间加载后，调用 `_pre_llm_call(messages=...)` 会进入 hook 内部并暴露未解析 helper 问题。
+- 结论: hook 的 late-binding 需要使用 `__package__` / `sys.modules[__package__]` 或直接相对导入，而不是硬编码包名。
+
+#### P1-2: `MemoryFrontmatter.new()` / store API / graph API 存在跨模块契约漂移
+
+- 插件文件: `tools.py`、`reflection.py`、`cluqi.py`、`dashboard/plugin_api.py`
+- 相关位置: `tools.py` 和 `reflection.py` 调用 `MemoryFrontmatter.new(...)`；`cluqi.py` 调用 `MemoryStore.get_by_id(...)` 和 `GraphMemoryManager.propagate_activation(...)`；`dashboard/plugin_api.py` 调用 `gm.associator.on_memory_coactivation(...)`。
+- 宿主影响: 当前代码中这些方法不存在或不在该对象层级暴露。工具写入、反射落库、CLUQI graph layer 和 Dashboard auto-associate 均存在运行期失败风险。
+- 对照验证: 最小导入检查显示 `MemoryFrontmatter.new: False`、`MemoryStore.get_by_id: False`、`GraphMemoryManager.propagate_activation: False`；Dashboard 包导入还会因为 `import __init__ as srh` 触发相对导入上下文错误。
+- 结论: 这些问题不只是内部单测缺失，而是会阻断 Hermes 宿主侧记忆增强的主要路径。
+
+#### P2-1: `plugin.yaml` 工具数量与真实注册数量不一致
+
+- 插件文件: `plugin.yaml`
+- 相关位置: description 声称 “17 SRH tools”，`provides_tools` 列出 16 个。
+- 宿主影响: Hermes 插件管理器记录 manifest 和实际注册状态时会出现对外描述与 registry 真实内容不一致，影响用户通过 `hermes plugins list` / tools 配置判断功能可用性。
+- 结论: 应统一为当前真实注册面；修复 P0-1 后再更新 manifest 数量。
+
+### 7.3 逐模块宿主适配结论
+
+| 模块 | 功能意图 | 宿主适配结论 |
+|---|---|---|
+| `plugin.yaml` | 声明插件工具/hook 能力 | 声明面大于真实注册面，需修正 |
+| `tools.py` | 12 个基础工具注册与 handler | 能被 Hermes `ctx.register_tool()` 调用注册，但写入路径仍受 `MemoryFrontmatter.new()` 等契约问题影响 |
+| `__init__.py` | 主包、存储、图工具、slash 注册 | 图工具/Slash 注册块没有被包顶层 `register(ctx)` 调用，v0.9 图增强不可达 |
+| `hooks.py` | 生命周期 hook、上下文注入、反思触发 | 参数名与 Hermes 当前 hook kwargs 不匹配，自动召回/微反思/全量反思不可认为正常 |
+| `reflection.py` | 微反思/全量反思候选生成与落库 | 宿主没有把 `ctx` 传到 session-end；且落库调用缺失 constructor，自动记忆沉淀受阻 |
+| `ahe_graph/__init__.py` | SQLite Hebbian 图、传播检索 | 模块本体基本可加载，但插件入口没有注册图工具；CLUQI 调用层级也未对齐 |
+| `cluqi.py` | BM25 + graph + supersedes 跨层查询 | 调用不存在的 store/graph manager API，v0.9 查询增强不可直接运行 |
+| `dashboard/plugin_api.py` | Dashboard API 和图可视化 | 以 `import __init__ as srh` 导入插件，脱离包上下文时会破坏相对导入；graph auto-associate API 也不匹配 |
+
+### 7.4 二次审查结论
+
+当前 `v0.9.2-beta` 不能判定为“作为 Hermes Agent 插件的记忆增强功能都正常执行”。基础工具注册面可以进入宿主 registry，但自动记忆增强的关键路径存在阻断：
+
+1. 图工具和 Slash 命令未从宿主入口注册。
+2. `pre_llm_call` 读取旧参数，无法可靠注入记忆上下文。
+3. `on_session_end` 拿不到消息和 LLM facade，full reflection 不会自动运行。
+4. 记忆写入/反射/CLUQI/Dashboard 存在多个跨模块 API 漂移。
+
+因此本轮审查状态应从“暂无已知阻断级残余风险”调整为“发现宿主集成阻断项，需先修复入口和 hook 契约，再验证记忆增强闭环”。
+
+### 7.5 快速修复记录
+
+2026-06-01 已针对 7.2 中的宿主集成问题完成快速修复：
+
+| 原问题 | 修复 |
+|---|---|
+| 包顶层 `register(ctx)` 未聚合注册基础工具、图工具和 Slash 命令 | 新增包顶层聚合 `register(ctx)`，先注册 `tools.py` 的 12 个基础工具，再注册 Slash 命令和 `__init__.py` 中的 4 个图工具 |
+| `pre_llm_call` 参数契约与 Hermes 当前 kwargs 不匹配 | `hooks.py` 同时支持 `user_message/conversation_history` 与旧 `messages`，并缓存 session 消息 |
+| `on_session_end` 拿不到 `messages/ctx` | `register(ctx)` 保存宿主 ctx，session-end 使用 `pre_llm_call` 缓存的消息作为 full reflection 输入 |
+| 跨模块 API 漂移 | 补齐 `MemoryFrontmatter.new()`、`MemoryStore.get_by_id()`、`GraphMemoryManager.propagate_activation()`、`AssociationEngine.on_memory_coactivation()`，并修复 CLUQI list/dict 兼容和 Dashboard 包内导入 |
+| manifest 工具数量不一致 | `plugin.yaml` description 从 17 个 SRH tools 修正为 16 个 |
+
+修复后最小宿主模拟验证结果：
+
+- 包顶层 `register(ctx)` 注册 16 个工具、4 个 hook、8 个 Slash command。
+- `srh_memory_write` 可成功写入 memory。
+- `pre_llm_call` 在 Hermes 当前 `user_message/conversation_history` kwargs 下可返回可注入 context。
+- `post_tool_call` graph auto-associate hook 可用 Hermes 当前 kwargs 调用。
+- Dashboard API 包导入恢复。
+- CLUQI + graph activation smoke 通过。
+
+当前结论：上述宿主集成阻断项已关闭，后续仍建议在真实 Hermes Agent 进程中跑一次插件发现和一轮完整对话 smoke。

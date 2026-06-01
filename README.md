@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v0.9.2-beta** — CLUQI cross-layer query, PageRank centrality, SUPERSEDES graph edges, Dashboard full ahe_graph integration.
+**Current version: v0.9.2-beta2** — Reflection audit, supersedes governance, lineage-aware recall, health metrics, temporal/context hints, CLUQI, and Dashboard graph integration.
 
 ## Features
 
@@ -29,10 +29,12 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | Document | Description |
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v0.8.0 |
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete SRH tool reference with examples |
-| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and API endpoints |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v0.9.2-beta2 |
+| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
+| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
+| [docs/review/DESIGN_EVALUATION.md](docs/review/DESIGN_EVALUATION.md) | Design-level evaluation of supersedes chains, graph memory, refinement, and recall |
+| [docs/design/PLAN_0_9_2_BETA2.md](docs/design/PLAN_0_9_2_BETA2.md) | v0.9.2-beta2 development plan based on design-review gaps |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
 | [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
 

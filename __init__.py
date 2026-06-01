@@ -2,17 +2,18 @@
 
 Ported from https://github.com/coder-brzhang/small-rust-hermes
 
-v0.9.2-beta Architecture (9 modules, approx 7,200 lines):
+v0.9.2-beta2 Architecture (12 code modules + dashboard, approx 6,900 lines):
 - core.py: MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, BM25
-- embed.py: ONNX embedding engine, cosine similarity, intent classification
-- reflection.py: micro/full reflection pipelines, auto-rebalance, profile compilation
-- hooks.py: session hooks (on_session_start/end, pre_llm_call, post_tool_call)
-- tools.py: 17 SRH tool handlers exposed to Hermes Agent
-- ahe_graph/__init__.py: SQLite-backed Hebbian graph, association engine, decay
-- cluqi.py: Cross-Layer Unified Query Interface (Memory + Graph + Supersedes)
-- pagerank.py: PageRank centrality computation for graph nodes
-- query_cache.py: Query templates and TTL-based result cache
-- cross_zone.py: Cross-zone graph analysis (bridges, centrality, recommendations)
+- search/embed.py: ONNX embedding engine, cosine similarity, intent classification
+- reflection/engine.py: micro/full reflection pipelines, auto-rebalance, profile compilation
+- hooks/lifecycle.py: session hooks (on_session_start/end, pre_llm_call, post_tool_call)
+- tools/handlers.py: 12 SRH tool handlers exposed to Hermes Agent
+- __init__.py: 4 graph tools + registration/bootstrap
+- graph/ahe_graph/__init__.py: SQLite-backed Hebbian graph, association engine, decay
+- graph/cluqi.py: Cross-Layer Unified Query Interface (Memory + Graph + Supersedes)
+- graph/pagerank.py: PageRank centrality computation for graph nodes
+- query/cache.py: Query templates and TTL-based result cache
+- graph/cross_zone.py: Cross-zone graph analysis (bridges, centrality, recommendations)
 - __init__.py: registration, exports, backward compat, standalone bootstrap
 
 Features:
@@ -76,7 +77,9 @@ from .core import (  # noqa: F401
     _ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL,
     _VALID_ZONES, _PROJECT_ZONE_PREFIX,
     _ZONE_SPLIT_THRESHOLD, _ZONE_MERGE_THRESHOLD,
-    _write_queue, _pending_writes,
+    _write_queue, _pending_writes, _write_path_lock, _cancel_pending_write, _write_memory,
+    _lineage_latest, _lineage_root, _lineage_depth, _lineage_cycle_check,
+    _classify_update_intent, _is_expired, _is_context_mismatch,
 )
 
 # Backward-compat aliases (old underscore names used by remaining __init__.py code)
@@ -96,8 +99,25 @@ _palace_index_path = palace_index_path
 _zone_cache_dir = zone_cache_dir
 _sanitize_zone_filename = sanitize_zone_filename
 _normalize_zone = normalize_zone
+_fast_hash = fast_hash
 _async_write_memory = async_write_memory
+_batch_record_stats = batch_record_stats
 _stats_path = lambda: plugin_data_dir() / "memory-stats.jsonl"
+
+def _palace_instructions_enabled() -> bool:
+    return bool(plugin_config().get("palace_instructions", True))
+
+def _active_memory_cap() -> int:
+    return int(plugin_config().get("active_memory_index_cap", 20))
+
+def _skill_index_cap() -> int:
+    return int(plugin_config().get("skill_index_cap", 20))
+
+def _relevant_memory_cap() -> int:
+    return int(plugin_config().get("relevant_memory_cap", 5))
+
+def _triggered_skill_cap() -> int:
+    return int(plugin_config().get("triggered_skill_cap", 3))
 
 logger = logging.getLogger(__name__)
 
@@ -232,15 +252,8 @@ def save_zone_summary(zone: str, content: str) -> Path:
     path = d / f"{safe}.md"
     tmp = d / f".{safe}.md.tmp"
     tmp.write_text(content, encoding="utf-8")
-    tmp.rename(path)
+    tmp.replace(path)
     return path
-
-
-def _plugin_data_dir() -> Path:
-    """Plugin data directory (for pending skills, logs, etc.)."""
-    # Use the directory containing this file as the plugin root
-    plugin_root = Path(__file__).parent.resolve()
-    return plugin_root
 
 
 def _user_memories_dir() -> Path:
@@ -272,10 +285,12 @@ class MemoryStore:
         self._embed_index: Optional[Any] = None
         self._embed_lock = threading.Lock()
         self._effectiveness_cache: Optional[Dict[str, MemoryEffectiveness]] = None  # lazy-loaded from JSONL
+        self._effectiveness_mtime_ns: int = 0
         self._doc_tokens: Optional[List[Tuple[str, List[str]]]] = None  # cached (id, tokens) for TF-IDF
         self._cache: Dict[str, Any] = {}  # In-memory cache
         self._cache_valid = False
         self._id_to_path: Dict[str, Path] = {}  # O(1) delete: memory id → file path
+        self._id_to_mem: Dict[str, LoadedMemory] = {}  # O(1) memory lookup
         self._index_dirty: bool = True  # P2-1: event-driven palace index rebuild
         self._last_index_hash: str = ""  # P0-1: write-on-change
         self._cached_index: str = ""  # Cached built index string (avoids rebuild on warm path)
@@ -290,8 +305,9 @@ class MemoryStore:
         if not self._cache_valid:
             return  # Will be rebuilt on next access
         loaded = LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
-        # O(1) id→path index
+        # O(1) id→path and id→memory indexes
         self._id_to_path[fm.id] = path
+        self._id_to_mem[fm.id] = loaded
         # Insert into 'all' maintaining sort order
         all_mems = self._cache["all"]
         # Find insertion point
@@ -328,6 +344,7 @@ class MemoryStore:
         self._cache["superseded"].discard(mem_id)
         self._doc_tokens = None  # invalidate on mutation
         self._id_to_path.pop(mem_id, None)  # P0-2: clean up id→path index
+        self._id_to_mem.pop(mem_id, None)
         self._index_dirty = True  # P2-1: mark palace index for rebuild
         self._cached_index = ""  # Invalidate cached index
 
@@ -336,15 +353,17 @@ class MemoryStore:
             return
         all_mems: List[LoadedMemory] = []
         self._id_to_path.clear()  # P0-2: rebuild id→path index
+        self._id_to_mem.clear()
         for scope, root in (("user", self.user_root), ("project", self.project_root)):
             if root is None or not root.exists():
                 continue
             for f in root.iterdir():
                 if f.suffix == ".md":
-                    m = _read_memory(f, scope)
+                    m = read_memory(f, scope)
                     if m:
                         all_mems.append(m)
                         self._id_to_path[m.id()] = f  # P0-2: populate O(1) index
+                        self._id_to_mem[m.id()] = m
         all_mems.sort(key=lambda m: m.id())
 
         superseded: Set[str] = set()
@@ -389,21 +408,172 @@ class MemoryStore:
 
     def get(self, mem_id: str) -> Optional[LoadedMemory]:
         self._ensure_cache()
-        for m in self._cache["all"]:
-            if m.id() == mem_id:
-                return m
+        # O(1) lookup via id→memory index
+        mem = self._id_to_mem.get(mem_id)
+        if mem is not None:
+            return mem
         return None
+
+    def get_by_id(self, mem_id: str) -> Optional[LoadedMemory]:
+        """Compatibility alias used by CLUQI and dashboard integration."""
+        return self.get(mem_id)
+
+    # -- lineage helpers (WS-1 / WS-2) ----------------------------------------
+
+    def latest_for(self, mem_id: str) -> Optional[LoadedMemory]:
+        """Return the latest (current) memory in the supersedes chain."""
+        latest_id = _lineage_latest(self, mem_id)
+        if latest_id:
+            return self.get(latest_id)
+        m = self.get(mem_id)
+        if m is not None and not self.is_superseded(mem_id):
+            return m
+        return None
+
+    def is_superseded(self, mem_id: str) -> bool:
+        """Check if a memory has been superseded by another."""
+        self._ensure_cache()
+        return mem_id in self._cache.get("superseded", set())
+
+    def lineage_chain(self, mem_id: str, max_depth: int = 10) -> List[LoadedMemory]:
+        """Return the full supersedes chain from root to current."""
+        chain: List[LoadedMemory] = []
+        current = _lineage_root(self, mem_id)
+        visited: Set[str] = set()
+        while current and current not in visited and len(visited) < max_depth:
+            visited.add(current)
+            m = self.get(current)
+            if m is None:
+                break
+            chain.append(m)
+            # Find successor
+            successor = None
+            for cand in self.list():
+                if current in (cand.frontmatter.supersedes or []):
+                    successor = cand.id()
+                    break
+            if successor is None:
+                break
+            current = successor
+        return chain
+
+    # -- health metrics (WS-5) ------------------------------------------------
+
+    def health_metrics(self) -> Dict[str, Any]:
+        """Compute memory health metrics for operator review."""
+        all_mems = self.list()
+        active_mems = self.list_active()
+
+        # Duplicate clusters: bounded Jaccard similarity on pre-tokenized bodies.
+        # HIGH-1 fix: O(n²) → O(n·k) by sampling max 30 candidates per memory
+        # and capping total comparisons at 2000.
+        dup_clusters = 0
+        seen_ids = set()
+        token_sets: Dict[str, Set[str]] = {}
+        for m in active_mems:
+            token_sets[m.id()] = set(_tokenise(m.body))
+        _MAX_CMP_PER_MEM = 30
+        _TOTAL_CMP_CAP = 2000
+        total_cmp = 0
+        for i, m1 in enumerate(active_mems):
+            if m1.id() in seen_ids:
+                continue
+            cluster = [m1]
+            # Only compare against a bounded window of candidates
+            candidates = active_mems[i + 1: i + 1 + _MAX_CMP_PER_MEM]
+            for m2 in candidates:
+                if m2.id() in seen_ids:
+                    continue
+                if total_cmp >= _TOTAL_CMP_CAP:
+                    break
+                total_cmp += 1
+                s1 = token_sets[m1.id()]
+                s2 = token_sets[m2.id()]
+                if not s1 or not s2:
+                    continue
+                inter = len(s1 & s2)
+                union = len(s1 | s2)
+                jaccard = inter / union if union else 0.0
+                if jaccard > 0.85:
+                    cluster.append(m2)
+                    seen_ids.add(m2.id())
+            if len(cluster) > 1:
+                dup_clusters += 1
+                seen_ids.update(m.id() for m in cluster)
+
+        # Longest supersedes chain
+        max_chain_len = 0
+        chain_roots = set()
+        for m in all_mems:
+            root = _lineage_root(self, m.id())
+            if root:
+                chain_roots.add(root)
+        for root in chain_roots:
+            chain = self.lineage_chain(root, max_depth=100)
+            max_chain_len = max(max_chain_len, len(chain))
+
+        # Supersedes cycle count
+        cycle_count = 0
+        for m in all_mems:
+            cycle = _lineage_cycle_check(self, m.id())
+            if cycle is not None:
+                cycle_count += 1
+
+        # Stale high-rank memories (rank > 5 and superseded)
+        stale_high_rank = sum(
+            1 for m in all_mems
+            if getattr(m.frontmatter, "rank", 0) > 5 and self.is_superseded(m.id())
+        )
+
+        # Expired memories
+        expired_count = sum(1 for m in all_mems if _is_expired(m.frontmatter))
+
+        # Reflection acceptance rate (from log)
+        acceptance_rate = 0.0
+        total_audit = accepted_audit = 0
+        try:
+            from .reflection.engine import _recent_reflect_outcomes
+            recent = _recent_reflect_outcomes(n=100)
+            for entry in recent:
+                for ae in entry.get("audit_entries", []):
+                    total_audit += 1
+                    if ae.get("decision") in ("accepted", "superseded"):
+                        accepted_audit += 1
+            if total_audit > 0:
+                acceptance_rate = round(accepted_audit / total_audit, 4)
+        except Exception:
+            pass
+
+        return {
+            "memory_count": len(all_mems),
+            "active_count": len(active_mems),
+            "duplicate_clusters": dup_clusters,
+            "longest_supersedes_chain": max_chain_len,
+            "supersedes_cycle_count": cycle_count,
+            "stale_high_rank_count": stale_high_rank,
+            "expired_count": expired_count,
+            "reflection_acceptance_rate": acceptance_rate,
+            "reflection_audit_entries": total_audit,
+        }
 
     # -- write ----------------------------------------------------------------
 
     def put(self, scope: str, fm: MemoryFrontmatter, body: str) -> Path:
         if self.get(fm.id):
             raise ValueError(f"Duplicate memory id: {fm.id}")
+        # WS-1: validate supersedes targets exist and do not create cycles
+        if fm.supersedes:
+            for sid in fm.supersedes:
+                if self.get(sid) is None:
+                    raise ValueError(f"supersedes target not found: {sid}")
+            cycle = _lineage_cycle_check(self, fm.supersedes[0])
+            if cycle is not None:
+                raise ValueError(f"supersedes would create a cycle: {' -> '.join(cycle)}")
         root = self._root_for(scope)
         date_prefix = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
         short = fm.id[:16]
         path = root / f"{date_prefix}-{short}.md"
-        _async_write_memory(path, fm, body)  # P2-2: async disk I/O
+        async_write_memory(path, fm, body)  # P2-2: async disk I/O
         self._id_to_path[fm.id] = path  # P0-2: O(1) id→path
         self._update_cache_for_put(scope, fm, body, path)
         # Try to index embedding
@@ -414,14 +584,15 @@ class MemoryStore:
         # P0-2: O(1) lookup via id→path index
         path = self._id_to_path.get(mem_id)
         if path is not None:
-            # P2-2: if file is still pending async write, just remove from queue tracking
-            _pending_writes.discard(path)
-            if path.exists():
-                try:
-                    path.unlink()
-                except OSError as e:
-                    logger.warning("Failed to delete memory file %s: %s", path, e)
-                    return False
+            with _write_path_lock(path):
+                # Invalidate any queued write for the same file before unlinking.
+                _cancel_pending_write(path)
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except OSError as e:
+                        logger.warning("Failed to delete memory file %s: %s", path, e)
+                        return False
             self._id_to_path.pop(mem_id, None)
             self._update_cache_for_delete(mem_id)
             self._try_remove_index(mem_id)
@@ -433,7 +604,9 @@ class MemoryStore:
                 continue
             m = _read_memory(f, scope)
             if m and m.id() == mem_id:
-                f.unlink()
+                with _write_path_lock(f):
+                    _cancel_pending_write(f)
+                    f.unlink()
                 self._id_to_path.pop(mem_id, None)
                 self._update_cache_for_delete(mem_id)
                 self._try_remove_index(mem_id)
@@ -463,13 +636,17 @@ class MemoryStore:
             pinned=pinned if pinned is not None else mem.frontmatter.pinned,
             tags=tags if tags is not None else mem.frontmatter.tags,
             supersedes=mem.frontmatter.supersedes,
+            supersedes_reason=mem.frontmatter.supersedes_reason,
+            valid_from=mem.frontmatter.valid_from,
+            valid_until=mem.frontmatter.valid_until,
+            context_scope=mem.frontmatter.context_scope,
             zone=zone if zone is not None else mem.frontmatter.zone,
             rank=mem.frontmatter.rank,
         )
         new_body = body if body is not None else mem.body
 
         # Write new file FIRST (preserves data on write failure)
-        new_path = self._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+        new_path = self._root_for(mem.scope) / f"{str(fm.created)[:10]}-{fm.id[:16]}.md"
         _write_memory(new_path, fm, new_body)
 
         # Delete old file only after successful write AND only if path changed
@@ -518,25 +695,26 @@ class MemoryStore:
                 pinned=mem.frontmatter.pinned,
                 tags=mem.frontmatter.tags,
                 supersedes=mem.frontmatter.supersedes,
+                supersedes_reason=mem.frontmatter.supersedes_reason,
+                valid_from=mem.frontmatter.valid_from,
+                valid_until=mem.frontmatter.valid_until,
+                context_scope=mem.frontmatter.context_scope,
                 zone=mem.frontmatter.zone,
                 rank=new_rank,
             )
 
             # Atomic write via temp file to avoid in-place overwrite corruption
-            new_path = self._root_for(mem.scope) / f"{fm.created[:10]}-{fm.id[:16]}.md"
+            new_path = self._root_for(mem.scope) / f"{str(fm.created)[:10]}-{fm.id[:16]}.md"
             tmp_path = new_path.with_suffix(new_path.suffix + ".tmp")
             _write_memory(tmp_path, fm, mem.body)
             os.replace(tmp_path, new_path)  # atomic on POSIX
             if new_path != mem.source_path:
                 self.delete(mem.scope, mem_id)
 
-            # Update cache
-            self._id_to_path[fm.id] = new_path
-            self._update_cache_for_put(mem.scope, fm, mem.body, new_path)
-            self._try_index(fm.id, mem.body)
             updated.append(mem_id)
 
-        # Invalidate cache to ensure fresh ordering
+        # HIGH-3 / LOW-7: invalidate once after all writes instead of
+        # incrementally updating the cache inside the loop.
         self._invalidate_cache()
         return updated
 
@@ -552,7 +730,7 @@ class MemoryStore:
     # -- Fusion search (BM25 + Graph + Supersedes) ---------------------------------------
 
     def _calc_supersedes_depth(self, memory_id: str, visited: Optional[Set[str]] = None,
-                               max_depth: int = 10) -> int:
+                               max_depth: int = 10, depth: int = 0) -> int:
         """Follow supersedes chain recursively to compute depth.
 
         depth=0: never superseded
@@ -562,17 +740,17 @@ class MemoryStore:
         """
         if visited is None:
             visited = set()
-        if memory_id in visited or len(visited) >= max_depth:
-            return len(visited)
+        if memory_id in visited or depth >= max_depth:
+            return depth
         visited.add(memory_id)
         m = self.get(memory_id)
         if m is None:
-            return len(visited) - 1
+            return depth
         supers = m.frontmatter.supersedes
         if not supers:
-            return len(visited) - 1
+            return depth
         # Follow the first supersedes link (linear chain assumption)
-        return self._calc_supersedes_depth(supers[0], visited, max_depth)
+        return self._calc_supersedes_depth(supers[0], visited, max_depth, depth + 1)
 
     def fusion_search(self, query: str, k: int = 5,
                       zone: Optional[str] = None,
@@ -641,14 +819,18 @@ class MemoryStore:
 
     def _get_effectiveness(self) -> Dict[str, MemoryEffectiveness]:
         """Lazy-load effectiveness stats from JSONL. Cached per store instance."""
-        if self._effectiveness_cache is not None:
+        sp = _stats_path()
+        current_mtime_ns = sp.stat().st_mtime_ns if sp.exists() else 0
+        if self._effectiveness_cache is not None and self._effectiveness_mtime_ns == current_mtime_ns:
             return self._effectiveness_cache
         self._effectiveness_cache = load_effectiveness()
+        self._effectiveness_mtime_ns = current_mtime_ns
         return self._effectiveness_cache
 
     def refresh_effectiveness(self) -> None:
         """Force reload of effectiveness stats (call after writing new stats)."""
         self._effectiveness_cache = None
+        self._effectiveness_mtime_ns = 0
 
     def _ensure_doc_tokens(self, active: List[LoadedMemory]) -> List[Tuple[str, List[str]]]:
         """Build or return cached tokenized documents for TF-IDF."""
@@ -660,22 +842,23 @@ class MemoryStore:
         self._doc_tokens = [(m.id(), _memory_tokens(m)) for m in active]
         return self._doc_tokens
 
-    def search(self, query: str, k: int = 5, zone: Optional[str] = None) -> List[LoadedMemory]:
-        active = self.list_active()
+    def search(self, query: str, k: int = 5, zone: Optional[str] = None,
+               include_history: bool = False) -> List[LoadedMemory]:
+        candidates = self.list_active() if not include_history else self.list()
         # Try embedding first if available
         embed_results = self._embed_search(query, k)
         if embed_results is not None:
             logger.debug("search: using embedding strategy for query=%r k=%d zone=%s", query, k, zone)
             id_set = {mid for mid, _ in embed_results}
-            results = [m for m in active if m.id() in id_set]
+            results = [m for m in candidates if m.id() in id_set]
             if zone:
                 results = [m for m in results if m.frontmatter.zone == _normalize_zone(zone)]
             return results[:k]
         # Load effectiveness and cached doc_tokens
         logger.debug("search: using BM25 strategy for query=%r k=%d zone=%s", query, k, zone)
         effectiveness = self._get_effectiveness()
-        doc_tokens = self._ensure_doc_tokens(active)
-        return _bm25_search(active, query, k, effectiveness, doc_tokens)
+        doc_tokens = self._ensure_doc_tokens(candidates)
+        return _bm25_search(candidates, query, k, effectiveness, doc_tokens)
 
     def check_conflict(self, body: str, threshold: Optional[float] = None) -> Optional[Tuple[str, float]]:
         """Check for conflicting memories using BM25 similarity.
@@ -690,6 +873,11 @@ class MemoryStore:
         """
         if threshold is None:
             threshold = _adaptive_conflict_threshold(body)
+            # HIGH-8: short facts (< 20 tokens) may not trigger BM25 overlap due
+            # to token sparsity. Lower threshold by 0.05 for short texts.
+            tokens = _tokenise(body)
+            if len(tokens) < 20:
+                threshold = max(0.65, threshold - 0.05)
         active = self.list_active()
         scored = _bm25_search_scored(active, body, 1)
         if scored:
@@ -816,117 +1004,6 @@ def _adaptive_conflict_threshold(body: str) -> float:
     elif ratio > 0.10:
         return 0.80
     return 0.85
-
-
-def _tokenise(s: str) -> List[str]:
-    lower = s.lower()
-    tokens = []
-    for segment in _TOKEN_RE.split(lower):
-        char_count = len(segment)
-        if char_count == 0:
-            continue
-        if char_count >= _MIN_TOKEN_LEN:
-            tokens.append(segment)
-        # CJK bigrams
-        if char_count >= 2 and any(_is_cjk(c) for c in segment):
-            chars = list(segment)
-            for i in range(len(chars) - 1):
-                tokens.append(chars[i] + chars[i + 1])
-    return tokens
-
-
-def _memory_tokens(m: LoadedMemory) -> List[str]:
-    tokens = _tokenise(m.body)
-    for tag in m.frontmatter.tags:
-        tokens.extend(_tokenise(tag))
-    return tokens
-
-
-def _bm25_search(memories: List[LoadedMemory], query: str, k: int,
-                  effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
-                  doc_tokens: Optional[List[Tuple[str, List[str]]]] = None) -> List[LoadedMemory]:
-    scored = _bm25_search_scored(memories, query, k, effectiveness, doc_tokens)
-    return [m for m, _ in scored]
-
-
-def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int,
-                         effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
-                         doc_tokens: Optional[List[Tuple[str, List[str]]]] = None
-                         ) -> List[Tuple[LoadedMemory, float]]:
-    """BM25 retrieval with effectiveness boosting.
-
-    BM25 formula (Robertson & Zaragoza, 2009):
-      score(D,Q) = Σ IDF(q_i) * TF_okapi(q_i,D) * (k1+1)/(TF_okapi(q_i,D)+k1*(1-b+b*|D|/avgdl))
-    
-    k1=1.5 (saturation), b=0.75 (length normalization) optimized for CJK mixed text.
-    Falls back gracefully for empty/singleton corpus.
-    """
-    k1, b = 1.5, 0.75
-    if k == 0 or not memories:
-        return []
-    q_tokens = _tokenise(query)
-    if not q_tokens:
-        return []
-    n = len(memories)
-
-    # Compute doc frequencies + doc lengths in one pass
-    df: Dict[str, int] = Counter()
-    doc_lens: List[int] = []
-    raw_doc_tokens: List[List[str]]
-    if doc_tokens is not None:
-        raw_doc_tokens = [tokens for _, tokens in doc_tokens]
-    else:
-        raw_doc_tokens = [_memory_tokens(m) for m in memories]
-    for tokens in raw_doc_tokens:
-        doc_lens.append(len(tokens))
-        for t in set(tokens):
-            df[t] += 1
-
-    avgdl = sum(doc_lens) / max(n, 1)
-    
-    # BM25 IDF: log(1 + (N - df(q) + 0.5) / (df(q) + 0.5))
-    q_tf = Counter(q_tokens)
-    idf_cache: Dict[str, float] = {}
-    for t in q_tf:
-        df_t = df.get(t, 0)
-        if df_t == 0:
-            continue  # skip unseen terms
-        idf_cache[t] = (n - df_t + 0.5) / (df_t + 0.5) + 1.0  # add-one smoothing
-
-    if not idf_cache:
-        return []
-
-    scored: List[Tuple[float, LoadedMemory]] = []
-    for i, (tokens, m) in enumerate(zip(raw_doc_tokens, memories)):
-        doc_len = doc_lens[i]
-        m_tf = Counter(tokens)
-        score = 0.0
-        for t, q_count in q_tf.items():
-            idf = idf_cache.get(t)
-            if idf is None:
-                continue
-            tf = m_tf.get(t, 0)
-            # BM25 term: (k1+1)*TF / (k1*(1-b+b*|D|/avgdl) + TF)
-            norm = k1 * (1 - b + b * doc_len / max(avgdl, 1))
-            score += idf * (tf * (k1 + 1)) / (tf + norm) * q_count  # q_count for multi-occur query terms
-        if score > 0:
-            # Apply effectiveness boosting if available
-            if effectiveness:
-                eff = effectiveness.get(m.id())
-                if eff:
-                    score *= eff.factor() * eff.decay_factor()
-            scored.append((score, m))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(m, s) for s, m in scored[:k]]
-
-
-def _cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
-    dot = sum(a[k] * b.get(k, 0.0) for k in a)
-    norm_a = sum(v * v for v in a.values()) ** 0.5
-    norm_b = sum(v * v for v in b.values()) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 # ---------------------------------------------------------------------------
@@ -1066,20 +1143,6 @@ _mem_store: Optional[MemoryStore] = None
 _skill_store: Optional[SkillStore] = None
 _turns_since_reflect: int = 0
 _micro_reflect_queue: List[Dict[str, Any]] = []
-
-
-def _get_mem_store() -> MemoryStore:
-    global _mem_store
-    if _mem_store is None:
-        _mem_store = MemoryStore(_user_memories_dir(), _project_memories_dir())
-    return _mem_store
-
-
-def _get_skill_store() -> SkillStore:
-    global _skill_store
-    if _skill_store is None:
-        _skill_store = SkillStore(_user_skills_dir(), _project_skills_dir())
-    return _skill_store
 
 
 # ---------------------------------------------------------------------------
@@ -1304,7 +1367,7 @@ def _register_slash_commands(ctx):
 
         # ── Common graph setup (runs regardless of import path) ──
         # Lazy-init on first use
-        _graph_db_dir = Path(ctx.hermes_home) / "plugins" / "mem-reflection-hermes"
+        _graph_db_dir = hermes_home() / "plugins" / "mem-reflection-hermes"
         # Set module-level globals so _on_session_end and _get_graph_neighbors
         # use the same singleton (P1-2, P2-1)
         global _gm_getter_func, _gm_getter_path
@@ -1326,10 +1389,15 @@ def _register_slash_commands(ctx):
         def _graph_associate_h(args: dict, **kwargs) -> str:
             gm = _ensure_gm()
             mids = args.get("memory_ids", [])[:MAX_ASSOCIATION_IDS]
+            # HIGH-10: validate memory IDs exist before creating graph edges
+            mem_store = _get_mem_store()
+            valid_mids = [mid for mid in mids if mem_store.get(mid) is not None]
+            if len(valid_mids) < 2:
+                return json.dumps({"error": "At least 2 valid memory IDs required", "valid_ids": valid_mids})
             ctx_str = args.get("context", "")
             rel = args.get("relation", "co_occurs")
-            result = gm.associate_memories(mids, ctx_str, rel)
-            return json.dumps(result)
+            result = gm.associate_memories(valid_mids, ctx_str, rel)
+            return json.dumps({**result, "validated_ids": valid_mids})
 
         ctx.register_tool(
             name="srh_associate",
@@ -1345,7 +1413,7 @@ def _register_slash_commands(ctx):
                             "items": {"type": "string"},
                             "description": "List of memory IDs to associate (max 20)",
                             "minItems": 2,
-                            "maxItems": MAX_ASSOCIATION_IDS,
+                            "maxItems": 20,
                         },
                         "relation": {
                             "type": "string",
@@ -1399,7 +1467,7 @@ def _register_slash_commands(ctx):
             toolset="mem_reflection_hermes",
             schema={
                 "name": "srh_graph_retrieve",
-                "description": "Retrieve graph-related memories via activation propagation. Given seed memory IDs, finds connected memories through graph edges with Hebbian weights. Progressive tiers: tier='count' (minimal), 'list' (summary, default), 'detail' (full with depth).",
+                "description": "Retrieve associative memories via co-activation propagation. Given seed memory IDs, finds related memories through associative (Hebbian co-occurrence) graph edges. Edges indicate 'used together', not factual entity relationships. Progressive tiers: tier='count' (minimal), 'list' (summary, default), 'detail' (full with depth).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1441,14 +1509,16 @@ def _register_slash_commands(ctx):
         # --- tool: srh_graph_stats ---
         def _graph_stats_h(args: dict, **kwargs) -> str:
             gm = _ensure_gm()
-            return json.dumps(gm.get_stats())
+            stats = gm.get_stats()
+            stats["graph_semantics"] = "associative_coactivation"
+            return json.dumps(stats)
 
         ctx.register_tool(
             name="srh_graph_stats",
             toolset="mem_reflection_hermes",
             schema={
                 "name": "srh_graph_stats",
-                "description": "Get graph memory statistics: node count, edge count, average edge weight, database path.",
+                "description": "Get associative graph statistics: node count, co-activation edge count, average edge weight, database path. The graph represents Hebbian co-occurrence (memories used together), not factual entity relationships.",
                 "parameters": {"type": "object", "properties": {}},
             },
             handler=_graph_stats_h,
@@ -1465,20 +1535,20 @@ def _register_slash_commands(ctx):
             if stats.get("node_count", 0) == 0:
                 return json.dumps({"nodes": [], "edges": [], "stats": stats})
             try:
-                conn = gm.store._connect()
-                nodes = conn.execute(
-                    "SELECT id, zone, importance, strength, status, access_count FROM graph_memory_meta "
-                    "WHERE strength > 0 ORDER BY importance DESC LIMIT 200"
-                ).fetchall()
-                edges = conn.execute(
-                    "SELECT source_id, target_id, relation, weight FROM graph_edges "
-                    "WHERE weight >= 0.1 ORDER BY weight DESC LIMIT 500"
-                ).fetchall()
-                return json.dumps({
-                    "nodes": [dict(r) for r in nodes],
-                    "edges": [dict(r) for r in edges],
-                    "stats": stats,
-                })
+                with gm.store._connect() as conn:
+                    nodes = conn.execute(
+                        "SELECT id, zone, importance, strength, status, access_count FROM graph_memory_meta "
+                        "WHERE strength > 0 ORDER BY importance DESC LIMIT 200"
+                    ).fetchall()
+                    edges = conn.execute(
+                        "SELECT source_id, target_id, relation, weight FROM graph_edges "
+                        "WHERE weight >= 0.1 ORDER BY weight DESC LIMIT 500"
+                    ).fetchall()
+                    return json.dumps({
+                        "nodes": [dict(r) for r in nodes],
+                        "edges": [dict(r) for r in edges],
+                        "stats": {**stats, "graph_semantics": "associative_coactivation"},
+                    })
             except Exception as e:
                 return json.dumps({"error": str(e), "stats": stats})
 
@@ -1487,7 +1557,7 @@ def _register_slash_commands(ctx):
             toolset="mem_reflection_hermes",
             schema={
                 "name": "srh_graph_viz",
-                "description": "Get full graph visualization data (nodes + edges) for dashboard rendering. tier='summary' returns counts only; 'detail' returns full node/edge lists.",
+                "description": "Get full associative graph visualization data (nodes + edges) for dashboard rendering. tier='summary' returns counts only; 'detail' returns full node/edge lists. Graph semantics: associative_coactivation (Hebbian co-occurrence edges, not factual entity relations).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1500,16 +1570,51 @@ def _register_slash_commands(ctx):
             emoji="🕸️",
         )
 
+        # --- tool: srh_memory_health (WS-5) ---
+        def _memory_health_h(args: dict, **kwargs) -> str:
+            store = _get_mem_store()
+            metrics = store.health_metrics()
+            return json.dumps({"health": metrics, "recommendations": _health_recommendations(metrics)})
+
+        def _health_recommendations(metrics: Dict[str, Any]) -> List[str]:
+            recs = []
+            if metrics.get("duplicate_clusters", 0) > 0:
+                recs.append(f"Review {metrics['duplicate_clusters']} duplicate memory cluster(s).")
+            if metrics.get("longest_supersedes_chain", 0) > 5:
+                recs.append(f"Longest supersedes chain ({metrics['longest_supersedes_chain']}) is deep; consider consolidation.")
+            if metrics.get("supersedes_cycle_count", 0) > 0:
+                recs.append(f"Found {metrics['supersedes_cycle_count']} cycle(s) in supersedes chains — fix immediately.")
+            if metrics.get("stale_high_rank_count", 0) > 0:
+                recs.append(f"{metrics['stale_high_rank_count']} superseded memories still have high rank; consider re-ranking.")
+            if metrics.get("expired_count", 0) > 0:
+                recs.append(f"{metrics['expired_count']} memories have passed their valid_until date.")
+            if not recs:
+                recs.append("Memory store looks healthy.")
+            return recs
+
+        ctx.register_tool(
+            name="srh_memory_health",
+            toolset="mem_reflection_hermes",
+            schema={
+                "name": "srh_memory_health",
+                "description": "Get memory health metrics: duplicate clusters, longest supersedes chain, cycle count, stale high-rank memories, expired memories, and reflection acceptance rate. Returns actionable recommendations.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=_memory_health_h,
+            description="Get memory health metrics and recommendations",
+            emoji="🏥",
+        )
+
         # --- hook: auto-associate on memory write ---
-        def _post_tool_associate(ctx_hook, context: dict) -> dict:
+        def _post_tool_associate(**kwargs) -> None:
             try:
-                tool_name = context.get("tool_name", "")
+                tool_name = kwargs.get("tool_name", "")
                 if tool_name not in ("srh_memory_write", "srh_memory_delete"):
-                    return context
+                    return None
 
                 gm = _ensure_gm()
-                args = context.get("tool_args", {})
-                result = context.get("result", {})
+                args = kwargs.get("args", {})
+                result = kwargs.get("result", {})
 
                 if tool_name == "srh_memory_write":
                     # result may be raw JSON string (srh_memory_write returns json.dumps)
@@ -1519,11 +1624,11 @@ def _register_slash_commands(ctx):
                         except json.JSONDecodeError:
                             result = {}
                     # Guard: only create graph metadata for successful writes
-                    if not result.get("success") and not result.get("id"):
-                        return context
+                    if not result.get("success") or not result.get("id"):
+                        return None
                     memory_id = result.get("id")
                     if not memory_id:
-                        return context
+                        return None
                     zone = args.get("zone", "general")
                     gm.store.ensure_meta(memory_id, zone=zone)
                     gm.store.record_access(memory_id)
@@ -1534,7 +1639,8 @@ def _register_slash_commands(ctx):
                         for old_id in supersedes_ids:
                             # Mark old memory as inactive in graph
                             gm.store.update_importance(old_id, delta=-0.9)
-                            gm.store._connect().execute(
+                            conn = gm.store._connect()
+                            conn.execute(
                                 "UPDATE graph_memory_meta SET strength=0, status='superseded' WHERE id=?",
                                 (old_id,)
                             )
@@ -1548,7 +1654,6 @@ def _register_slash_commands(ctx):
                                 # Copy edge from new memory to neighbor with decayed weight
                                 gm.store.set_edge_weight(memory_id, neigh, relation=rel,
                                                      weight=old_w * 0.3)
-                            conn = gm.store._connect()
                             conn.commit()
                 elif tool_name == "srh_memory_delete":
                     # Clean up graph metadata and edges for this memory
@@ -1556,15 +1661,17 @@ def _register_slash_commands(ctx):
                     if mem_id:
                         # ── Scheme A-2: Soft-delete (mark inactive) instead of hard delete ──
                         gm.store.update_importance(mem_id, delta=-0.9)
-                        gm.store._connect().execute(
+                        conn = gm.store._connect()
+                        conn.execute(
                             "UPDATE graph_memory_meta SET strength=0, status='deleted' WHERE id=?",
                             (mem_id,)
                         )
+                        conn.commit()
                         # Decay connected edges heavily
                         gm.store.decay_edges(decay_rate=0.9)
             except Exception as e:
                 logger.debug("ahe_graph auto-associate: %s", e)
-            return context
+            return None
 
         ctx.register_hook("post_tool_call", _post_tool_associate)
 
@@ -1603,14 +1710,62 @@ def _register_slash_commands(ctx):
         logger.info("ahe_graph integration registered (v0.6.1+)")
     except ImportError as e:
         logger.warning("ahe_graph not available (skip integration): %s", e)
+        # HIGH-7: ensure post_tool_call hook is always registered
+        ctx.register_hook("post_tool_call", lambda **kwargs: None)
     except Exception as e:
         logger.warning("ahe_graph integration error: %s", e)
+        # HIGH-7: ensure post_tool_call hook is always registered
+        ctx.register_hook("post_tool_call", lambda **kwargs: None)
 
 
-# Tool handlers extracted to tools.py
-# Tool handlers extracted to tools.py
+def _get_mem_store() -> MemoryStore:
+    """Return the package-level memory store; keep this before star imports."""
+    global _mem_store
+    if _mem_store is None:
+        _mem_store = MemoryStore(_user_memories_dir(), _project_memories_dir())
+    return _mem_store
+
+
+def _get_skill_store() -> SkillStore:
+    """Return the package-level skill store; keep this before star imports."""
+    global _skill_store
+    if _skill_store is None:
+        _skill_store = SkillStore(_user_skills_dir(), _project_skills_dir())
+    return _skill_store
+
+
+# Keep package-native helpers before star imports from submodules add wrappers
+# with the same names.
+_package_get_mem_store = _get_mem_store
+_package_get_skill_store = _get_skill_store
+_package_build_context_block = _build_context_block
+_package_normalize_zone = _normalize_zone
+_package_micro_reflection_enabled = _micro_reflection_enabled
+_package_estimate_tokens = _estimate_tokens
+
+
+# Tool handlers extracted to tools/handlers.py
 
 # Sub-module imports
-from .reflection import *  # noqa: F401, F403
-from .tools import *  # noqa: F401, F403
-from .hooks import *  # noqa: F401, F403
+from .reflection.engine import *  # noqa: F401, F403
+from .tools.handlers import *  # noqa: F401, F403
+from .hooks.lifecycle import *  # noqa: F401, F403
+
+_build_context_block = _package_build_context_block
+_normalize_zone = _package_normalize_zone
+_micro_reflection_enabled = _package_micro_reflection_enabled
+_estimate_tokens = _package_estimate_tokens
+
+def _reflection_mode() -> str:
+    return plugin_config().get("reflection_mode", "embedding")
+
+
+def register(ctx) -> None:
+    """Register all Hermes plugin tools, hooks, slash commands, and graph tools."""
+    from .hooks import lifecycle as _hooks_mod
+    from .tools import handlers as _tools_mod
+
+    if hasattr(_hooks_mod, "_set_plugin_context"):
+        _hooks_mod._set_plugin_context(ctx)
+    _tools_mod.register(ctx)
+    _register_slash_commands(ctx)

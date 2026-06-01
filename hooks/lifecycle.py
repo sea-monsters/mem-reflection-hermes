@@ -1,4 +1,4 @@
-"""hooks.py — Plugin lifecycle hooks, graph utils, and slash commands.
+"""hooks/lifecycle.py — Plugin lifecycle hooks, graph utils, and slash commands.
 Entry points: _on_session_start, _on_session_end, _pre_llm_call.
 Plus: graph manager, slash commands for reflect/skills/memory management.
 """
@@ -6,15 +6,16 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .core import (
+from ..core import (
     LoadedMemory, MemoryFrontmatter,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
 )
-from .reflection import (
+from ..reflection.engine import (
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_micro_reflection,
     _approve_skill, _reject_skill,
@@ -46,13 +47,25 @@ __all__ = [
 # Late-binding imports cached at module level to avoid repeated dict lookups
 # (P2-23: was doing import on every call)
 _late_bindings: Dict[str, Any] = {}
+_plugin_ctx: Any = None
+_session_messages: Dict[str, List[Dict[str, Any]]] = {}
+
+def _set_plugin_context(ctx: Any) -> None:
+    """Remember the host plugin context for hooks that run without ctx kwargs."""
+    global _plugin_ctx
+    _plugin_ctx = ctx
 
 def _lb(name: str):
     """Get a late-bound function, caching the lookup."""
     fn = _late_bindings.get(name)
     if fn is None:
-        from mem_reflection_hermes import __dict__ as _mod
-        fn = _mod[name]
+        pkg = __package__ or "mem_reflection_hermes"
+        mod = sys.modules.get(pkg) or sys.modules.get("mem_reflection_hermes")
+        if mod is None:
+            raise KeyError(f"Plugin module not loaded for late binding: {pkg}")
+        fn = getattr(mod, name, None)
+        if fn is None:
+            raise KeyError(f"Plugin module not loaded for late binding: {pkg}")
         _late_bindings[name] = fn
     return fn
 
@@ -77,6 +90,9 @@ def _save_pending_skill_candidates(candidates):
 def _recent_reflect_outcomes(n=10):
     return _lb("_recent_reflect_outcomes")(n)
 
+def _micro_reflection_enabled():
+    return _lb("_micro_reflection_enabled")()
+
 _turns_since_reflect: int = 0
 
 # ── Graph manager global singleton (set during plugin init) ─────────
@@ -95,7 +111,8 @@ def _on_session_start(**kwargs) -> None:
 
 
 def _on_session_end(**kwargs) -> None:
-    messages = kwargs.get("messages", [])
+    session_id = kwargs.get("session_id", "")
+    messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
 
     # ── Periodic graph decay ──────────────────────────────
     # Run Ebbinghaus decay on graph edges every session end so weights
@@ -110,7 +127,7 @@ def _on_session_end(**kwargs) -> None:
     if not messages:
         return
     # Attempt full reflection via LLM if available
-    ctx = kwargs.get("ctx")
+    ctx = kwargs.get("ctx") or _plugin_ctx
     if ctx is not None:
         try:
             _run_full_reflection(ctx, messages)
@@ -122,8 +139,14 @@ def _on_session_end(**kwargs) -> None:
 
 def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
     """Inject layered context into the user message; also trigger micro-reflection."""
-    messages = kwargs.get("messages", [])
-    ctx = kwargs.get("ctx")
+    messages = kwargs.get("messages") or kwargs.get("conversation_history") or []
+    user_message = kwargs.get("user_message")
+    if user_message:
+        messages = list(messages) + [{"role": "user", "content": user_message}]
+    session_id = kwargs.get("session_id", "")
+    if session_id:
+        _session_messages[session_id] = list(messages)[-80:]
+    ctx = kwargs.get("ctx") or _plugin_ctx
 
     # Extract latest user query and assistant response for micro-reflection
     user_msg = ""
@@ -146,11 +169,15 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
         global _turns_since_reflect
         has_intent = _is_explicit_memory_intent(user_msg)
         if has_intent or _turns_since_reflect >= 3:
-            try:
-                _run_micro_reflection(ctx, user_msg, assistant_msg)
-                _turns_since_reflect = 0
-            except Exception as e:
-                logger.debug("Micro-reflection failed: %s", e)
+            # Guard: LLM-based micro-reflection requires ctx; skip if unavailable
+            if ctx is None and _reflection_mode() == "llm":
+                logger.debug("Micro-reflection skipped: ctx unavailable in llm mode")
+            else:
+                try:
+                    _run_micro_reflection(ctx, user_msg, assistant_msg)
+                    _turns_since_reflect = 0
+                except Exception as e:
+                    logger.debug("Micro-reflection failed: %s", e)
         else:
             _turns_since_reflect += 1
 
@@ -324,7 +351,7 @@ def _slash_compile_profile(raw_args: str) -> str:
 
 
 # Embedding engine extracted to embed.py
-from .embed import *  # noqa: F401, F403
+from ..search.embed import *  # noqa: F401, F403
 
 
 
@@ -332,4 +359,4 @@ from .embed import *  # noqa: F401, F403
 # Pending skill candidate approval system
 
 # Reflection pipeline extracted to reflection.py
-from .reflection import *  # noqa: F401, F403
+from ..reflection.engine import *  # noqa: F401, F403

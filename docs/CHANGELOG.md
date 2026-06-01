@@ -1,13 +1,22 @@
 # Changelog
 
+## v0.9.2-beta2 — Reflection Audit + Supersedes Governance + Lineage Recall
+
+- **WS-1 Supersedes governance**: `supersedes_reason` frontmatter field, lineage helpers (`latest_for`, `is_superseded`, `lineage_chain`), cycle detection, missing-target validation
+- **WS-2 Lineage-aware recall**: Default search excludes superseded memories; `include_history` flag; CLUQI boosts latest active memory in chain
+- **WS-3 Reflection quality audit**: Structured `audit_entries` in reflect log with `candidate_id`, `decision`, `decision_reason`, `novelty_score`, `conflict_id`, `supersedes_ids`, `supersedes_reason`, `assigned_zone`, `graph_migration`. Dashboard `/reflections/audit` endpoint for querying audit entries.
+- **WS-6 Temporal/context hints**: `valid_from`, `valid_until`, `context_scope`, `supersedes_reason` frontmatter fields with round-trip preservation and expired-memory detection
+- **Beta2 plan**: Added `docs/design/PLAN_0_9_2_BETA2.md` to turn review gaps into prioritized workstreams
+
 ## v0.9.2-beta — Dashboard Graph Integration + CLUQI + PageRank
 
+- **Design evaluation**: Added `docs/review/DESIGN_EVALUATION.md` evaluating supersedes chains, associative graph memory, reflection refinement, and recall against Mem0, Letta/MemGPT, Zep/Graphiti, Memary, and Cognee.
 - **CLUQI** (`cluqi.py`): Cross-Layer Unified Query Interface joining MemoryStore, GraphStore, and supersedes chains
 - **PageRank** (`pagerank.py`): Centrality scores for identifying hub memories in the graph
 - **Query templates** (`query_cache.py`): 8 predefined patterns + TTL-based result cache
 - **Cross-zone analysis** (`cross_zone.py`): Bridge memories, zone centrality, zone recommendations
 - **SUPERSEDES graph edges**: Structural version lineage edges in ahe_graph (preserved from decay)
-- **Dashboard v0.9.2**:
+- **Dashboard v0.9.2**: 13 API routes
   - `GET /graph` returns real Hebbian edges from ahe_graph SQLite + PageRank scores
   - `GET /graph/neighbors/{id}` with CLUQI metadata enrichment
   - `GET /graph/zones` for cross-zone bridge visualization
@@ -26,8 +35,8 @@
 ## v0.8.0 — Module Split + ahe_graph Integration
 
 - **6-way module split**: `__init__.py` reduced from ~4,500 to ~1,588 lines; logic moved to `core`, `embed`, `reflection`, `hooks`, `tools`
-- **17 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`, `srh_associate/graph_retrieve/graph_stats/graph_viz`
-- **ahe_graph integration**: Graph memory with `srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`
+- **12 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`
+- **ahe_graph integration**: Graph memory layer surfaced through dashboard graph endpoints and CLUQI query
 - **Backpressure queue**: Micro-reflection bounded queue (max 20) with overflow logging
 - **CJK adaptive threshold**: Per-language similarity threshold (CJK 0.55, Latin 0.65)
 - **LRU embed cache**: 128-entry LRU cache for embedding vectors

@@ -9,23 +9,23 @@ def check_p0():
     issues = []
 
     # 1. register not in tools.py __all__
-    with open('tools.py') as f:
+    with open('../tools/handlers.py', encoding='utf-8') as f:
         tree = ast.parse(f.read())
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == '__all__':
-                    names = [elt.s for elt in node.value.elts if isinstance(elt, ast.Str)]
+                    names = [elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
                     if 'register' not in names:
                         issues.append("P0-1: 'register' not in tools.py __all__")
-                        print("  ❌ P0-1: 'register' not in tools.py __all__")
+                        print("  [FAIL] P0-1: 'register' not in tools.py __all__")
                     else:
-                        print("  ✅ P0-1: 'register' in tools.py __all__")
+                        print("  [OK] P0-1: 'register' in tools.py __all__")
 
     # 2. _bm25_search_scored duplicate with mismatched return types
-    with open('core.py') as f:
+    with open('../core.py', encoding='utf-8') as f:
         core_tree = ast.parse(f.read())
-    with open('__init__.py') as f:
+    with open('../__init__.py', encoding='utf-8') as f:
         init_tree = ast.parse(f.read())
 
     core_return = None
@@ -39,9 +39,9 @@ def check_p0():
 
     if core_return != init_return:
         issues.append(f"P0-2: _bm25_search_scored return type mismatch: core={core_return}, init={init_return}")
-        print(f"  ❌ P0-2: _bm25_search_scored return type mismatch: core={core_return}, init={init_return}")
+        print(f"  [FAIL] P0-2: _bm25_search_scored return type mismatch: core={core_return}, init={init_return}")
     else:
-        print(f"  ✅ P0-2: _bm25_search_scored return types match")
+        print(f"  [OK] P0-2: _bm25_search_scored return types match")
 
     return issues
 
@@ -51,50 +51,50 @@ def check_p1():
     issues = []
 
     # 1. _safe_write in core.py
-    with open('core.py') as f:
+    with open('../core.py', encoding='utf-8') as f:
         content = f.read()
     if 'def _safe_write' not in content:
         issues.append("P1-1: _safe_write missing in core.py")
-        print("  ❌ P1-1: _safe_write missing")
+        print("  [FAIL] P1-1: _safe_write missing")
     elif 'os.fsync' not in content:
         issues.append("P1-1: _safe_write missing os.fsync")
-        print("  ❌ P1-1: _safe_write missing os.fsync")
+        print("  [FAIL] P1-1: _safe_write missing os.fsync")
     else:
-        print("  ✅ P1-1: _safe_write with fsync present")
+        print("  [OK] P1-1: _safe_write with fsync present")
 
     # 2. _cosine_sim dim check
-    with open('embed.py') as f:
+    with open('../search/embed.py', encoding='utf-8') as f:
         content = f.read()
     if 'len(a) != len(b)' not in content:
         issues.append("P1-2: _cosine_sim missing dimension check")
-        print("  ❌ P1-2: _cosine_sim missing dimension check")
+        print("  [FAIL] P1-2: _cosine_sim missing dimension check")
     else:
-        print("  ✅ P1-2: _cosine_sim has dimension check")
+        print("  [OK] P1-2: _cosine_sim has dimension check")
 
     # 3. _MAX_REFLECT_TRANSCRIPT_CHARS
-    with open('reflection.py') as f:
+    with open('../reflection/engine.py', encoding='utf-8') as f:
         content = f.read()
     if '_MAX_REFLECT_TRANSCRIPT_CHARS' not in content:
         issues.append("P1-3: _MAX_REFLECT_TRANSCRIPT_CHARS missing")
-        print("  ❌ P1-3: transcript truncation missing")
+        print("  [FAIL] P1-3: transcript truncation missing")
     else:
-        print("  ✅ P1-3: transcript truncation present")
+        print("  [OK] P1-3: transcript truncation present")
 
     # 4. delete OSError protection
-    with open('__init__.py') as f:
+    with open('../__init__.py', encoding='utf-8') as f:
         content = f.read()
     if 'except OSError' not in content or 'path.unlink()' not in content:
         issues.append("P1-4: delete() missing OSError protection")
-        print("  ❌ P1-4: delete() missing OSError protection")
+        print("  [FAIL] P1-4: delete() missing OSError protection")
     else:
-        print("  ✅ P1-4: delete() has OSError protection")
+        print("  [OK] P1-4: delete() has OSError protection")
 
     # 5. _async_write_memory alias
     if '_async_write_memory' not in content:
         issues.append("P1-5: _async_write_memory alias missing")
-        print("  ❌ P1-5: _async_write_memory alias missing")
+        print("  [FAIL] P1-5: _async_write_memory alias missing")
     else:
-        print("  ✅ P1-5: _async_write_memory alias present")
+        print("  [OK] P1-5: _async_write_memory alias present")
 
     return issues
 
@@ -105,24 +105,24 @@ def check_p2():
 
     # Check a few key P2 issues
     checks = [
-        ('core.py', 'k1, b = 1.5, 0.75', 'P2-1: BM25 k1/b parameters'),
-        ('embed.py', '_INTENT_PROTOTYPE_EMBEDDINGS', 'P2-4: Intent prototype embeddings'),
-        ('ahe_graph/__init__.py', 'max_neighbors', 'P2-20: max_neighbors limit'),
-        ('tools.py', 'default=str', 'P2-33: json.dumps default=str'),
+        ('../core.py', 'k1, b = 1.5, 0.75', 'P2-1: BM25 k1/b parameters'),
+        ('../search/embed.py', '_INTENT_PROTOTYPE_EMBEDDINGS', 'P2-4: Intent prototype embeddings'),
+        ('../graph/ahe_graph.py', 'max_neighbors', 'P2-20: max_neighbors limit'),
+        ('../tools/handlers.py', 'default=str', 'P2-33: json.dumps default=str'),
     ]
 
     for filename, marker, desc in checks:
         try:
-            with open(filename) as f:
+            with open(filename, encoding='utf-8') as f:
                 content = f.read()
             if marker in content:
-                print(f"  ✅ {desc}")
+                print(f"  [OK] {desc}")
             else:
                 issues.append(f"{desc} missing")
-                print(f"  ❌ {desc} missing")
+                print(f"  [FAIL] {desc} missing")
         except FileNotFoundError:
             issues.append(f"{filename} not found")
-            print(f"  ❌ {filename} not found")
+            print(f"  [FAIL] {filename} not found")
 
     return issues
 
@@ -143,5 +143,5 @@ if __name__ == '__main__':
             print(f"  - {i}")
         sys.exit(1)
     else:
-        print("\n✅ All checks passed!")
+        print("\n[OK] All checks passed!")
         sys.exit(0)
