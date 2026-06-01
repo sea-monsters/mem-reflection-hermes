@@ -1751,6 +1751,11 @@ from .reflection.engine import *  # noqa: F401, F403
 from .tools.handlers import *  # noqa: F401, F403
 from .hooks.lifecycle import *  # noqa: F401, F403
 
+# engine.py's __all__ exports _get_mem_store/_get_skill_store, so import *
+# overwrites the root-native versions. Restore them here to prevent recursive
+# late-binding (engine._get_mem_store → from mem_reflection_hermes import → engine._get_mem_store).
+_get_mem_store = _package_get_mem_store
+_get_skill_store = _package_get_skill_store
 _build_context_block = _package_build_context_block
 _normalize_zone = _package_normalize_zone
 _micro_reflection_enabled = _package_micro_reflection_enabled
