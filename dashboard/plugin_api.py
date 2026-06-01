@@ -249,7 +249,7 @@ async def get_graph(
         nodes.append({
             "id": mem.id(),
             "type": "memory",
-            "label": mem.body()[:60] + "..." if len(mem.body()) > 60 else mem.body(),
+            "label": mem.body[:60] + "..." if len(mem.body) > 60 else mem.body,
             "zone": mem.frontmatter.zone,
             "confidence": mem.frontmatter.confidence,
             "pinned": mem.frontmatter.pinned,

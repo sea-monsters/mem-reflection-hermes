@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .core import (
     LoadedMemory, MemoryFrontmatter, SkillFrontmatter, LoadedSkill,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
-    serialize_frontmatter,
+    serialize_frontmatter, record_memory_stat,
 )
 from .embed import _extract_keywords
 from .reflection import (

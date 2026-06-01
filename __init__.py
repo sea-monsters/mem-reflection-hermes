@@ -1218,7 +1218,10 @@ def _build_context_block_inner(query: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-    # Register slash commands
+# Register slash commands
+# ---------------------------------------------------------------------------
+def _register_slash_commands(ctx):
+    """Register all slash commands with the Hermes context."""
     ctx.register_command(
         name="reflect",
         handler=lambda raw: _slash_reflect(raw),
