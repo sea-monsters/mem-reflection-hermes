@@ -172,7 +172,7 @@ class CLUQI:
                     continue
                 if min_confidence and _CONF_ORDER.get(m.frontmatter.confidence, 0) < min_level:
                     continue
-                if not include_superseded and m.frontmatter.supersedes:
+                if not include_superseded and self.store.is_superseded(m.id()):
                     continue
                 filtered.append(m)
             memories = filtered
