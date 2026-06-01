@@ -56,16 +56,21 @@ def _set_plugin_context(ctx: Any) -> None:
     _plugin_ctx = ctx
 
 def _lb(name: str):
-    """Get a late-bound function, caching the lookup."""
+    """Get a late-bound function, caching the lookup.
+
+    Always resolves from the root plugin module (mem_reflection_hermes)
+    rather than the child package so that functions defined in __init__.py
+    (e.g. _micro_reflection_enabled, _build_context_block) are found
+    regardless of which sub-module calls _lb.
+    """
     fn = _late_bindings.get(name)
     if fn is None:
-        pkg = __package__ or "mem_reflection_hermes"
-        mod = sys.modules.get(pkg) or sys.modules.get("mem_reflection_hermes")
+        mod = sys.modules.get("mem_reflection_hermes")
         if mod is None:
-            raise KeyError(f"Plugin module not loaded for late binding: {pkg}")
+            raise KeyError("Plugin module not loaded for late binding: mem_reflection_hermes")
         fn = getattr(mod, name, None)
         if fn is None:
-            raise KeyError(f"Plugin module not loaded for late binding: {pkg}")
+            raise KeyError(f"Root plugin module has no attribute: {name}")
         _late_bindings[name] = fn
     return fn
 
