@@ -783,6 +783,7 @@ def register(ctx) -> None:
                     "query": {"type": "string", "description": "Search query"},
                     "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
                     "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
+                    "include_history": {"type": "boolean", "description": "Include superseded memories in search results (lineage-aware recall)", "default": False},
                 },
                 "required": ["query"],
             },

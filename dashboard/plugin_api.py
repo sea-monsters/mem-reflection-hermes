@@ -437,10 +437,11 @@ async def get_graph_neighbors(
 async def get_zone_analysis():
     """Get cross-zone graph analysis."""
     try:
-        from ..graph.cross_zone import analyze_zone_connections
+        import importlib
+        cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
         gm = _get_graph_manager()
         if gm:
-            result = analyze_zone_connections(_get_store(), gm.store)
+            result = cz.analyze_zone_connections(_get_store(), gm.store)
             return result
     except Exception as e:
         import logging
