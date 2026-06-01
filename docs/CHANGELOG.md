@@ -1,0 +1,100 @@
+# Changelog
+
+## v0.9.2-beta — Dashboard Graph Integration + CLUQI + PageRank
+
+- **CLUQI** (`cluqi.py`): Cross-Layer Unified Query Interface joining MemoryStore, GraphStore, and supersedes chains
+- **PageRank** (`pagerank.py`): Centrality scores for identifying hub memories in the graph
+- **Query templates** (`query_cache.py`): 8 predefined patterns + TTL-based result cache
+- **Cross-zone analysis** (`cross_zone.py`): Bridge memories, zone centrality, zone recommendations
+- **SUPERSEDES graph edges**: Structural version lineage edges in ahe_graph (preserved from decay)
+- **Dashboard v0.9.2**:
+  - `GET /graph` returns real Hebbian edges from ahe_graph SQLite + PageRank scores
+  - `GET /graph/neighbors/{id}` with CLUQI metadata enrichment
+  - `GET /graph/zones` for cross-zone bridge visualization
+  - `GET /query` for CLUQI unified search
+  - Memory CRUD auto-syncs graph data
+  - Frontend: node click highlighting, Zone Analysis tab, CLUQI Query tab, zone move dropdown
+
+## v0.9.1 — Cross-Layer Query + Graph Analysis (2026-05-31)
+
+- CLUQI cross-layer unified query
+- PageRank centrality computation
+- SUPERSEDES graph edge type
+- Query templates and result cache
+- Cross-zone graph analysis
+
+## v0.8.0 — Module Split + ahe_graph Integration
+
+- **6-way module split**: `__init__.py` reduced from ~4,500 to ~1,588 lines; logic moved to `core`, `embed`, `reflection`, `hooks`, `tools`
+- **17 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`, `srh_associate/graph_retrieve/graph_stats/graph_viz`
+- **ahe_graph integration**: Graph memory with `srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`
+- **Backpressure queue**: Micro-reflection bounded queue (max 20) with overflow logging
+- **CJK adaptive threshold**: Per-language similarity threshold (CJK 0.55, Latin 0.65)
+- **LRU embed cache**: 128-entry LRU cache for embedding vectors
+- **Zone rebalance**: Automatic zone split/merge with dry-run mode
+- **Memory history**: `srh_memory_history` traces supersedes chains
+- **Codex review fixes**: P0/P1/P2 issues resolved with audit script verification
+
+## v0.7.0 — ahe_graph Deep Integration
+
+- Graph memory layer with associate/retrieve/stats/viz tools
+- `post_tool_call` hook builds tool result associations
+- Intent classification via embedding similarity
+
+## v0.6.1 — Atomic Store Refactor
+
+- **Atomic `MemoryStore.update()`**: Single method handles file write, cache invalidation, and index rebuild. Prevents 5 classes of cache inconsistency bugs.
+- **Atomic `MemoryStore.reorder()`**: Assigns explicit `rank` values instead of manipulating timestamps. Stable across filtering and sorting modes.
+- **`rank` field**: New `rank: int = 0` in `MemoryFrontmatter`. Higher rank = earlier in default sort. Backward compatible.
+- **Simplified HTTP layer**: `plugin_api.py` delegates all mutation logic to Store methods — HTTP layer only validates and translates errors.
+- **Post-review fixes**: Plugin registration API compat (`__HERMES_PLUGINS__.register`), atomic write via `os.replace()`, reflections field name fix, scope validation, zone list refresh.
+
+## v0.6.0 — Dashboard Memory Manager + Bug Fixes
+
+- **Dashboard Memory Manager**: Full CRUD UI with search, zone filter, sort controls, and reorder
+- **6 API endpoints**: Create, read, update, delete, reorder, zones
+- **Bug fix**: Duplicate memory scanning when `cwd` is `~` (user root == project root)
+- **Bug fix**: Python 3.11 `importlib.util` + `@dataclass` compatibility (full fallback chain)
+- Dashboard version: 1.0.0 → 1.1.1; path: `/memory-graph` → `/memory-manager`
+
+## v0.5.0 — Performance Optimization Release
+
+- **P0-1**: Palace index write-on-change — skip disk write when content hasn't changed
+- **P0-2**: O(1) delete via id→path reverse index — eliminates directory scan
+- **P1-1**: Fast byte-based token estimation — 5000x faster than char-by-char CJK check
+- **P1-2**: Async stat flush — background thread for JSONL recording
+- **P2-1**: Event-driven palace index rebuild — only rebuild on memory mutation
+- **P2-2**: Async memory write — background thread for file I/O
+- **SkillStore lazy cache**: One-time file read per session
+- **build_palace_index cache**: Cached result string on MemoryStore
+- Fix: `build_palace_index` sort key type error (int vs datetime)
+
+## v0.4.0 — Palace Mode + Profile Compilation
+
+- **Memory Palace**: Zone-based organization (core, work, episode, general, project:*)
+- **Palace navigation tools**: `srh_palace_zones`, `srh_palace_read_zone`, `srh_palace_recall`, `srh_palace_search`
+- **Profile compilation**: LLM-driven compilation of memories into structured profile documents
+- **Always-active skills**: User-configured skills always injected into context
+- **Supersedes chains**: Memory versioning with explicit replacement tracking
+
+## v0.3.0 — Effectiveness Tracking + BM25
+
+- **Per-memory effectiveness scoring**: Track how often memories are triggered
+- **Exponential time decay**: `score * 0.5^(days/30)`
+- **BM25 search**: Replaces TF-IDF with Okapi BM25 for better relevance
+- **Effectiveness boosting**: Search results weighted by effectiveness score
+
+## v0.2.0 — Embedding + Semantic Search
+
+- **ONNX Runtime integration**: 16x faster than PyTorch for embeddings
+- **Semantic search**: Cosine similarity over embedding vectors
+- **Hybrid search**: Token overlap + embedding similarity combined
+- **Lazy model loading**: ONNX model loaded on first use
+
+## v0.1.0 — Initial Port
+
+- Ported from `coder-brzhang/small-rust-hermes`
+- TF-IDF search with zero dependencies
+- Dual scope (user + project)
+- Micro/full reflection pipelines
+- Skill auto-matching via token overlap

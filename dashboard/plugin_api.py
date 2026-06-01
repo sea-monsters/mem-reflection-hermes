@@ -3,8 +3,8 @@
 Exposes endpoints for memory graph visualization, skill inventory,
 reflection history, and memory management (CRUD + reorder).
 
-All mutation operations are delegated to MemoryStore atomic methods
-(update/reorder) to ensure cache and index consistency.
+v0.9.2: Full ahe_graph integration — Hebbian edges, SUPERSEDES edges,
+PageRank scores, cross-zone analysis, CLUQI queries.
 """
 
 import json
@@ -54,7 +54,19 @@ class MemoryReorder(BaseModel):
 # Helper: serialize LoadedMemory to dict
 # ---------------------------------------------------------------------------
 
+def _get_store():
+    """Get the memory store instance."""
+    return srh._get_mem_store()
+
+
 def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
+    created_val = m.frontmatter.created
+    if hasattr(created_val, 'isoformat'):
+        created_str = created_val.isoformat()
+    elif isinstance(created_val, str):
+        created_str = created_val
+    else:
+        created_str = str(created_val) if created_val else None
     return {
         "id": m.id(),
         "scope": m.scope,
@@ -63,162 +75,65 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
         "pinned": m.frontmatter.pinned,
         "tags": m.frontmatter.tags,
         "supersedes": m.frontmatter.supersedes,
-        "created": m.frontmatter.created,
-        "source": m.frontmatter.source,
         "zone": m.frontmatter.zone,
-        "rank": m.frontmatter.rank,
+        "rank": getattr(m.frontmatter, "rank", 0),
+        "created": created_str,
+        "source": m.frontmatter.source,
     }
 
 
+def _get_graph_manager():
+    """Get the graph manager if available."""
+    try:
+        from ahe_graph import get_graph_manager
+        return get_graph_manager()
+    except Exception:
+        return None
+
+
+def _get_cluqi():
+    """Get CLUQI instance if available."""
+    try:
+        from cluqi import CLUQI
+        gm = _get_graph_manager()
+        return CLUQI(srh._store, gm)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Existing endpoints (graph, skills, reflections, stats)
+# Memories (CRUD + reorder)
 # ---------------------------------------------------------------------------
 
 @router.get("/memories")
-async def get_memories():
-    """Return all active memories with metadata."""
-    store = srh._get_mem_store()
-    memories = store.list_active()
-    return {
-        "count": len(memories),
-        "memories": [_memory_to_dict(m) for m in memories],
-    }
+async def list_memories(
+    zone: Optional[str] = None,
+    query: Optional[str] = None,
+    sort: Literal["rank", "created", "confidence", "zone"] = "rank",
+):
+    """List memories with optional zone filter, search, and sorting."""
+    memories = _get_store().list_active()
+    if zone:
+        memories = [m for m in memories if m.frontmatter.zone == zone]
+    if query:
+        memories = [m for m in memories if query.lower() in m.body.lower()]
 
+    sort_key = {
+        "rank": lambda m: getattr(m.frontmatter, "rank", 0),
+        "created": lambda m: m.frontmatter.created or "",
+        "confidence": lambda m: {"high": 3, "medium": 2, "low": 1}.get(
+            m.frontmatter.confidence, 0
+        ),
+        "zone": lambda m: m.frontmatter.zone or "",
+    }.get(sort, lambda m: 0)
 
-@router.get("/skills")
-async def get_skills():
-    """Return all skills with metadata."""
-    store = srh._get_skill_store()
-    skills = store.list()
-    return {
-        "count": len(skills),
-        "skills": [
-            {
-                "name": s.frontmatter.name,
-                "description": s.frontmatter.description,
-                "triggers": s.frontmatter.triggers,
-                "scope": s.scope,
-                "version": s.frontmatter.version,
-                "license": s.frontmatter.license,
-            }
-            for s in skills
-        ],
-    }
+    memories.sort(key=sort_key, reverse=(sort == "rank"))
+    return {"memories": [_memory_to_dict(m) for m in memories]}
 
-
-@router.get("/reflections")
-async def get_reflections(limit: int = 20):
-    """Return recent reflection outcomes."""
-    outcomes = srh._recent_reflect_outcomes(limit)
-    return {"count": len(outcomes), "reflections": outcomes}
-
-
-@router.get("/graph")
-async def get_graph():
-    """Return memory graph data for visualization (nodes + edges).
-
-    Nodes: memories and skills.
-    Edges: supersedes links, tag overlaps, skill triggers.
-    """
-    mem_store = srh._get_mem_store()
-    skill_store = srh._get_skill_store()
-
-    memories = mem_store.list_active()
-    skills = skill_store.list()
-
-    nodes: List[Dict[str, Any]] = []
-    edges: List[Dict[str, Any]] = []
-
-    # Memory nodes
-    for m in memories:
-        nodes.append({
-            "id": m.id(),
-            "type": "memory",
-            "label": m.body[:60] + "..." if len(m.body) > 60 else m.body,
-            "scope": m.scope,
-            "confidence": m.frontmatter.confidence,
-            "pinned": m.frontmatter.pinned,
-            "tags": m.frontmatter.tags,
-        })
-        # Supersedes edges
-        for old_id in m.frontmatter.supersedes:
-            edges.append({
-                "source": m.id(),
-                "target": old_id,
-                "type": "supersedes",
-            })
-
-    # Skill nodes
-    for s in skills:
-        nodes.append({
-            "id": s.frontmatter.name,
-            "type": "skill",
-            "label": s.frontmatter.name,
-            "description": s.frontmatter.description,
-            "scope": s.scope,
-            "triggers": s.frontmatter.triggers,
-        })
-        # Link skills to memories by tag overlap
-        skill_tags = set(srh._skill_tokenise(s.frontmatter.name))
-        skill_tags.update(srh._skill_tokenise(s.frontmatter.description))
-        for t in s.frontmatter.triggers:
-            skill_tags.update(srh._skill_tokenise(t))
-
-        for m in memories:
-            mem_tags = set(m.frontmatter.tags)
-            mem_tags.update(srh._tokenise(m.body))
-            overlap = skill_tags & mem_tags
-            if overlap:
-                edges.append({
-                    "source": s.frontmatter.name,
-                    "target": m.id(),
-                    "type": "tag_overlap",
-                    "overlap": list(overlap),
-                })
-
-    return {"nodes": nodes, "edges": edges}
-
-
-@router.get("/stats")
-async def get_stats():
-    """Return aggregate statistics."""
-    mem_store = srh._get_mem_store()
-    skill_store = srh._get_skill_store()
-
-    memories = mem_store.list_active()
-    skills = skill_store.list()
-
-    mem_by_scope: Dict[str, int] = {}
-    mem_by_confidence: Dict[str, int] = {}
-    tag_counts: Dict[str, int] = {}
-    zone_counts: Dict[str, int] = {}
-
-    for m in memories:
-        mem_by_scope[m.scope] = mem_by_scope.get(m.scope, 0) + 1
-        c = m.frontmatter.confidence
-        mem_by_confidence[c] = mem_by_confidence.get(c, 0) + 1
-        for t in m.frontmatter.tags:
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-        zone_counts[m.frontmatter.zone] = zone_counts.get(m.frontmatter.zone, 0) + 1
-
-    return {
-        "memory_count": len(memories),
-        "skill_count": len(skills),
-        "memories_by_scope": mem_by_scope,
-        "memories_by_confidence": mem_by_confidence,
-        "memories_by_zone": zone_counts,
-        "top_tags": sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Memory Management endpoints (CRUD + reorder)
-# All mutations delegated to MemoryStore atomic methods.
-# ---------------------------------------------------------------------------
 
 @router.post("/memories")
 async def create_memory(payload: MemoryCreate):
-    """Create a new memory entry manually."""
+    """Create a new memory and auto-associate in graph."""
     result = srh._tool_srh_memory_write({
         "body": payload.body,
         "zone": payload.zone,
@@ -227,66 +142,417 @@ async def create_memory(payload: MemoryCreate):
         "pinned": payload.pinned,
         "scope": payload.scope,
     })
-    data = json.loads(result)
-    if data.get("error"):
-        raise HTTPException(status_code=400, detail=data["error"])
-    return data
+    # Parse tool result and propagate errors
+    try:
+        result_obj = json.loads(result)
+        if isinstance(result_obj, dict) and "error" in result_obj:
+            raise HTTPException(status_code=400, detail=result_obj["error"])
+    except json.JSONDecodeError:
+        pass  # Non-JSON result (e.g., success string), proceed
+
+    # Auto-associate with related memories in graph
+    gm = _get_graph_manager()
+    if gm:
+        try:
+            # Find memories with overlapping tags
+            all_mems = _get_store().list_active()
+            new_mem = None
+            for m in all_mems:
+                if m.body == payload.body:
+                    new_mem = m
+                    break
+            if new_mem:
+                related = [m.id() for m in all_mems
+                          if m.id() != new_mem.id()
+                          and set(m.frontmatter.tags or []) & set(payload.tags)]
+                if related:
+                    gm.associator.on_memory_coactivation([new_mem.id()] + related)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Graph auto-associate failed: %s", e)
+    return {"status": "ok", "result": result}
 
 
-@router.get("/memories/{memory_id}")
-async def get_memory(memory_id: str):
-    """Get a single memory by ID."""
-    store = srh._get_mem_store()
-    mem = store.get(memory_id)
-    if not mem:
-        raise HTTPException(status_code=404, detail="Memory not found")
+@router.put("/memories/{mem_id}")
+async def update_memory(mem_id: str, payload: MemoryUpdate):
+    """Update a memory's content or metadata."""
+    mem = _get_store().update(
+        mem_id,
+        body=payload.body,
+        zone=payload.zone,
+        confidence=payload.confidence,
+        tags=payload.tags,
+        pinned=payload.pinned,
+    )
+    # Update graph meta if zone changed
+    if payload.zone:
+        gm = _get_graph_manager()
+        if gm:
+            try:
+                gm.store.ensure_meta(mem_id, zone=payload.zone)
+            except Exception:
+                pass
     return _memory_to_dict(mem)
 
 
-@router.put("/memories/{memory_id}")
-async def update_memory(memory_id: str, payload: MemoryUpdate):
-    """Update an existing memory's content or metadata."""
-    store = srh._get_mem_store()
-    try:
-        updated = store.update(
-            memory_id,
-            body=payload.body,
-            zone=payload.zone,
-            confidence=payload.confidence,
-            tags=payload.tags,
-            pinned=payload.pinned,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {"success": True, "id": memory_id, "memory": _memory_to_dict(updated)}
-
-
-@router.delete("/memories/{memory_id}")
-async def delete_memory(memory_id: str):
-    """Delete a memory by ID."""
-    store = srh._get_mem_store()
-    mem = store.get(memory_id)
-    if not mem:
+@router.delete("/memories/{mem_id}")
+async def delete_memory(mem_id: str):
+    """Delete a memory and clean up graph edges."""
+    ok = _get_store().delete("user", mem_id)
+    if not ok:
+        ok = _get_store().delete("project", mem_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
-
-    success = store.delete(mem.scope, memory_id)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to delete memory")
-
-    return {"success": True, "id": memory_id}
+    # Clean up graph edges
+    gm = _get_graph_manager()
+    if gm:
+        try:
+            # Remove all edges connected to this memory
+            conn = gm.store._connect()
+            conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
+            conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
+            conn.commit()
+        except Exception:
+            pass
+    return {"status": "deleted", "id": mem_id}
 
 
 @router.post("/memories/reorder")
 async def reorder_memories(payload: MemoryReorder):
-    """Reorder memories by assigning explicit rank values.
+    """Reorder memories by rank."""
+    _get_store().reorder(payload.memory_ids)
+    return {"status": "ok"}
 
-    The new order is determined by the provided memory_ids list.
-    Earlier items get higher rank and appear first in the default sort.
+
+# ---------------------------------------------------------------------------
+# Graph (v0.9.2: real ahe_graph integration)
+# ---------------------------------------------------------------------------
+
+@router.get("/graph")
+async def get_graph(
+    zone: Optional[str] = None,
+    min_weight: float = 0.1,
+    include_supersedes: bool = True,
+):
+    """Return the memory graph with real Hebbian edges from ahe_graph.
+
+    v0.9.2: Now includes:
+    - Hebbian co_occurs edges from SQLite graph_store
+    - SUPERSEDES edges from graph_store
+    - Skill tag overlap edges (computed)
+    - PageRank scores on nodes
     """
-    store = srh._get_mem_store()
-    updated = store.reorder(payload.memory_ids)
-    return {"success": True, "updated": updated, "count": len(updated)}
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    seen_nodes: set = set()
 
+    # Get all active memories as nodes
+    memories = _get_store().list_active()
+    if zone:
+        memories = [m for m in memories if m.frontmatter.zone == zone]
+
+    # Build memory nodes
+    for mem in memories:
+        seen_nodes.add(mem.id())
+        nodes.append({
+            "id": mem.id(),
+            "type": "memory",
+            "label": mem.body[:60] + "..." if len(mem.body) > 60 else mem.body,
+            "zone": mem.frontmatter.zone,
+            "confidence": mem.frontmatter.confidence,
+            "pinned": mem.frontmatter.pinned,
+            "tags": mem.frontmatter.tags,
+        })
+
+    # Get graph edges from ahe_graph
+    gm = _get_graph_manager()
+    pagerank_scores: Dict[str, float] = {}
+    if gm:
+        try:
+            # Get real Hebbian edges
+            for mem in memories:
+                neighbors = gm.store.get_neighbors(
+                    mem.id(), min_weight=min_weight, limit=50
+                )
+                for n in neighbors:
+                    tgt = n.get("target_id")
+                    if tgt and tgt in seen_nodes:
+                        edges.append({
+                            "source": mem.id(),
+                            "target": tgt,
+                            "relation": n.get("relation", "co_occurs"),
+                            "weight": round(n.get("weight", 0.0), 3),
+                            "type": "hebbian",
+                        })
+
+            # Get SUPERSEDES edges
+            if include_supersedes:
+                for mem in memories:
+                    if mem.frontmatter.supersedes:
+                        for old_id in mem.frontmatter.supersedes:
+                            if old_id in seen_nodes:
+                                edges.append({
+                                    "source": old_id,
+                                    "target": mem.id(),
+                                    "relation": "SUPERSEDES",
+                                    "weight": 0.95,
+                                    "type": "supersedes",
+                                })
+                                # Also add to graph store if not already there
+                                try:
+                                    gm.store.add_supersedes_edge(old_id, mem.id())
+                                except Exception:
+                                    pass
+
+            # Compute PageRank
+            try:
+                from pagerank import compute_pagerank
+                pagerank_scores = compute_pagerank(gm.store)
+                for node in nodes:
+                    node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("PageRank computation failed: %s", e)
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Graph query failed: %s", e)
+    else:
+        # Fallback: only supersedes edges from flat files
+        if include_supersedes:
+            for mem in memories:
+                if mem.frontmatter.supersedes:
+                    for old_id in mem.frontmatter.supersedes:
+                        if old_id in seen_nodes:
+                            edges.append({
+                                "source": old_id,
+                                "target": mem.id(),
+                                "relation": "SUPERSEDES",
+                                "weight": 0.95,
+                                "type": "supersedes",
+                            })
+
+    # Skill tag overlap edges
+    try:
+        skill_store = srh.SkillStore(
+            srh._user_memories_dir(),
+            srh._project_memories_dir(),
+        )
+        skills = skill_store.list()
+        skill_nodes = []
+        for sk in skills:
+            sk_name = sk.frontmatter.name if sk.frontmatter else "unknown"
+            if sk_name not in seen_nodes:
+                seen_nodes.add(sk_name)
+                skill_nodes.append({
+                    "id": sk_name,
+                    "type": "skill",
+                    "label": sk_name,
+                    "tags": sk.frontmatter.triggers if sk.frontmatter else [],
+                })
+        nodes.extend(skill_nodes)
+
+        # Tag overlap edges between memories and skills
+        mem_tags: Dict[str, List[str]] = {
+            m.id(): m.frontmatter.tags or [] for m in memories
+        }
+        skill_tags: Dict[str, List[str]] = {
+            (sk.frontmatter.name if sk.frontmatter else "unknown"): (sk.frontmatter.triggers if sk.frontmatter else [])
+            for sk in skills
+        }
+        for mem_id, mtags in mem_tags.items():
+            for sk_name, stags in skill_tags.items():
+                overlap = set(mtags) & set(stags)
+                if overlap:
+                    edges.append({
+                        "source": mem_id,
+                        "target": sk_name,
+                        "relation": "tag_overlap",
+                        "weight": round(len(overlap) * 0.3, 2),
+                        "type": "skill",
+                    })
+    except Exception:
+        pass
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "hebbian_edges": len([e for e in edges if e.get("type") == "hebbian"]),
+            "supersedes_edges": len([e for e in edges if e.get("type") == "supersedes"]),
+            "skill_edges": len([e for e in edges if e.get("type") == "skill"]),
+            "pagerank_computed": len(pagerank_scores) > 0,
+        },
+    }
+
+
+@router.get("/graph/neighbors/{mem_id}")
+async def get_graph_neighbors(
+    mem_id: str,
+    min_weight: float = 0.1,
+    limit: int = 20,
+):
+    """Get graph neighbors for a specific memory with metadata enrichment."""
+    cluqi = _get_cluqi()
+    if cluqi:
+        neighbors = cluqi.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
+        return {"memory_id": mem_id, "neighbors": neighbors}
+
+    # Fallback to raw graph store
+    gm = _get_graph_manager()
+    if gm:
+        neighbors = gm.store.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
+        return {"memory_id": mem_id, "neighbors": neighbors}
+
+    raise HTTPException(status_code=503, detail="Graph system not available")
+
+
+@router.get("/graph/zones")
+async def get_zone_analysis():
+    """Get cross-zone graph analysis."""
+    try:
+        from cross_zone import analyze_zone_connections
+        gm = _get_graph_manager()
+        if gm:
+            result = analyze_zone_connections(_get_store(), gm.store)
+            return result
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Zone analysis failed: %s", e)
+    return {"zone_matrix": {}, "bridge_memories": [], "zone_centrality": {}, "isolated_zones": []}
+
+
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+@router.get("/skills")
+async def list_skills():
+    """Return all loaded skills."""
+    skill_store = srh.SkillStore(
+        srh._user_memories_dir(),
+        srh._project_memories_dir(),
+    )
+    skills = skill_store.list()
+    return {
+        "skills": [
+            {
+                "name": sk.frontmatter.name if sk.frontmatter else "unknown",
+                "triggers": sk.frontmatter.triggers if sk.frontmatter else [],
+                "description": sk.frontmatter.description if sk.frontmatter else "",
+                "version": sk.frontmatter.version if sk.frontmatter else "",
+                "always_active": sk.frontmatter.always_active if sk.frontmatter else False,
+            }
+            for sk in skills
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reflections
+# ---------------------------------------------------------------------------
+
+@router.get("/reflections")
+async def list_reflections(limit: int = 50):
+    """Return recent reflection history."""
+    log_path = srh._plugin_data_dir() / "reflect-log.jsonl"
+    entries = []
+    if log_path.exists():
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    entries.reverse()
+    return {"reflections": entries[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+@router.get("/stats")
+async def get_stats():
+    """Return aggregate statistics."""
+    memories = _get_store().list_active()
+    zones: Dict[str, int] = {}
+    for m in memories:
+        z = m.frontmatter.zone or "general"
+        zones[z] = zones.get(z, 0) + 1
+
+    # Graph stats
+    graph_stats = {"available": False}
+    gm = _get_graph_manager()
+    if gm:
+        try:
+            graph_stats = {
+                "available": True,
+                **gm.store.stats(),
+            }
+        except Exception:
+            pass
+
+    # Cache stats
+    cache_stats = {"available": False}
+    try:
+        from query_cache import get_cache
+        cache_stats = {
+            "available": True,
+            **get_cache().stats(),
+        }
+    except Exception:
+        pass
+
+    return {
+        "memory_count": len(memories),
+        "zones": zones,
+        "graph": graph_stats,
+        "cache": cache_stats,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLUQI Query (v0.9.2)
+# ---------------------------------------------------------------------------
+
+@router.get("/query")
+async def cluqi_query(
+    q: str,
+    zone: Optional[str] = None,
+    k: int = 10,
+):
+    """Cross-layer unified query across MemoryStore, GraphStore, and Supersedes chains."""
+    cluqi = _get_cluqi()
+    if not cluqi:
+        raise HTTPException(status_code=503, detail="CLUQI not available")
+    try:
+        results = cluqi.query(q, zone=zone, k=k)
+        return {
+            "query": q,
+            "results": [
+                {
+                    "memory_id": r.memory_id,
+                    "score": round(r.total_score(), 4),
+                    "layer_scores": r.layer_scores,
+                    "sources": r.sources,
+                    "metadata": r.metadata,
+                }
+                for r in results
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Zones
+# ---------------------------------------------------------------------------
 
 @router.get("/zones")
 async def get_zones():
