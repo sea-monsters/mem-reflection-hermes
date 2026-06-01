@@ -1,6 +1,6 @@
 name: mem-reflection-hermes
-version: 0.8.0
-description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, ahe_graph graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache. v0.8: 6-module architecture (core/embed/reflection/hooks/tools/__init__), backpressure queues, memory history/supersedes lineage."
+version: 0.9.2-beta
+description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, ahe_graph graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache. v0.8: 6-module architecture. v0.9: CLUQI cross-layer query, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis. v0.9.2: Dashboard full ahe_graph integration with Hebbian edges, node click highlighting, zone bridge visualization, CLUQI search UI."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:
   - srh_memory_search

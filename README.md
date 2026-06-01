@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v0.8.0** — 6-module architecture, 17 SRH tools, ahe_graph integration.
+**Current version: v0.9.2-beta** — CLUQI cross-layer query, PageRank centrality, SUPERSEDES graph edges, Dashboard full ahe_graph integration.
 
 ## Features
 
@@ -17,8 +17,12 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Full Reflection**: Session-end structured summary with human approval for skills
 - **Skill Auto-Matching**: Token overlap + optional embedding hybrid
 - **Profile Compilation**: LLM-driven compilation into structured profile documents
-- **Graph Memory (ahe_graph)**: Associate memories, graph traversal, stats, visualization
-- **Dashboard Memory Manager**: Full CRUD + reorder UI
+- **Graph Memory (ahe_graph)**: Hebbian co-occurrence learning, Ebbinghaus decay, adaptive retrieval
+- **CLUQI**: Cross-Layer Unified Query across MemoryStore, GraphStore, and supersedes chains
+- **PageRank**: Centrality scores for hub memory identification
+- **Query Templates & Cache**: 8 predefined patterns with TTL-based result caching
+- **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
+- **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + CLUQI search + zone analysis
 
 ## Documentation
 

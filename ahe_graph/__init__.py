@@ -255,6 +255,7 @@ class GraphStore(GraphStoreProtocol):
                 neighbor = r["target_id"] if r["source_id"] == memory_id else r["source_id"]
                 results.append({
                     "memory_id": neighbor,
+                    "target_id": neighbor,
                     "relation": r["relation"],
                     "weight": r["weight"],
                     "co_occurrence": r["co_occurrence"],
@@ -386,6 +387,49 @@ class GraphStore(GraphStoreProtocol):
         ).fetchone()
         return dict(row) if row else None
 
+    def get_all_nodes(self) -> List[dict]:
+        """Get all memory nodes in the graph."""
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT id as memory_id, zone, importance, strength, status "
+                "FROM graph_memory_meta WHERE status != 'archived'"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.exception("graph_store: get_all_nodes error: %s", e)
+            return []
+
+    def add_supersedes_edge(self, old_memory_id: str, new_memory_id: str) -> None:
+        """Record a SUPERSEDES relationship: new_memory supersedes old_memory."""
+        self.ensure_meta(old_memory_id)
+        self.ensure_meta(new_memory_id)
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            conn = self._connect()
+            conn.execute(
+                "INSERT OR REPLACE INTO graph_edges "
+                "(source_id, target_id, relation, weight, co_occurrence, created_at, last_activated) "
+                "VALUES (?, ?, 'SUPERSEDES', 0.95, 1, ?, ?)",
+                (old_memory_id, new_memory_id, now, now)
+            )
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.exception("graph_store: add_supersedes_edge error %s->%s: %s",
+                             old_memory_id, new_memory_id, e)
+
+    def remove_supersedes_edge(self, old_memory_id: str, new_memory_id: str) -> None:
+        """Remove a SUPERSEDES edge."""
+        try:
+            conn = self._connect()
+            conn.execute(
+                "DELETE FROM graph_edges WHERE source_id=? AND target_id=? AND relation='SUPERSEDES'",
+                (old_memory_id, new_memory_id)
+            )
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.exception("graph_store: remove_supersedes_edge error: %s", e)
+
     def decay_all(self, base_half_life: float = 7.0):
         """Run strength decay on all memory entries."""
         conn = self._connect()
@@ -441,6 +485,7 @@ class GraphStore(GraphStoreProtocol):
                 "DELETE FROM graph_edges WHERE weight < ? AND relation = ?",
                 (prune_threshold, relation)
             )
+        # SUPERSEDES edges are structural, not Hebbian — never decay
         conn.commit()
 
     def stats(self) -> dict:

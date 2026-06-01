@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.9.2-beta — Dashboard Graph Integration + CLUQI + PageRank
+
+- **CLUQI** (`cluqi.py`): Cross-Layer Unified Query Interface joining MemoryStore, GraphStore, and supersedes chains
+- **PageRank** (`pagerank.py`): Centrality scores for identifying hub memories in the graph
+- **Query templates** (`query_cache.py`): 8 predefined patterns + TTL-based result cache
+- **Cross-zone analysis** (`cross_zone.py`): Bridge memories, zone centrality, zone recommendations
+- **SUPERSEDES graph edges**: Structural version lineage edges in ahe_graph (preserved from decay)
+- **Dashboard v0.9.2**:
+  - `GET /graph` returns real Hebbian edges from ahe_graph SQLite + PageRank scores
+  - `GET /graph/neighbors/{id}` with CLUQI metadata enrichment
+  - `GET /graph/zones` for cross-zone bridge visualization
+  - `GET /query` for CLUQI unified search
+  - Memory CRUD auto-syncs graph data
+  - Frontend: node click highlighting, Zone Analysis tab, CLUQI Query tab, zone move dropdown
+
+## v0.9.1 — Cross-Layer Query + Graph Analysis (2026-05-31)
+
+- CLUQI cross-layer unified query
+- PageRank centrality computation
+- SUPERSEDES graph edge type
+- Query templates and result cache
+- Cross-zone graph analysis
+
 ## v0.8.0 — Module Split + ahe_graph Integration
 
 - **6-way module split**: `__init__.py` reduced from ~4,500 to ~1,588 lines; logic moved to `core`, `embed`, `reflection`, `hooks`, `tools`

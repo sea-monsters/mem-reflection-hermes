@@ -27,7 +27,10 @@ FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`:
 | `DELETE` | `/memories/{id}` | Delete memory |
 | `POST` | `/memories/reorder` | **Atomic reorder** via explicit `rank` assignment |
 | `GET` | `/zones` | All zones with counts |
-| `GET` | `/graph` | Memory graph (nodes + edges) |
+| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores |
+| `GET` | `/graph/neighbors/{id}` | Graph neighbors for a memory with metadata enrichment |
+| `GET` | `/graph/zones` | Cross-zone bridge analysis |
+| `GET` | `/query` | CLUQI cross-layer unified search |
 | `GET` | `/skills` | All skills with metadata |
 | `GET` | `/reflections` | Recent reflection outcomes |
-| `GET` | `/stats` | Aggregate statistics (by scope, confidence, zone, tags) |
+| `GET` | `/stats` | Aggregate statistics (memory count, zones, graph stats, cache stats) |

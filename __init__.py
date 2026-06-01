@@ -1,13 +1,18 @@
-"""mem-reflection-hermes plugin — Self-evolving memory & reflection system.
+"""mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
 Ported from https://github.com/coder-brzhang/small-rust-hermes
 
-v0.8.0 Architecture (6 modules, ~5,900 lines):
-- core.py: MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths
+v0.9.2-beta Architecture (9 modules, approx 7,200 lines):
+- core.py: MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, BM25
 - embed.py: ONNX embedding engine, cosine similarity, intent classification
 - reflection.py: micro/full reflection pipelines, auto-rebalance, profile compilation
 - hooks.py: session hooks (on_session_start/end, pre_llm_call, post_tool_call)
 - tools.py: 17 SRH tool handlers exposed to Hermes Agent
+- ahe_graph/__init__.py: SQLite-backed Hebbian graph, association engine, decay
+- cluqi.py: Cross-Layer Unified Query Interface (Memory + Graph + Supersedes)
+- pagerank.py: PageRank centrality computation for graph nodes
+- query_cache.py: Query templates and TTL-based result cache
+- cross_zone.py: Cross-zone graph analysis (bridges, centrality, recommendations)
 - __init__.py: registration, exports, backward compat, standalone bootstrap
 
 Features:
@@ -15,19 +20,26 @@ Features:
   confidence, pinned, tags, supersedes, zone, rank, version)
 - Dual scope: user (~/.hermes/memories/) and project (./.hermes/memories/)
 - Memory Palace: zone-based organization (core, work, episode, general, project:*)
-- TF-IDF / BM25 search with effectiveness boosting (zero-dependency, ~0.8ms/50 mems)
+- TF-IDF / BM25 search with effectiveness boosting (zero-dependency, approx 0.8ms/50 mems)
 - Semantic search: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
 - Conflict detection on write with supersedes chains and version lineage
 - Effectiveness tracking: per-memory scoring with exponential time decay
 - Micro-reflection: lightweight per-turn background reflection with backpressure queue
 - Full reflection: session-end structured JSON pipeline with human approval for skills
 - Skill auto-matching: token-overlap + optional embedding hybrid, always-active skills
-- Context layering: Pinned → Active Index → Triggered Skills → Always-Active Skills
+- Context layering: Pinned -> Active Index -> Triggered Skills -> Always-Active Skills
 - Profile compilation: LLM-driven compilation of all memories into structured profile docs
-- ahe_graph integration: graph memory with associate/retrieve/stats/viz tools
-- CJK adaptive threshold, LRU embed cache, zone rebalance, memory history tracing
+- ahe_graph integration: graph memory with associate/retrieve/stats/viz tools,
+  Hebbian co-occurrence learning, Ebbinghaus decay, adaptive retrieval router
+- CLUQI: unified cross-layer query joining MemoryStore, GraphStore, and supersedes
+- PageRank: centrality scores for identifying hub memories in the graph
+- Query templates: 8 predefined patterns (recent, by_zone, by_tag, graph_neighbors, etc.)
+- Result cache: TTL-based caching for BM25 and fusion search results
+- Cross-zone analysis: bridge memories, zone centrality, zone recommendations
+- Dashboard: React-based UI with graph visualization, CLUQI search, zone analysis
 
-All data lives in flat files for transparency and version-control friendliness.
+v0.9.1 (2026-05-31): CLUQI, PageRank, SUPERSEDES edges, query templates, result cache, cross-zone analysis
+v0.9.2-beta (2026-06-01): Dashboard full ahe_graph integration, node click highlighting, zone bridge UI
 """
 
 from __future__ import annotations
