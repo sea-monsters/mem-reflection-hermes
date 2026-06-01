@@ -142,6 +142,14 @@ async def create_memory(payload: MemoryCreate):
         "pinned": payload.pinned,
         "scope": payload.scope,
     })
+    # Parse tool result and propagate errors
+    try:
+        result_obj = json.loads(result)
+        if isinstance(result_obj, dict) and "error" in result_obj:
+            raise HTTPException(status_code=400, detail=result_obj["error"])
+    except json.JSONDecodeError:
+        pass  # Non-JSON result (e.g., success string), proceed
+
     # Auto-associate with related memories in graph
     gm = _get_graph_manager()
     if gm:

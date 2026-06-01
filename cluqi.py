@@ -86,7 +86,7 @@ class CLUQI:
                 r = CLUQIResult(
                     memory_id=mem.id(),
                     metadata={
-                        "body": mem.body()[:200],
+                        "body": mem.body[:200],
                         "zone": mem.frontmatter.zone,
                         "tags": mem.frontmatter.tags,
                         "confidence": mem.frontmatter.confidence,
@@ -113,7 +113,7 @@ class CLUQI:
                     r = CLUQIResult(
                         memory_id=mem_id,
                         metadata={
-                            "body": mem.body()[:200],
+                            "body": mem.body[:200],
                             "zone": mem.frontmatter.zone,
                             "tags": mem.frontmatter.tags,
                             "confidence": mem.frontmatter.confidence,
@@ -210,7 +210,7 @@ class CLUQI:
             if mem:
                 n["zone"] = mem.frontmatter.zone
                 n["tags"] = mem.frontmatter.tags
-                n["body_preview"] = mem.body()[:100]
+                n["body_preview"] = mem.body[:100]
         return neighbors
 
     def cross_zone_bridge(self, zone_a: str, zone_b: str,
@@ -234,9 +234,9 @@ class CLUQI:
                 if target and target.frontmatter.zone == zone_b:
                     bridges.append({
                         "source_id": mem.id(),
-                        "source_body": mem.body()[:100],
+                        "source_body": mem.body[:100],
                         "target_id": mid,
-                        "target_body": target.body()[:100],
+                        "target_body": target.body[:100],
                         "weight": n.get("weight", 0.0),
                         "relation": n.get("relation", "unknown"),
                     })

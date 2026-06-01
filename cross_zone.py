@@ -61,7 +61,7 @@ def analyze_zone_connections(memory_store, graph_store) -> Dict[str, Any]:
             bridge_memories.append({
                 "memory_id": mid,
                 "zone": src_zone,
-                "body_preview": mem.body()[:100],
+                "body_preview": mem.body[:100],
                 "cross_zone_edges": cross_zone_edges,
                 "bridge_strength": sum(e["weight"] for e in cross_zone_edges),
             })
@@ -121,9 +121,9 @@ def get_zone_recommendations(memory_store, graph_store,
             recommendations.append({
                 "memory_id": mid,
                 "zone": mem.frontmatter.zone,
-                "body_preview": mem.body()[:100],
+                "body_preview": mem.body[:100],
                 "connection_to_target": tm.id(),
-                "target_preview": tm.body()[:50],
+                "target_preview": tm.body[:50],
                 "weight": n.get("weight", 0.0),
                 "relation": n.get("relation", "unknown"),
             })
