@@ -354,8 +354,8 @@ async def get_graph(
     # Skill tag overlap edges
     try:
         skill_store = srh.SkillStore(
-            srh._user_memories_dir(),
-            srh._project_memories_dir(),
+            srh._user_skills_dir(),
+            srh._project_skills_dir(),
         )
         skills = skill_store.list()
         skill_nodes = []

@@ -640,7 +640,7 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
         Dict with 'success', 'path', 'mode', 'token_count' or 'error'
     """
     # P2-32: quick return when profile mode is disabled
-    from .core import profile_mode_enabled as _profile_mode_enabled
+    from ..core import profile_mode_enabled as _profile_mode_enabled
     if not _profile_mode_enabled():
         return {"error": "Profile mode is disabled (enable via config.yaml memory.palace_mode or memory.profile_mode)"}
 

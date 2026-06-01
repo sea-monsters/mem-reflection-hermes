@@ -8,6 +8,7 @@ Zero-dependency leaf module (only imports from .core, not from __init__).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
