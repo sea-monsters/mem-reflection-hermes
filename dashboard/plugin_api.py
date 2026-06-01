@@ -24,6 +24,7 @@ except ImportError:
         "mem_reflection_hermes", plugin_dir / "__init__.py"
     )
     srh = importlib.util.module_from_spec(spec)  # type: ignore
+    sys.modules["mem_reflection_hermes"] = srh  # Register before exec so sub-imports resolve
     spec.loader.exec_module(srh)  # type: ignore
 else:
     class _ModuleProxy:
