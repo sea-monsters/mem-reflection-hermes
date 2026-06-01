@@ -156,7 +156,27 @@ class CLUQI:
         # Fallback: use _bm25_search_scored from core
         from ..core import _bm25_search_scored
         memories = self.store.list_active()
-        return _bm25_search_scored(memories, query, k=kwargs.get('k', 30))
+        # Apply filters that list_active() doesn't support natively
+        _CONF_ORDER = {"low": 0, "medium": 1, "high": 2}
+        zone = kwargs.get("zone")
+        tags = kwargs.get("tags")
+        min_confidence = kwargs.get("min_confidence")
+        include_superseded = kwargs.get("include_superseded", False)
+        if zone or tags or min_confidence or not include_superseded:
+            min_level = _CONF_ORDER.get(min_confidence, 0) if min_confidence else 0
+            filtered = []
+            for m in memories:
+                if zone and m.frontmatter.zone != zone:
+                    continue
+                if tags and not any(t in m.frontmatter.tags for t in tags):
+                    continue
+                if min_confidence and _CONF_ORDER.get(m.frontmatter.confidence, 0) < min_level:
+                    continue
+                if not include_superseded and m.frontmatter.supersedes:
+                    continue
+                filtered.append(m)
+            memories = filtered
+        return _bm25_search_scored(memories, query, k=kwargs.get("k", 30))
 
     def _query_graph_layer(self, query: str, seed_ids: List[str],
                            k: int) -> List[Tuple[str, float]]:

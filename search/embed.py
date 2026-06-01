@@ -103,7 +103,7 @@ def _intent_prototypes() -> Dict[str, List[str]]:
     }
 
     try:
-        from .core import plugin_config, CONFIG_KEY_INTENT_PROTOTYPES
+        from ..core import plugin_config, CONFIG_KEY_INTENT_PROTOTYPES
         cfg = plugin_config()
         custom = cfg.get(CONFIG_KEY_INTENT_PROTOTYPES)
         if isinstance(custom, dict) and custom:
