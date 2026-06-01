@@ -148,7 +148,8 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     include_history = bool(args.get("include_history", False))
     mem_store = _get_mem_store()
     # ── Scheme C: Fusion search (BM25 × Graph × Supersedes) instead of two-stage ──
-    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None)
+    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None,
+                                       include_history=include_history)
     out = []
     for m in results:
         is_superseded = mem_store.is_superseded(m.id())

@@ -18,10 +18,13 @@ from pydantic import BaseModel
 try:
     from .. import __dict__ as _srh_dict
 except ImportError:
+    import importlib.util
     plugin_dir = Path(__file__).resolve().parent.parent
-    if str(plugin_dir.parent) not in sys.path:
-        sys.path.insert(0, str(plugin_dir.parent))
-    import mem_reflection_hermes as srh  # type: ignore
+    spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes", plugin_dir / "__init__.py"
+    )
+    srh = importlib.util.module_from_spec(spec)  # type: ignore
+    spec.loader.exec_module(srh)  # type: ignore
 else:
     class _ModuleProxy:
         def __getattr__(self, name: str) -> Any:

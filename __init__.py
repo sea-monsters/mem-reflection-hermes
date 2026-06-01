@@ -755,15 +755,19 @@ class MemoryStore:
     def fusion_search(self, query: str, k: int = 5,
                       zone: Optional[str] = None,
                       alpha: float = 0.7,
-                      beta: float = 0.3) -> List[LoadedMemory]:
+                      beta: float = 0.3,
+                      include_history: bool = False) -> List[LoadedMemory]:
         """Unified fusion search: BM25 × Graph × Supersedes.
 
         final_score = α * bm25_norm + β * (graph_activation / (1 + supersedes_depth))
 
         This replaces the old two-stage "BM25 → graph_expanded as extra" pattern
         with a single fused ranking.
+
+        When include_history=True, superseded memories are also included in the
+        search pool (ranked lower via supersedes_depth penalty).
         """
-        active = self.list_active()
+        active = self.list() if include_history else self.list_active()
         if not active:
             return []
 
