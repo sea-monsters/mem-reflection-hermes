@@ -364,7 +364,45 @@ def _load_frontmatter_yaml(yaml_part: str) -> Dict[str, Any]:
             return dict(data)
     except Exception:
         pass
-    return {}
+    # Dependency-free fallback: parse simple key-value YAML used by Hermes memories
+    data: Dict[str, Any] = {}
+    current_list_key: Optional[str] = None
+    for line in yaml_part.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- ") and current_list_key is not None:
+            item = stripped[2:].strip()
+            lst = data.setdefault(current_list_key, [])
+            if isinstance(lst, list):
+                lst.append(item)
+            continue
+        if ":" in stripped:
+            key, _, raw_val = stripped.partition(":")
+            key = key.strip()
+            val = raw_val.strip()
+            current_list_key = None
+            if val == "":
+                # Could be the start of a list block
+                current_list_key = key
+                continue
+            # Boolean and None parsing
+            if val.lower() == "true":
+                data[key] = True
+            elif val.lower() == "false":
+                data[key] = False
+            elif val.lower() == "null" or val.lower() == "~":
+                data[key] = None
+            else:
+                # Try number parsing
+                try:
+                    if "." in val:
+                        data[key] = float(val)
+                    else:
+                        data[key] = int(val)
+                except (ValueError, TypeError):
+                    data[key] = val
+    return data
 
 
 def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
