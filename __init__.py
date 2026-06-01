@@ -1778,3 +1778,9 @@ def register(ctx) -> None:
         _hooks_mod._set_plugin_context(ctx)
     _tools_mod.register(ctx)
     _register_slash_commands(ctx)
+
+    # Forward graph manager config from __init__ to lifecycle module
+    # so _get_graph_mgr sees the same singleton (P2)
+    if _gm_getter_func is not None:
+        _hooks_mod._gm_getter_func = _gm_getter_func
+        _hooks_mod._gm_getter_path = _gm_getter_path

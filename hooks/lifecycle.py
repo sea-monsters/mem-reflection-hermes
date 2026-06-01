@@ -333,7 +333,8 @@ def _slash_skills(raw_args: str) -> str:
     query = raw_args.strip()
     skill_store = _get_skill_store()
     if query:
-        skills = match_skills(skill_store.list(), query, k=10)
+        from .. import match_skills as _match_skills
+        skills = _match_skills(skill_store.list(), query, k=10)
     else:
         skills = skill_store.list()
     lines = [f"🔧 Skills ({len(skills)}):"]
