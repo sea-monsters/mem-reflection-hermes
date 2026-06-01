@@ -98,6 +98,7 @@ _profile_mode_enabled = profile_mode_enabled
 _palace_index_path = palace_index_path
 _zone_cache_dir = zone_cache_dir
 _sanitize_zone_filename = sanitize_zone_filename
+_read_memory = read_memory
 _normalize_zone = normalize_zone
 _fast_hash = fast_hash
 _async_write_memory = async_write_memory
