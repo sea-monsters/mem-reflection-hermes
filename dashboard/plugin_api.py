@@ -101,8 +101,9 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
 def _get_graph_manager():
     """Get the graph manager if available."""
     try:
-        from ..graph.ahe_graph import get_graph_manager
-        return get_graph_manager()
+        import importlib
+        mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        return mod.get_graph_manager()
     except Exception:
         return None
 
@@ -110,9 +111,11 @@ def _get_graph_manager():
 def _get_cluqi():
     """Get CLUQI instance if available."""
     try:
-        from ..graph.cluqi import CLUQI
-        gm = _get_graph_manager()
-        return CLUQI(srh._get_mem_store(), gm)
+        import importlib
+        ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
+        gm = ahe.get_graph_manager()
+        return cluqi_mod.CLUQI(srh._get_mem_store(), gm)
     except Exception:
         return None
 

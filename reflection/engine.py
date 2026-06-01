@@ -494,7 +494,7 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
             "Reflection transcript truncated from %d to %d chars",
             len(result), _MAX_REFLECT_TRANSCRIPT_CHARS,
         )
-        result = result[:_MAX_REFLECT_TRANSCRIPT_CHARS]
+        result = result[-_MAX_REFLECT_TRANSCRIPT_CHARS:]
     return result
 
 
