@@ -14,6 +14,7 @@ import math
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -504,7 +505,7 @@ def record_memory_stat(memory_id: str, event: str) -> None:
     try:
         _append_stat_entries([(memory_id, event)])
     except Exception:
-        logger.debug("Failed to record memory stat for %s", memory_id)
+        logger.warning("Failed to record memory stat for %s", memory_id)
 
 
 def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
@@ -512,7 +513,7 @@ def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
     try:
         _append_stat_entries(entries)
     except Exception:
-        logger.debug("Stat sync write failed")
+        logger.warning("Stat sync write failed")
 
 
 import atexit as _atexit
@@ -521,7 +522,7 @@ import atexit as _atexit
 _write_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue(maxsize=500)
 _pending_writes: Set[Path] = set()
 _write_guard_lock = threading.Lock()
-_write_path_locks: WeakValueDictionary = WeakValueDictionary()
+_write_path_locks: Dict[str, threading.RLock] = {}  # H8: regular Dict (no GC race)
 _write_generations: Dict[str, int] = {}
 
 
@@ -558,23 +559,47 @@ def _cancel_pending_write(path: Path) -> None:
     with _write_guard_lock:
         _write_generations[key] = _write_generations.get(key, 0) + 1
         _pending_writes.discard(path)
+        _cleanup_write_generations(path)
+
+
+def _cleanup_write_generations(path: Path) -> None:
+    """Remove generation entries for paths with no pending writes (H9)."""
+    with _write_guard_lock:
+        if path not in _pending_writes:
+            key = _write_path_key(path)
+            _write_generations.pop(key, None)
+            _write_path_locks.pop(key, None)
 
 
 def _safe_write(path: Path, content: str) -> None:
-    """Atomically write content to path via temp-file + os.replace.
+    """Atomically write content to path via unique-temp-file + os.replace.
 
     P1: MemoryStore.put() previously used Path.write_text() which does NOT
     call os.fsync(), leaving data in kernel page cache for up to 30 seconds.
     This helper ensures the data reaches the storage device before returning.
     P0-beta3: Uses temp-file + os.replace to avoid truncated files on crash.
+    Each call creates a unique temp file so concurrent writes on Windows do
+    not race on a shared temporary path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    f = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8",
+        dir=path.parent, suffix=".tmp", delete=False,
+    )
+    try:
         f.write(content)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    finally:
+        f.close()
+    # On Windows, concurrent os.replace may collide (target deletion vs rename race).
+    for _ in range(5):
+        try:
+            os.replace(f.name, path)
+            return
+        except PermissionError:
+            time.sleep(0.01)
+    os.replace(f.name, path)  # final attempt, let it raise
 
 
 def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
@@ -618,9 +643,10 @@ def _file_flush_worker() -> None:
                     continue
                 _safe_write(path, content)
         except Exception:
-            logger.debug("Async write failed for %s", path)
+            logger.warning("Async write failed for %s", path)
         finally:
             _pending_writes.discard(path)
+            _cleanup_write_generations(path)
 
 
 _write_thread = threading.Thread(target=_file_flush_worker, daemon=True)
@@ -685,8 +711,8 @@ def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
                 at = entry.get("at")
                 if at and (e.last_event_at is None or at > e.last_event_at):
                     e.last_event_at = at
-    except Exception:
-        logger.debug("Failed to load effectiveness stats")
+    except Exception as e:
+        logger.warning("Failed to load effectiveness stats from %s: %s", sp, e)
     return eff
 
 
@@ -794,13 +820,13 @@ def _tokenise(s: str) -> List[str]:
         # Check if the part contains CJK characters
         has_cjk = any(is_cjk(c) for c in part)
         if has_cjk:
-            # CJK bigram tokenization: sliding window of 2 chars
+            # CJK bigram tokenization: non-overlapping window of 2 chars
             i = 0
             while i < len(part) - 1:
                 bigram = part[i:i+2]
                 if all(is_cjk(c) for c in bigram):
                     tokens.append(bigram)
-                    i += 2  # advance by 2 for overlapping bigrams (was 1, fixed for correct overlap)
+                    i += 2  # non-overlapping stride (each char used in exactly one bigram)
                 else:
                     i += 1
             # Also include the whole part if it has non-CJK
@@ -833,6 +859,7 @@ def _memory_tokens(memory: LoadedMemory) -> Counter:
 def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
                  effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
                  doc_tokens: Optional[List[Tuple[str, Counter]]] = None,
+                 query_tokens: Optional[List[str]] = None,
                  ) -> List[Tuple[LoadedMemory, float]]:
     """BM25 search with IDF-based scoring.
 
@@ -848,7 +875,7 @@ def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
     k1, b = 1.5, 0.75
     if k == 0 or not memories:
         return []
-    q_tokens = _tokenise(query)
+    q_tokens = query_tokens if query_tokens is not None else _tokenise(query)
     if not q_tokens:
         return []
     n = len(memories)

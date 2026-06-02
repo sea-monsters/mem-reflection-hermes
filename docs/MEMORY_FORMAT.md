@@ -115,23 +115,24 @@ valid and readable.
 │   └── memory-stats.jsonl           # Effectiveness tracking
 ├── plugins/
 │   └── mem-reflection-hermes/
-│       ├── __init__.py              # Registration, exports, graph tools, bootstrap (~1,416 lines)
-│       ├── core.py                  # MemoryStore, SkillStore, models (~652 lines)
+│       ├── __init__.py              # Registration, exports, graph tools, bootstrap (~1,870 lines)
+│       ├── core.py                  # MemoryStore, SkillStore, models, BM25 (~1,078 lines)
+│       ├── late_binding.py          # Shared late-binding symbol resolution (~38 lines)
 │       ├── search/
-│       │   └── embed.py             # ONNX embedding engine (~411 lines)
+│       │   └── embed.py             # ONNX embedding engine, LRU cache (~504 lines)
 │       ├── reflection/
-│       │   └── engine.py            # Micro/full reflection, rebalance (~1,085 lines)
+│       │   └── engine.py            # Micro/full/raw-chunk reflection (~1,692 lines)
 │       ├── hooks/
-│       │   └── lifecycle.py         # Session hooks (~276 lines)
+│       │   └── lifecycle.py         # Session hooks, slash commands (~423 lines)
 │       ├── tools/
-│       │   └── handlers.py          # 12 core SRH tool handlers (~1,019 lines)
+│       │   └── handlers.py          # 12 core SRH tool handlers (~966 lines)
 │       ├── graph/
-│       │   ├── ahe_graph/__init__.py # SQLite-backed graph memory (~687 lines)
-│       │   ├── cluqi.py             # Cross-layer query orchestration (~287 lines)
-│       │   ├── pagerank.py          # PageRank centrality (~101 lines)
-│       │   └── cross_zone.py        # Cross-zone analysis (~132 lines)
+│       │   ├── ahe_graph.py         # SQLite-backed graph memory (~1,024 lines)
+│       │   ├── cluqi.py             # Cross-layer query orchestration (~296 lines)
+│       │   ├── pagerank.py          # PageRank centrality (~116 lines)
+│       │   └── cross_zone.py        # Cross-zone analysis (~133 lines)
 │       ├── query/
-│       │   └── cache.py             # TTL query cache (~163 lines)
+│       │   └── cache.py             # TTL query cache, LRU eviction (~213 lines)
 │       ├── plugin.yaml              # Plugin manifest
 │       ├── README.md                # Index document
 │       ├── scripts/

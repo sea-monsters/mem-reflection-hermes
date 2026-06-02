@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 try:
@@ -167,6 +167,7 @@ async def create_memory(payload: MemoryCreate):
         "scope": payload.scope,
     })
     # Parse tool result and propagate errors
+    result_obj = None
     try:
         result_obj = json.loads(result)
         if isinstance(result_obj, dict) and "error" in result_obj:
@@ -178,8 +179,7 @@ async def create_memory(payload: MemoryCreate):
     gm = _get_graph_manager()
     if gm:
         try:
-            # Parse the new memory ID from tool result (beta3: was race-prone body matching)
-            result_obj = json.loads(result) if isinstance(result, str) else result
+            # Reuse parsed result when available; do not parse non-JSON responses twice
             new_id = result_obj.get("id") if isinstance(result_obj, dict) else None
             new_mem = _get_store().get(new_id) if new_id else None
             if new_mem:
@@ -228,6 +228,7 @@ async def delete_memory(mem_id: str):
     # Clean up graph edges (beta3: wrap in transaction, fix context-manager misuse)
     gm = _get_graph_manager()
     if gm:
+        conn = None
         try:
             conn = gm.store._connect()
             conn.execute("BEGIN")
@@ -235,8 +236,16 @@ async def delete_memory(mem_id: str):
             conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
             conn.commit()
         except Exception as e:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             import logging
             logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
+        finally:
+            if conn is not None:
+                conn.close()
     return {"status": "deleted", "id": mem_id}
 
 
@@ -353,11 +362,15 @@ async def get_graph(
                             })
 
     # Skill tag overlap edges
+    # M18: cache SkillStore instance instead of reconstructing per request
     try:
-        skill_store = srh.SkillStore(
-            srh._user_skills_dir(),
-            srh._project_skills_dir(),
-        )
+        skill_store = getattr(_get_graph, '_cached_skill_store', None)
+        if skill_store is None:
+            skill_store = srh.SkillStore(
+                srh._user_skills_dir(),
+                srh._project_skills_dir(),
+            )
+            _get_graph._cached_skill_store = skill_store
         skills = skill_store.list()
         skill_nodes = []
         for sk in skills:
@@ -413,8 +426,8 @@ async def get_graph(
 @router.get("/graph/neighbors/{mem_id}")
 async def get_graph_neighbors(
     mem_id: str,
-    min_weight: float = 0.1,
-    limit: int = 20,
+    min_weight: float = Query(0.1, ge=0.0, le=1.0),
+    limit: int = Query(20, ge=1, le=200),
 ):
     """Get graph neighbors for a specific memory with metadata enrichment."""
     cluqi = _get_cluqi()
@@ -475,7 +488,7 @@ async def list_skills():
 # ---------------------------------------------------------------------------
 
 @router.get("/reflections")
-async def list_reflections(limit: int = 50, mode: Optional[str] = None):
+async def list_reflections(limit: int = Query(50, ge=1, le=500), mode: Optional[str] = None):
     """Return recent reflection history.
 
     Args:
@@ -502,7 +515,7 @@ async def list_reflections(limit: int = 50, mode: Optional[str] = None):
 
 
 @router.get("/reflections/audit")
-async def list_reflection_audit(limit: int = 100, decision: Optional[str] = None):
+async def list_reflection_audit(limit: int = Query(100, ge=1, le=1000), decision: Optional[str] = None):
     """Return flattened reflection audit entries from all reflection logs.
 
     Args:
@@ -591,7 +604,7 @@ async def get_stats():
 async def cluqi_query(
     q: str,
     zone: Optional[str] = None,
-    k: int = 10,
+    k: int = Query(10, ge=1, le=100),
 ):
     """Cross-layer unified query across MemoryStore, GraphStore, and Supersedes chains."""
     cluqi = _get_cluqi()

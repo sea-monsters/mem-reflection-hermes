@@ -89,6 +89,7 @@ def analyze_zone_connections(memory_store, graph_store) -> Dict[str, Any]:
         "zone_matrix": dict(zone_matrix),
         "bridge_memories": bridge_memories[:50],  # Cap at 50
         "zone_centrality": zone_centrality,
+        "zone_degree": dict(zone_degree),
         "isolated_zones": isolated,
         "zone_count": len(zones),
         "total_bridge_memories": len(bridge_memories),
@@ -112,7 +113,7 @@ def get_zone_recommendations(memory_store, graph_store,
         neighbors = graph_store.get_neighbors(tm.id(), min_weight=0.15, limit=50)
         for n in neighbors:
             mid = n.get("target_id")
-            if mid in seen:
+            if not mid or mid in seen:
                 continue
             mem = memory_store.get_by_id(mid)
             if mem is None or mem.frontmatter.zone == target_zone:

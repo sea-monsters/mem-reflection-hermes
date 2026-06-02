@@ -41,19 +41,26 @@ def compute_pagerank(graph_store, damping: float = 0.85,
     scores: Dict[str, float] = {nid: 1.0 / n for nid in node_ids}
 
     # Pre-compute outgoing edges and build reverse adjacency table
-    # (beta3: O(n^2*d) -> O(n*d) by indexing incoming contributions)
+    # H15: build graph from single get_all_edges() call instead of N+1 get_neighbors()
     outgoing: Dict[str, List[Tuple[str, float]]] = {}
     incoming: Dict[str, List[Tuple[str, float]]] = {nid: [] for nid in node_ids}
-    for nid in node_ids:
-        neighbors = graph_store.get_neighbors(nid, min_weight=0.0, limit=1000)
-        edges = []
-        for n in neighbors:
-            tgt = n.get("target_id")
-            if tgt and tgt in scores:
-                w = n.get("weight", 1.0)
-                edges.append((tgt, w))
-                incoming[tgt].append((nid, w))
-        outgoing[nid] = edges
+    all_edges = graph_store.get_all_edges(min_weight=0.0) if hasattr(graph_store, 'get_all_edges') else []
+    for src_id, tgt_id, weight in all_edges:
+        if src_id in scores and tgt_id in scores:
+            outgoing.setdefault(src_id, []).append((tgt_id, weight))
+            incoming.setdefault(tgt_id, []).append((src_id, weight))
+            outgoing.setdefault(tgt_id, []).append((src_id, weight))
+            incoming.setdefault(src_id, []).append((tgt_id, weight))
+    # Legacy fallback for stores without get_all_edges
+    if not all_edges:
+        for nid in node_ids:
+            neighbors = graph_store.get_neighbors(nid, min_weight=0.0, limit=1000)
+            for neighbor in neighbors:
+                tgt = neighbor.get("target_id")
+                if tgt and tgt in scores:
+                    w = neighbor.get("weight", 1.0)
+                    outgoing.setdefault(nid, []).append((tgt, w))
+                    incoming.setdefault(tgt, []).append((nid, w))
 
     for iteration in range(max_iterations):
         new_scores: Dict[str, float] = {}
@@ -95,12 +102,14 @@ def get_top_pagerank(graph_store, k: int = 10,
     """
     scores = compute_pagerank(graph_store)
     if zone:
-        # Filter by zone if metadata available
-        filtered = []
-        for nid, score in scores.items():
-            meta = graph_store.get_meta(nid)
-            if meta and meta.get("zone") == zone:
-                filtered.append((nid, score))
+        # H16: build zone map from get_all_nodes() instead of N+1 get_meta()
+        zone_map: Dict[str, str] = {}
+        for n in graph_store.get_all_nodes():
+            nzone = n.get("zone")
+            if nzone:
+                zone_map[n["memory_id"]] = nzone
+        filtered = [(nid, score) for nid, score in scores.items()
+                    if zone_map.get(nid) == zone]
         filtered.sort(key=lambda x: x[1], reverse=True)
         return filtered[:k]
     sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)

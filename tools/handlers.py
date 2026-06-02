@@ -22,6 +22,7 @@ from ..core import (
     _is_expired, _is_context_mismatch, _classify_update_intent,
 )
 from ..search.embed import _extract_keywords
+from ..late_binding import late_bind
 from ..reflection.engine import (
     _append_reflect_log, _recent_reflect_outcomes,
     _run_full_reflection, _run_micro_reflection,
@@ -30,35 +31,17 @@ from ..reflection.engine import (
 
 logger = logging.getLogger(__name__)
 
-# P2-33: safe JSON serialization with default=str to handle non-serializable types
+# P2-33: safe JSON serialization.
+# default=str converts non-serializable types (datetime, Path, etc.) to their
+# string representation. This is intentional for tool output formatting.
 def _jd(obj, **kw) -> str:
     """json.dumps wrapper with default=str. Default ensure_ascii=False."""
     if "ensure_ascii" not in kw:
         kw["ensure_ascii"] = False
     return json.dumps(obj, default=str, **kw)
 
-# Late-binding imports cached at module level to avoid repeated dict lookups
-# (P2-23: was doing import on every call; P2-30: unified with hooks.py pattern)
-_late_bindings: Dict[str, Any] = {}
-
 def _lb(name: str):
-    """Get a late-bound function, caching the lookup.
-
-    Always resolves from the root plugin module (mem_reflection_hermes)
-    rather than the child package so that functions defined in __init__.py
-    (e.g. _get_mem_store, _build_context_block) are found regardless of
-    which sub-module calls _lb.
-    """
-    fn = _late_bindings.get(name)
-    if fn is None:
-        mod = sys.modules.get("mem_reflection_hermes")
-        if mod is None:
-            raise KeyError("Plugin module not loaded for late binding: mem_reflection_hermes")
-        fn = getattr(mod, name, None)
-        if fn is None:
-            raise KeyError(f"Root plugin module has no attribute: {name}")
-        _late_bindings[name] = fn
-    return fn
+    return late_bind(name)
 
 __all__ = [
     "register",

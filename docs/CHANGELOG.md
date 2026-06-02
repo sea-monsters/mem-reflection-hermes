@@ -1,5 +1,73 @@
 # Changelog
 
+## v1.0-beta — R1 Code Review Fixes + Thread Safety + Robustness
+
+First release candidate. 63 review findings addressed (1 CRITICAL, 30 HIGH, 16 MEDIUM, 9 LOW).
+
+### CRITICAL (1)
+- **C1**: Fixed `_embed_single` / `_cosine_sim` NameError — added missing re-exports from `search/embed.py` to `__init__.py`
+
+### Thread Safety (6 fixes)
+- `MemoryStore` public methods guarded with `RLock` (concurrent `put`/`delete`/`update`/`reorder`/`search`)
+- `_session_messages` dict protected with `threading.Lock` in lifecycle hooks
+- `_turns_since_reflect` counter protected with `threading.Lock` (micro-reflection cadence)
+- `_reflect_log_lock` now acquired for both read and write paths (prevents torn reads)
+- `ResultCache` singleton uses double-checked locking (`get_cache()`)
+- `_classify_intent_stats` mutations synchronized via `_bump_classify_intent_stat`
+
+### Logic Bug Fixes (5 fixes)
+- `sup_factor` inversion corrected — current (most-revised) memories now score highest, not lowest
+- `check_conflict` supersedes validation checks ALL targets, not just the first
+- `_run_full_reflection` / `_run_micro_reflection` now register newly created memory IDs in session exclusion set (prevents feedback loop)
+- `_pre_llm_call` micro-reflection cadence preserved when reflection is skipped (no false counter reset)
+- `_pre_llm_call` fixed `UnboundLocalError` — added missing `global _turns_since_reflect`
+
+### Error Handling (11 fixes)
+- Silent failures upgraded from `logger.debug` to `logger.warning` in: async write flush, `record_memory_stat`, `batch_record_stats`, `load_effectiveness`, `fusion_search` embedding fallback, `build_palace_index`, `close()` checkpoint
+- `_repair_truncated_json` escape-sequence bypass fixed — backward scan now tracks unescaped quotes
+- `load_effectiveness` logs corruption details before returning empty dict
+
+### Performance (3 fixes)
+- `_build_adjacency` cache key now includes `min_weight` (prevents stale adjacency results)
+- `_build_adjacency` mtime check + DB query + cache update all inside `self._lock` (fixes stale cache race)
+- `check_conflict` tokenizes query once and reuses for both threshold check and BM25 search
+- `_bm25_search_scored` accepts optional `query_tokens` parameter to avoid re-tokenization
+
+### Graph Module Cleanup
+- `decay_all` uses batch processing (100 rows at a time) with per-row error handling
+- PageRank uses single `get_all_edges()` query instead of N+1 `get_neighbors()` calls
+- `get_top_pagerank` uses `get_all_nodes()` with zone info instead of N+1 `get_meta()` calls
+- `_lineage_status` caches supersedes mapping at query time (O(n*k) → O(n))
+- `GraphStoreProtocol` now inherits from `typing.Protocol`
+- `RetrievalRouter` accepts `GraphStoreProtocol` instead of concrete `GraphStore`
+- `add_supersedes_edge` is now a true no-op (deprecated; lineage uses frontmatter)
+- `_query_graph_layer` removes dead dict-style activation code
+- Dead code in `cluqi.py` dict/list branching removed
+
+### Cache & Search Improvements
+- `ResultCache` eviction uses LRU (least recently accessed) instead of earliest expiry
+- `_set_cached_embed` delegates to proper LRU `_put_cached_embed`
+- `_intent_prototypes` logs configuration errors instead of silently discarding
+- `invalidate_pattern` logs warning and returns 0 (previously silent no-op)
+- `SkillStore` cached per-request in dashboard `/graph` endpoint
+
+### Infrastructure
+- `late_binding.py` — shared module with `invalidate_late_bindings()` for cache invalidation
+- `_sanitize_filename` blocks path separators
+- Reflect log archives auto-deleted after 30 days
+- Dashboard `delete_memory` uses `try/finally` with `conn.close()` (fixes SQLite connection leak)
+- Dashboard `create_memory` reuses parsed JSON (no double `json.loads`)
+- `update()` populates `_id_to_mem` with new memory before cache invalidation
+- File naming uses `fm.created.strftime('%Y-%m-%d')` instead of fragile `str()[:10]` slicing
+- `reorder()` uses `_write_memory` + `os.replace` (consistent with other write paths)
+
+### Test Coverage
+- 117 tests passing (was 105), including new regression tests for:
+  - Full reflection session-ID exclusion
+  - Micro-reflection cadence preservation on skip
+  - Supersedes cycle detection for multi-target
+  - Embedding reflection supersedes exclusion
+
 ## v0.9.2-beta2 — Reflection Audit + Supersedes Governance + Lineage Recall
 
 - **WS-1 Supersedes governance**: `supersedes_reason` frontmatter field, lineage helpers (`latest_for`, `is_superseded`, `lineage_chain`), cycle detection, missing-target validation
