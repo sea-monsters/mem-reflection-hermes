@@ -8,6 +8,7 @@ Zero-dependency leaf module (only imports from .core, not from __init__).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -57,7 +58,7 @@ _EMBED_CACHE_MAX = 500
 def _embed_cache_key(text: str) -> str:
     """Hash text for cache key."""
     import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _get_cached_embed(text: str) -> Optional[Any]:
@@ -122,7 +123,7 @@ def _intent_prototypes() -> Dict[str, List[str]]:
                 merged[key] = values
             return merged
     except Exception:
-        pass
+        logger.warning("Invalid intent prototype configuration ignored", exc_info=True)
 
     return defaults
 
@@ -162,6 +163,12 @@ def _ensure_intent_prototypes() -> Optional[Dict[str, List[Any]]]:
 
 # P2-6: counters to track keyword vs embedding classification ratio
 _classify_intent_stats = {"embedding": 0, "keyword": 0, "fallback_none": 0}
+_classify_intent_stats_lock = threading.Lock()
+
+
+def _bump_classify_intent_stat(name: str) -> None:
+    with _classify_intent_stats_lock:
+        _classify_intent_stats[name] += 1
 
 
 def _classify_intent(text: str) -> str:
@@ -174,7 +181,7 @@ def _classify_intent(text: str) -> str:
     """
     global _classify_intent_stats
     if not text or len(text) < 5:
-        _classify_intent_stats["fallback_none"] += 1
+        _bump_classify_intent_stat("fallback_none")
         return "none"
     
     # Try embedding-based classification first
@@ -195,22 +202,22 @@ def _classify_intent(text: str) -> str:
                             best_score = sim
                             best_intent = intent
                 if best_intent != "none":
-                    _classify_intent_stats["embedding"] += 1
+                    _bump_classify_intent_stat("embedding")
                     return best_intent
     except Exception:
         pass
     
     # Fallback to keyword-based detection
     if _is_explicit_memory_intent_kw(text):
-        _classify_intent_stats["keyword"] += 1
+        _bump_classify_intent_stat("keyword")
         return "memory"
     if _is_correction_kw(text):
-        _classify_intent_stats["keyword"] += 1
+        _bump_classify_intent_stat("keyword")
         return "correction"
     if _is_procedure_kw(text):
-        _classify_intent_stats["keyword"] += 1
+        _bump_classify_intent_stat("keyword")
         return "procedure"
-    _classify_intent_stats["fallback_none"] += 1
+    _bump_classify_intent_stat("fallback_none")
     return "none"
 
 
@@ -249,14 +256,7 @@ def _is_procedure_kw(text: str) -> bool:
 
 def _set_cached_embed(text: str, vec: Any) -> None:
     """Cache embedding with LRU eviction."""
-    key = _embed_cache_key(text)
-    with _embed_cache_lock:
-        if len(_embed_cache) >= _EMBED_CACHE_MAX:
-            # Simple eviction: clear half the cache
-            items = list(_embed_cache.items())
-            _embed_cache.clear()
-            _embed_cache.update(items[_EMBED_CACHE_MAX // 2:])
-        _embed_cache[key] = vec
+    _put_cached_embed(text, vec)
 
 
 def _get_onnx_session() -> Tuple[Optional[Any], Optional[Any]]:
@@ -467,11 +467,14 @@ def _extract_keywords(text: str, top_k: int = 5) -> List[str]:
     # Count and score by rarity (rarer = higher score)
     tf = Counter(tokens)
     scored = []
+    total_tokens = len(tokens)
     for t, c in tf.items():
         if t in stops or len(t) < 3:
             continue
-        # Prefer longer, less frequent tokens
-        score = c * len(t) / (1 + sum(1 for x in tokens if x == t))
+        # W2: rare terms score higher (IDF-like) × length bonus
+        # c = term frequency; higher tf → lower score (rarer = more distinctive)
+        idf_like = math.log(total_tokens / (c + 1) + 1.0)
+        score = idf_like * len(t)
         scored.append((score, t))
     scored.sort(reverse=True)
     seen = set()

@@ -8,15 +8,19 @@ Mutations write the new file first, then delete the old file. If the write fails
 
 When the new file path equals the old path (same-day updates, rank-only changes), the write goes to a `.tmp` file first, then `os.replace()` atomically swaps it — preventing file corruption on partial writes.
 
+## Thread Safety (v1.0-beta)
+
+All public mutation methods on `MemoryStore` are guarded with `RLock` to prevent concurrent read/write races. Session-level state (`_session_messages`, `_turns_since_reflect`) uses `threading.Lock`. Graph adjacency rebuild and embedding cache operations are fully synchronized.
+
 ## Cache Consistency
 
-`MemoryStore.update()` and `reorder()` call `_invalidate_cache()` before `_update_cache_for_put()` to prevent duplicate entries, and explicitly set `_index_dirty = True` + `_cached_index = ""` for same-path updates.
+`MemoryStore.update()` populates `_id_to_mem` with the new memory before calling `_invalidate_cache()`, ensuring the ID→memory mapping stays current even when the full cache is invalidated. `reorder()` uses the same `_write_memory` + `os.replace` pattern as other write paths.
+
+## Error Logging
+
+All silent failure paths (async write flush, stat recording, effectiveness loading, embedding fallback, graph operations) log at `logger.warning` level in production. Debug-level logging is reserved for non-critical cleanup operations (e.g., WAL checkpoint during close).
 
 ## Known Issues
-
-### Duplicate Memory Scanning (Fixed in v0.6.0)
-
-When `cwd` is `~`, `_project_memories_dir()` resolved to the same path as `_user_memories_dir()`, causing every memory to appear twice. **Fixed** with path resolution comparison.
 
 ### ONNX Fallback Cache Guard (Known, P3)
 

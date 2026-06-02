@@ -17,19 +17,19 @@ The dashboard communicates with MemoryStore through **atomic store methods** (`u
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 14 routes.
+Current surface: 14 routes (v1.0-beta).
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/memories` | List all active memories |
-| `POST` | `/memories` | Create new memory |
+| `POST` | `/memories` | Create new memory (auto-associates in graph) |
 | `PUT` | `/memories/{id}` | **Atomic update** (write-then-delete swap, cache + index) |
-| `DELETE` | `/memories/{id}` | Delete memory |
+| `DELETE` | `/memories/{id}` | Delete memory + cleanup graph edges |
 | `POST` | `/memories/reorder` | **Atomic reorder** via explicit `rank` assignment |
 | `GET` | `/zones` | All zones with counts |
-| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores |
+| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes |
 | `GET` | `/graph/neighbors/{id}` | Graph neighbors for a memory with metadata enrichment |
-| `GET` | `/graph/zones` | Cross-zone bridge analysis |
+| `GET` | `/graph/zones` | Cross-zone bridge analysis (includes `zone_degree`) |
 | `GET` | `/query` | CLUQI cross-layer unified search |
 | `GET` | `/skills` | All skills with metadata |
 | `GET` | `/reflections` | Recent reflection outcomes (optional `mode` filter) |

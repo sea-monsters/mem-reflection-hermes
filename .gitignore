@@ -24,3 +24,8 @@ Thumbs.db
 sync-to-github.sh
 memory-stats.jsonl
 palace-index.md
+
+# RTK (local AI assistant configuration)
+RTK.md
+AGENTS.md
+.rtk/

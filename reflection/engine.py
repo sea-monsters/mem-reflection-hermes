@@ -22,7 +22,7 @@ from ..core import (
     user_skills_dir as _user_skills_dir,
     micro_reflection_enabled, profile_mode_enabled,
     parse_frontmatter, serialize_frontmatter,
-    _tokenise,
+    _tokenise, _lineage_cycle_check,
 )
 from ..search.embed import (
     _embed_single, _cosine_sim, _extract_keywords,
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Thread-safe locks for file-based operations
 _reflect_log_lock = threading.Lock()
 _pending_skills_lock = threading.Lock()
+_current_session_memory_ids = threading.local()
 
 __all__ = [
     "_FULL_REFLECT_SYSTEM",
@@ -62,6 +63,7 @@ __all__ = [
     "_reflection_mode",
     "_reject_skill",
     "_repair_truncated_json",
+    "_reset_current_session_memory_ids",
     "_run_embedding_micro_reflection",
     "_run_embedding_reflection",
     "_run_full_reflection",
@@ -129,6 +131,26 @@ def _build_audit_entry(
     }
 
 
+def _get_current_session_memory_ids() -> Set[str]:
+    ids = getattr(_current_session_memory_ids, "ids", None)
+    if not ids:
+        return set()
+    return set(ids)
+
+
+
+def _remember_current_session_memory_id(memory_id: str) -> None:
+    ids = _get_current_session_memory_ids()
+    ids.add(memory_id)
+    _current_session_memory_ids.ids = ids
+
+
+
+def _reset_current_session_memory_ids() -> None:
+    if hasattr(_current_session_memory_ids, "ids"):
+        delattr(_current_session_memory_ids, "ids")
+
+
 # # Block 1: Reflection log
 
 # ---------------------------------------------------------------------------
@@ -137,6 +159,7 @@ def _build_audit_entry(
 
 REFLECT_LOG_PATH = _plugin_data_dir() / "reflect-log.jsonl"
 _MAX_REFLECT_LOG_LINES = 5000  # P2-29: auto-rotate after this many entries
+_MAX_ARCHIVE_AGE_DAYS = 30  # M10: auto-delete archives older than this
 # MED-7: approximate line count to avoid reading the full file on every append
 _reflect_log_line_count: int = 0
 
@@ -165,20 +188,29 @@ def _append_reflect_log(entry: Dict[str, Any]) -> None:
                             _reflect_log_line_count,
                         )
                         _reflect_log_line_count = 0
+                        # M10: purge old archives beyond retention window
+                        try:
+                            cutoff = datetime.now(timezone.utc).timestamp() - _MAX_ARCHIVE_AGE_DAYS * 86400
+                            for old in REFLECT_LOG_PATH.parent.glob("reflect-log.*.jsonl"):
+                                if old.stat().st_mtime < cutoff:
+                                    old.unlink(missing_ok=True)
+                        except Exception:
+                            logger.debug("Archive cleanup failed", exc_info=True)
                 except Exception:
-                    pass
+                    logger.warning("Reflect log rotation failed", exc_info=True)
             with open(REFLECT_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 _reflect_log_line_count += 1
     except Exception:
-        pass
+        logger.warning("Reflect log append failed", exc_info=True)
 
 
 def _recent_reflect_outcomes(n: int = 10) -> List[Dict[str, Any]]:
     try:
-        if not REFLECT_LOG_PATH.exists():
-            return []
-        lines = REFLECT_LOG_PATH.read_text(encoding="utf-8").strip().split("\n")
+        with _reflect_log_lock:
+            if not REFLECT_LOG_PATH.exists():
+                return []
+            lines = REFLECT_LOG_PATH.read_text(encoding="utf-8").strip().split("\n")
         out = []
         for line in lines[-n:]:
             line = line.strip()
@@ -187,9 +219,10 @@ def _recent_reflect_outcomes(n: int = 10) -> List[Dict[str, Any]]:
             try:
                 out.append(json.loads(line))
             except Exception:
-                pass
+                logger.debug("Skipping malformed reflect log line", exc_info=True)
         return out
     except Exception:
+        logger.warning("Reflect log read failed", exc_info=True)
         return []
 
 
@@ -248,7 +281,8 @@ markdown fences. No commentary.
       "scope": "user" | "project",
       "confidence": "low" | "medium" | "high",
       "rationale": "why this should persist",
-      "supersedes": ["mem_xxxx"]
+      "supersedes": ["mem_xxxx"],
+      "supersedes_reason": "human-readable reason why this replaces the referenced memory(s)"
     }
   ],
   "conflicts": [
@@ -303,91 +337,99 @@ def _repair_truncated_json(s: str) -> Optional[str]:
     s = s.strip()
     if not s.startswith("{"):
         return None
-    curly = square = 0
-    in_str = escape = False
-    last_safe = None
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if escape:
-            escape = False
-            i += 1
-            continue
-        if ch == "\\" and in_str:
-            escape = True
-            i += 1
-            continue
-        if ch == '"':
-            in_str = not in_str
-            i += 1
-            continue
-        if in_str:
-            i += 1
-            continue
-        if ch == "{":
-            curly += 1
-        elif ch == "}":
-            curly -= 1
-            if curly == 1:
-                rest = s[i + 1:].lstrip()
-                if rest.startswith(","):
-                    last_safe = i + 2
-                elif rest.startswith("}"):
-                    last_safe = i + 1
-        elif ch == "[":
-            square += 1
-        elif ch == "]":
-            square -= 1
-            if square == 0 and curly == 1:
-                rest = s[i + 1:].lstrip()
-                if rest.startswith(","):
-                    last_safe = i + 2
-                elif rest.startswith("}"):
-                    last_safe = i + 1
-        i += 1
-    if curly <= 0 and square <= 0:
+
+    def _close_open_containers(prefix: str) -> Optional[str]:
+        stack: List[str] = []
+        in_str = False
+        escape = False
+        for ch in prefix:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "[{":
+                stack.append(ch)
+            elif ch == "]":
+                if not stack or stack[-1] != "[":
+                    return None
+                stack.pop()
+            elif ch == "}":
+                if not stack or stack[-1] != "{":
+                    return None
+                stack.pop()
+        if in_str or escape:
+            return None
+        repaired = prefix.rstrip()
+        while stack:
+            opener = stack.pop()
+            repaired += "]" if opener == "[" else "}"
+        return repaired
+
+    try:
+        json.loads(s)
         return None
-    repaired = s[:last_safe].rstrip() if last_safe is not None else s
-    if repaired.endswith(","):
-        repaired = repaired[:-1]
-    # Recount
-    c2 = s2 = 0
-    in_str = False
-    for ch in repaired:
-        if ch == '"':
-            in_str = not in_str
+    except Exception:
+        pass
+
+    repaired_full = _close_open_containers(s)
+    if repaired_full is not None:
+        tail_char = s.rstrip()[-1]
+        if tail_char not in "[{:,":
+            try:
+                json.loads(repaired_full)
+                return repaired_full
+            except Exception:
+                pass
+
+    for end in range(len(s) - 1, 0, -1):
+        prefix = s[:end].rstrip()
+        if not prefix or prefix == "{":
             continue
-        if in_str:
+        if prefix.endswith((":", ",", "[", "{")):
             continue
-        if ch == "{":
-            c2 += 1
-        elif ch == "}":
-            c2 -= 1
-        elif ch == "[":
-            s2 += 1
-        elif ch == "]":
-            s2 -= 1
-    for _ in range(max(s2, 0)):
-        repaired += "]"
-    for _ in range(max(c2, 0)):
-        repaired += "}"
-    return repaired
+        repaired = _close_open_containers(prefix)
+        if repaired is None:
+            continue
+        try:
+            json.loads(repaired)
+            return repaired
+        except Exception:
+            continue
+    return None
 
 
 def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
     json_str = _strip_code_fence(text)
     # P2-26: extract JSON object from surrounding text if present
-    import re as _re
-    json_match = _re.search(r'\{.*\}', json_str, _re.DOTALL)
-    if json_match:
-        json_str = json_match.group(0)
+    # beta3-fix: use json.JSONDecoder.raw_decode to handle nested structures
+    # correctly instead of greedy regex r'\{.*\}' which fails on multi-JSON.
+    import json as _json
+    decoder = _json.JSONDecoder()
+    i = 0
+    while i < len(json_str):
+        if json_str[i] == "{":
+            try:
+                obj, end = decoder.raw_decode(json_str, i)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        i += 1
+    # Fallback: try the whole string
     try:
-        return json.loads(json_str)
+        return _json.loads(json_str)
     except Exception as first_err:
         repaired = _repair_truncated_json(json_str)
         if repaired:
             try:
-                return json.loads(repaired)
+                return _json.loads(repaired)
             except Exception:
                 pass
         logger.warning("Reflection JSON parse failed: %s", first_err)
@@ -513,11 +555,15 @@ def _format_inventory() -> str:
 
 
 def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Run a full reflection. Uses embedding-based reflection by default;
-    falls back to LLM only if reflection_mode is 'llm' or 'hybrid'."""
+    """Run a full reflection. Default is raw_chunk (zero LLM cost);
+    falls back to embedding/LLM if configured."""
     mode = _reflection_mode()
 
-    # Default to embedding-based (local, zero cost)
+    # W2: raw_chunk mode — zero LLM calls, store raw conversation chunks
+    if mode == "raw_chunk":
+        return _run_raw_chunk_reflection(messages)
+
+    # embedding-based (local, zero cost)
     if mode in ("embedding", "local"):
         return _run_embedding_reflection(messages)
 
@@ -556,6 +602,7 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             system_prompt=_FULL_REFLECT_SYSTEM,
             purpose="full_reflection",
             max_tokens=4096,
+            timeout=30,
         )
     except Exception as e:
         logger.warning("LLM reflection call failed: %s", e)
@@ -581,8 +628,8 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Conflict check
-        conflict = mem_store.check_conflict(body)
+        supersedes = cand.get("supersedes", [])
+        conflict = mem_store.check_conflict(body, exclude_ids=list(supersedes))
         if conflict:
             existing_id, score = conflict
             logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
@@ -603,12 +650,14 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 tags=cand.get("tags", []),
                 zone="episode",
             )
-            fm.supersedes = cand.get("supersedes", [])
+            fm.supersedes = supersedes
+            _validate_supersedes_targets(mem_store, fm.supersedes)
             supersedes_reason = cand.get("supersedes_reason", "")
             if not supersedes_reason and fm.supersedes:
                 supersedes_reason = "LLM suggested replacement"
             fm.supersedes_reason = supersedes_reason
             path = mem_store.put(scope, fm, body)
+            _remember_current_session_memory_id(fm.id)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
             audit_entries.append(_build_audit_entry(
                 candidate_id=cand_id,
@@ -697,6 +746,7 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
             system_prompt=_MICRO_REFLECT_SYSTEM,
             purpose="micro_reflection",
             max_tokens=2048,
+            timeout=30,
         )
     except Exception as e:
         logger.debug("Micro-reflection LLM call failed: %s", e)
@@ -721,7 +771,8 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
         except Exception:
             pass
 
-        conflict = mem_store.check_conflict(body)
+        supersedes = cand.get("supersedes", [])
+        conflict = mem_store.check_conflict(body, exclude_ids=list(supersedes))
         if conflict:
             existing_id, score = conflict
             audit_entries.append(_build_audit_entry(
@@ -740,8 +791,10 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
                 confidence=cand.get("confidence", "low"),
                 tags=cand.get("tags", []),
             )
-            fm.supersedes = cand.get("supersedes", [])
+            fm.supersedes = supersedes
+            _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
+            _remember_current_session_memory_id(fm.id)
             accepted = {"id": fm.id, "body": body, "path": str(path)}
             audit_entries.append(_build_audit_entry(
                 candidate_id=cand_id,
@@ -842,6 +895,17 @@ def _update_pending_skill_status(pending_id: str, status: str, reason: str = "")
         return False
 
 
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a skill name for filesystem use. Only allow safe characters."""
+    safe = re.sub(r'[^a-zA-Z0-9_\-.]', '_', name)
+    safe = safe.strip('.-')
+    # M13: strip any residual path separators
+    safe = safe.replace("/", "_").replace("\\", "_")
+    if not safe:
+        safe = "unnamed_skill"
+    return safe
+
+
 def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
     """Approve a pending skill candidate and write it to the skill store."""
     candidates = _load_pending_skill_candidates()
@@ -851,7 +915,7 @@ def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
                 return {"error": f"Skill already {cand['_status']}"}
             try:
                 # Write skill to user skills directory
-                skill_name = cand["name"]
+                skill_name = _sanitize_filename(cand["name"])
                 skill_dir = _user_skills_dir() / skill_name
                 skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -907,7 +971,8 @@ def _format_pending_skills_for_display() -> str:
 # Post-register reflection functions (extracted from __init__.py)
 # ---------------------------------------------------------------------------
 
-def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory]) -> float:
+def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory],
+                           exclude_ids: Optional[Set[str]] = None) -> float:
     """Compute how novel a text is compared to existing memories (0-1, higher = more novel).
 
     Uses pre-computed memory embeddings from the store's embed_index when available
@@ -915,10 +980,11 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory])
     """
     if not existing_memories:
         return 1.0
+    exclude_ids = exclude_ids or set()
     new_emb = _embed_single(new_text)
     if new_emb is None:
-        # Fallback to TF-IDF
-        return 1.0 - _tfidf_max_similarity(new_text, existing_memories)
+        filtered = [m for m in existing_memories if m.id() not in exclude_ids]
+        return 1.0 - _tfidf_max_similarity(new_text, filtered)
 
     # Try to use store's embed_index for fast vector lookup
     store = _get_mem_store()
@@ -926,6 +992,8 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory])
     if store._embed_index is not None:
         vectors = store._embed_index.get("vectors", {})
         for m in existing_memories:
+            if m.id() in exclude_ids:
+                continue
             m_emb = vectors.get(m.id())
             if m_emb is not None:
                 sim = _cosine_sim(new_emb, m_emb)
@@ -939,6 +1007,8 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory])
     else:
         # No embed index: encode each memory on demand
         for m in existing_memories:
+            if m.id() in exclude_ids:
+                continue
             m_emb = _embed_single(m.body)
             if m_emb is not None:
                 sim = _cosine_sim(new_emb, m_emb)
@@ -949,11 +1019,13 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory])
     return novelty
 
 
-def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], threshold: float = 0.75) -> Optional[Tuple[LoadedMemory, float]]:
+def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], threshold: float = 0.75,
+                             exclude_ids: Optional[Set[str]] = None) -> Optional[Tuple[LoadedMemory, float]]:
     """Find a semantically similar but potentially conflicting memory.
 
     Uses pre-computed memory embeddings from the store's embed_index when available.
     """
+    exclude_ids = exclude_ids or set()
     new_emb = _embed_single(new_text)
     if new_emb is None:
         return None
@@ -964,6 +1036,8 @@ def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], thresh
     if store._embed_index is not None:
         vectors = store._embed_index.get("vectors", {})
         for m in existing:
+            if m.id() in exclude_ids:
+                continue
             m_emb = vectors.get(m.id())
             if m_emb is None:
                 m_emb = _embed_single(m.body)
@@ -974,6 +1048,8 @@ def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], thresh
                         best = (m, sim)
     else:
         for m in existing:
+            if m.id() in exclude_ids:
+                continue
             m_emb = _embed_single(m.body)
             if m_emb is not None:
                 sim = _cosine_sim(new_emb, m_emb)
@@ -1080,6 +1156,21 @@ def _text_similarity(a: str, b: str) -> float:
     return inter / max(len(ta), len(tb))
 
 
+def _infer_zone_from_scope(scope: str) -> str:
+    """Map memory scope to default zone."""
+    return "work" if scope == "project" else "general"
+
+
+def _validate_supersedes_targets(mem_store: Any, supersedes: List[str]) -> None:
+    """Validate every supersedes target before storage (H27)."""
+    for sid in supersedes or []:
+        if mem_store.get(sid) is None:
+            raise ValueError(f"supersedes target not found: {sid}")
+        cycle = _lineage_cycle_check(mem_store, sid)
+        if cycle is not None:
+            raise ValueError(f"supersedes would create a cycle: {' -> '.join(cycle)}")
+
+
 def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Run a full reflection using local embeddings + rule engine (zero LLM cost).
 
@@ -1092,6 +1183,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     mem_store = _get_mem_store()
     skill_store = _get_skill_store()
     active_memories = mem_store.list_active()
+    current_session_ids = _get_current_session_memory_ids()
     all_skills = skill_store.list()
 
     # Build transcript
@@ -1100,7 +1192,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"summary": "Empty transcript", "accepted_memories": [], "skill_candidates": [], "conflicts": []}
 
     # Compute overall novelty of this session vs existing memories
-    session_novelty = _compute_novelty_score(transcript, active_memories)
+    session_novelty = _compute_novelty_score(transcript, active_memories, exclude_ids=current_session_ids)
     logger.debug("Session novelty score: %.3f", session_novelty)
 
     # Extract potential facts from each turn
@@ -1133,7 +1225,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         text = fact["text"]
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         # Check novelty
-        novelty = _compute_novelty_score(text, active_memories)
+        novelty = _compute_novelty_score(text, active_memories, exclude_ids=current_session_ids)
         if novelty < 0.3:
             logger.debug("Fact too similar to existing memory (novelty %.3f), skipping: %s", novelty, text[:60])
             audit_entries.append(_build_audit_entry(
@@ -1141,12 +1233,12 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="skipped",
                 decision_reason=f"novelty too low ({novelty:.3f} < 0.3)",
                 novelty_score=novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
             continue
 
         # Check for conflicts
-        conflict_mem = _find_conflicting_memory(text, active_memories)
+        conflict_mem = _find_conflicting_memory(text, active_memories, exclude_ids=current_session_ids)
         tags = _extract_keywords(text, top_k=3)
 
         if conflict_mem:
@@ -1175,7 +1267,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     conflict_id=mem.id(),
                     supersedes_ids=[mem.id()],
                     supersedes_reason="user correction",
-                    assigned_zone="episode",
+                    assigned_zone=_infer_zone_from_scope("user"),
                 ))
             else:
                 # Just similar, not necessarily conflicting - skip to avoid duplication
@@ -1186,7 +1278,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision_reason=f"similar to {mem.id()} (sim {sim:.2f}) without explicit correction",
                     novelty_score=novelty,
                     conflict_id=mem.id(),
-                    assigned_zone="episode",
+                    assigned_zone=_infer_zone_from_scope("user"),
                 ))
                 continue
         else:
@@ -1203,18 +1295,21 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="pending_storage",
                 decision_reason="novelty sufficient, no conflict",
                 novelty_score=novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
+
+    summary_text = ""
+    summary_tags: List[str] = []
 
     # Also check if the overall session contains novel concepts not captured by explicit facts
     if session_novelty > 0.5 and len(memory_candidates) == 0:
         # Generate a summary memory from the session
         summary_text = _generate_session_summary(transcript)
         if summary_text and len(summary_text) > 20:
-            tags = _extract_keywords(summary_text, top_k=3)
+            summary_tags = _extract_keywords(summary_text, top_k=3)
             memory_candidates.append({
                 "fact": summary_text,
-                "tags": tags,
+                "tags": summary_tags,
                 "scope": "user",
                 "confidence": "low",
                 "rationale": "Session contained novel concepts not matching existing memories",
@@ -1225,7 +1320,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="pending_storage",
                 decision_reason="session novelty high but no explicit facts extracted",
                 novelty_score=session_novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
 
     # Skill detection: look for reusable procedures
@@ -1247,7 +1342,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             skill_candidates.append({
                 "name": name,
                 "description": f"Procedure extracted from session: {summary_text[:80] if summary_text else 'multi-step workflow'}",
-                "triggers": tags[:3] if tags else ["procedure"],
+                "triggers": summary_tags[:3] if summary_tags else ["procedure"],
                 "body": f"## {name}\n\n{full_assistant[:800]}",
                 "rationale": "Assistant provided a multi-step procedure that may be reusable",
                 "confidence": "low",
@@ -1265,16 +1360,19 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         body = cand["fact"]
         scope = cand.get("scope", "user")
+        zone = _infer_zone_from_scope(scope)
         try:
             fm = MemoryFrontmatter.new(
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
-                zone="episode",
+                zone=zone,
             )
             fm.supersedes = cand.get("supersedes", [])
+            _validate_supersedes_targets(mem_store, fm.supersedes)
+            exclude_ids = list(current_session_ids | set(fm.supersedes or []))
             # Final conflict check
-            conflict = mem_store.check_conflict(body)
+            conflict = mem_store.check_conflict(body, exclude_ids=exclude_ids)
             if conflict:
                 existing_id, score = conflict
                 logger.info("Embedding reflection: memory conflicts with %s (%.2f), skipping", existing_id, score)
@@ -1284,15 +1382,16 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision_reason=f"late conflict with {existing_id} (score {score:.2f})",
                     conflict_id=existing_id,
                     supersedes_ids=fm.supersedes or [],
-                    assigned_zone="episode",
+                    assigned_zone=zone,
                 ))
                 continue
             path = mem_store.put(scope, fm, body)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
+            _remember_current_session_memory_id(fm.id)
             # Update the matching pending_storage audit entry if present
             updated = False
             for ae in audit_entries:
-                if ae.get("decision") == "pending_storage" and ae.get("assigned_zone") == "episode":
+                if ae.get("decision") == "pending_storage":
                     ae["decision"] = "accepted" if not fm.supersedes else "superseded"
                     ae["decision_reason"] = "stored successfully" if not fm.supersedes else f"stored and superseded {fm.supersedes}"
                     ae["supersedes_ids"] = fm.supersedes or []
@@ -1304,7 +1403,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision="accepted" if not fm.supersedes else "superseded",
                     decision_reason="stored successfully",
                     supersedes_ids=fm.supersedes or [],
-                    assigned_zone="episode",
+                    assigned_zone=zone,
                 ))
         except Exception as e:
             logger.warning("Failed to store embedding reflection memory: %s", e)
@@ -1345,6 +1444,79 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "accepted_memories": accepted_memories,
         "skill_candidates": skill_candidates,
         "conflicts": conflicts,
+    }
+
+
+def _run_raw_chunk_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Save raw conversation chunks as episode memories. Zero LLM calls.
+
+    Academic basis: [Retrieval Bottleneck] arXiv:2603.02473, Sec.3.1.
+    Basic RAG (zero LLM calls) with hybrid retrieval reaches 81.1%,
+    outperforming Mem0-style Extracted Facts (77.3%).
+    """
+    mem_store = _get_mem_store()
+    accepted = []
+    audit_entries: List[Dict[str, Any]] = []
+
+    # Group messages into 3-turn windows
+    chunk_size = 3
+    for i in range(0, len(messages), chunk_size):
+        chunk = messages[i:i + chunk_size]
+        # Format chunk as readable text
+        lines = []
+        for msg in chunk:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                content = " ".join(texts)
+            if content and isinstance(content, str):
+                lines.append(f"[{role}] {content.strip()}")
+        body = "\n".join(lines)
+
+        if len(body) < 20:
+            continue
+
+        # Direct write without LLM analysis
+        fm = MemoryFrontmatter.new(
+            source="raw_chunk",
+            confidence="low",
+            tags=["episode", "raw_chunk"],
+            zone="episode",
+        )
+        try:
+            path = mem_store.put("user", fm, body)
+            accepted.append({"id": fm.id, "body_preview": body[:120]})
+            _remember_current_session_memory_id(fm.id)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"chunk_{fm.id}",
+                decision="accepted",
+                decision_reason="raw chunk stored (zero LLM)",
+                assigned_zone="episode",
+            ))
+        except Exception as e:
+            logger.debug("Raw chunk storage failed: %s", e)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"chunk_{uuid.uuid4().hex[:8]}",
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                assigned_zone="episode",
+            ))
+
+    summary = f"Raw chunk reflection: {len(accepted)} chunks stored from {len(messages)} messages."
+    _append_reflect_log({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "raw_chunk",
+        "summary": summary,
+        "accepted_memories": len(accepted),
+        "audit_entries": audit_entries,
+    })
+
+    return {
+        "mode": "raw_chunk",
+        "summary": summary,
+        "accepted_memories": accepted,
+        "chunks_created": len(accepted),
     }
 
 
@@ -1447,7 +1619,9 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             zone="episode",
         )
         fm.supersedes = supersedes
+        _validate_supersedes_targets(mem_store, fm.supersedes)
         path = mem_store.put("user", fm, best["text"])
+        _remember_current_session_memory_id(fm.id)
         accepted = {"id": fm.id, "body": best["text"], "path": str(path)}
 
         _append_reflect_log({

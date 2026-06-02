@@ -104,6 +104,7 @@ def build_query(template_name: str, **kwargs) -> Dict[str, Any]:
 class _CacheEntry:
     result: Any
     expires_at: float
+    last_access: float = 0.0
     access_count: int = 0
 
 
@@ -146,6 +147,7 @@ class ResultCache:
                 self._misses += 1
                 return None
             entry.access_count += 1
+            entry.last_access = time.monotonic()
             self._hits += 1
             return entry.result
 
@@ -155,11 +157,11 @@ class ResultCache:
         key = self._make_key(*args, **kwargs)
         expires = time.monotonic() + (ttl or self.default_ttl)
         with self._lock:
-            # Evict oldest if at capacity
+            # M17: evict least recently accessed, not earliest expiry
             if len(self._store) >= self.max_size:
-                oldest = min(self._store.items(), key=lambda x: x[1].expires_at)
-                del self._store[oldest[0]]
-            self._store[key] = _CacheEntry(result, expires)
+                lru = min(self._store.items(), key=lambda x: x[1].last_access)
+                del self._store[lru[0]]
+            self._store[key] = _CacheEntry(result, expires, last_access=time.monotonic())
         return key
 
     def invalidate(self, *args, **kwargs) -> bool:
@@ -172,12 +174,9 @@ class ResultCache:
             return False
 
     def invalidate_pattern(self, pattern: str) -> int:
-        """Invalidate all keys containing a substring."""
-        with self._lock:
-            to_remove = [k for k in self._store if pattern in k]
-            for k in to_remove:
-                del self._store[k]
-            return len(to_remove)
+        """Pattern invalidation is unsupported because cache keys are opaque hashes."""
+        logger.warning("ResultCache.invalidate_pattern ignored opaque hash pattern: %s", pattern)
+        return 0
 
     def clear(self) -> None:
         """Clear all cached entries."""
@@ -201,11 +200,14 @@ class ResultCache:
 
 # Global cache instance (lazy-initialized)
 _global_cache: Optional[ResultCache] = None
+_global_cache_lock = threading.Lock()
 
 
 def get_cache() -> ResultCache:
     """Get the global result cache instance."""
     global _global_cache
     if _global_cache is None:
-        _global_cache = ResultCache()
+        with _global_cache_lock:
+            if _global_cache is None:
+                _global_cache = ResultCache()
     return _global_cache

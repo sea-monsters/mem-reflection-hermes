@@ -15,13 +15,16 @@ from ..core import (
     LoadedMemory, MemoryFrontmatter, record_memory_stat,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
 )
+from ..late_binding import late_bind
 from ..reflection.engine import (
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_micro_reflection,
     _approve_skill, _reject_skill,
     _load_pending_skill_candidates,
     _format_pending_skills_for_display,
+    _reset_current_session_memory_ids,
 )
+from ..search.embed import _is_explicit_memory_intent
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +47,9 @@ __all__ = [
     "_turns_since_reflect",
 ]
 
-# Late-binding imports cached at module level to avoid repeated dict lookups
-# (P2-23: was doing import on every call)
-_late_bindings: Dict[str, Any] = {}
 _plugin_ctx: Any = None
 _session_messages: Dict[str, List[Dict[str, Any]]] = {}
+_session_messages_lock = threading.Lock()  # H20: protect concurrent session access
 
 def _set_plugin_context(ctx: Any) -> None:
     """Remember the host plugin context for hooks that run without ctx kwargs."""
@@ -56,23 +57,7 @@ def _set_plugin_context(ctx: Any) -> None:
     _plugin_ctx = ctx
 
 def _lb(name: str):
-    """Get a late-bound function, caching the lookup.
-
-    Always resolves from the root plugin module (mem_reflection_hermes)
-    rather than the child package so that functions defined in __init__.py
-    (e.g. _micro_reflection_enabled, _build_context_block) are found
-    regardless of which sub-module calls _lb.
-    """
-    fn = _late_bindings.get(name)
-    if fn is None:
-        mod = sys.modules.get("mem_reflection_hermes")
-        if mod is None:
-            raise KeyError("Plugin module not loaded for late binding: mem_reflection_hermes")
-        fn = getattr(mod, name, None)
-        if fn is None:
-            raise KeyError(f"Root plugin module has no attribute: {name}")
-        _late_bindings[name] = fn
-    return fn
+    return late_bind(name)
 
 def _get_mem_store():
     return _lb("_get_mem_store")()
@@ -85,6 +70,10 @@ def _build_context_block(query=""):
 
 def _estimate_tokens(text):
     return _lb("_estimate_tokens")(text)
+
+
+def _reflection_mode():
+    return _lb("_reflection_mode")()
 
 def _auto_rebalance_zones():
     return _lb("_auto_rebalance_zones")()
@@ -99,6 +88,7 @@ def _micro_reflection_enabled():
     return _lb("_micro_reflection_enabled")()
 
 _turns_since_reflect: int = 0
+_turns_since_reflect_lock = threading.Lock()  # H21: protect concurrent access
 
 # ── Graph manager global singleton (set during plugin init) ─────────
 _gm_getter_func = None
@@ -110,14 +100,17 @@ _gm_singleton_lock = threading.Lock()
 # === Hooks ===
 def _on_session_start(**kwargs) -> None:
     global _turns_since_reflect
-    _turns_since_reflect = 0
+    with _turns_since_reflect_lock:
+        _turns_since_reflect = 0
+    _reset_current_session_memory_ids()
     logger.debug("mem-reflection-hermes: session started")
 
 
 
 def _on_session_end(**kwargs) -> None:
     session_id = kwargs.get("session_id", "")
-    messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
+    with _session_messages_lock:
+        messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
 
     # ── Periodic graph decay ──────────────────────────────
     # Run Ebbinghaus decay on graph edges every session end so weights
@@ -129,28 +122,33 @@ def _on_session_end(**kwargs) -> None:
     except Exception as e:
         logger.warning("ahe_graph decay skipped: %s", e)
 
-    if not messages:
-        return
-    # Attempt full reflection via LLM if available
-    ctx = kwargs.get("ctx") or _plugin_ctx
-    if ctx is not None:
-        try:
-            _run_full_reflection(ctx, messages)
-        except Exception as e:
-            logger.warning("Full reflection failed: %s", e)
-    else:
-        logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
+    try:
+        if not messages:
+            return
+        # Attempt full reflection via LLM if available
+        ctx = kwargs.get("ctx") or _plugin_ctx
+        if ctx is not None:
+            try:
+                _run_full_reflection(ctx, messages)
+            except Exception as e:
+                logger.warning("Full reflection failed: %s", e)
+        else:
+            logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
+    finally:
+        _reset_current_session_memory_ids()
 
 
 def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
     """Inject layered context into the user message; also trigger micro-reflection."""
+    global _turns_since_reflect
     messages = kwargs.get("messages") or kwargs.get("conversation_history") or []
     user_message = kwargs.get("user_message")
     if user_message:
         messages = list(messages) + [{"role": "user", "content": user_message}]
     session_id = kwargs.get("session_id", "")
     if session_id:
-        _session_messages[session_id] = list(messages)[-80:]
+        with _session_messages_lock:
+            _session_messages[session_id] = list(messages)[-80:]
     ctx = kwargs.get("ctx") or _plugin_ctx
 
     # Extract latest user query and assistant response for micro-reflection
@@ -171,20 +169,28 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
     # Trigger micro-reflection: explicit intent always, otherwise every 3 turns
     # (mirrors small-rust-hermes simplified heuristic)
     if _micro_reflection_enabled() and user_msg and assistant_msg:
-        global _turns_since_reflect
         has_intent = _is_explicit_memory_intent(user_msg)
-        if has_intent or _turns_since_reflect >= 3:
+        should_reflect = False
+        with _turns_since_reflect_lock:
+            if has_intent or _turns_since_reflect >= 3:
+                should_reflect = True
+            else:
+                _turns_since_reflect += 1
+
+        if should_reflect:
+            reflection_ran = False
             # Guard: LLM-based micro-reflection requires ctx; skip if unavailable
             if ctx is None and _reflection_mode() == "llm":
                 logger.debug("Micro-reflection skipped: ctx unavailable in llm mode")
             else:
                 try:
                     _run_micro_reflection(ctx, user_msg, assistant_msg)
-                    _turns_since_reflect = 0
+                    reflection_ran = True
                 except Exception as e:
                     logger.debug("Micro-reflection failed: %s", e)
-        else:
-            _turns_since_reflect += 1
+            if reflection_ran:
+                with _turns_since_reflect_lock:
+                    _turns_since_reflect = 0
 
     # Build context block
     query = ""
@@ -200,9 +206,70 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
         # P2-22: phase failure should silently skip rather than fail the whole hook
         logger.warning("Context block build failed in pre_llm_call, skipping injection: %s", e)
         context = None
+
+    # Token budget enforcement (beta3: truncate or skip if context too large)
     if context:
+        try:
+            tok = _estimate_tokens(context)
+            # Default 2000-token budget for injected context; overridable via config
+            budget = 2000
+            try:
+                from ..core import plugin_config
+                budget = plugin_config().get("memory", {}).get("context_token_budget", 2000)
+            except Exception:
+                pass
+            if tok > budget:
+                # Hard truncate to budget (rough: 4 chars/token for ASCII)
+                trunc_len = int(budget * 3.5)
+                context = context[:trunc_len] + "\n...[context truncated]"
+                logger.debug("Context truncated from %d to ~%d tokens", tok, budget)
+        except Exception:
+            pass  # Budget check failure is non-fatal
         return {"context": context}
     return None
+
+
+def _post_tool_call(**kwargs) -> None:
+    """Hook called after a tool invocation to enrich graph with co-accessed memories.
+
+    Extracts memory IDs from tool results (search, read, recall, write)
+    and creates Hebbian associations between memories used together.
+    """
+    tool_name = kwargs.get("tool_name", "")
+    result = kwargs.get("result", "")
+    mem_ids: List[str] = []
+
+    # Only process memory-related tools
+    if not any(t in tool_name for t in ("memory", "palace", "skill")):
+        return
+
+    # Try to extract memory IDs from JSON result
+    try:
+        if isinstance(result, str):
+            result_obj = json.loads(result)
+        else:
+            result_obj = result
+        if isinstance(result_obj, dict):
+            # Direct id fields
+            if "id" in result_obj:
+                mem_ids.append(result_obj["id"])
+            # Results array
+            for key in ("results", "memories", "chain", "graph_expanded"):
+                for item in result_obj.get(key, []):
+                    if isinstance(item, dict):
+                        mid = item.get("id") or item.get("memory_id")
+                        if mid:
+                            mem_ids.append(mid)
+    except Exception:
+        return
+
+    if len(mem_ids) >= 2:
+        try:
+            gm = _get_graph_mgr()
+            if gm:
+                gm.associator.on_co_occurrence(mem_ids, context=tool_name)
+        except Exception as e:
+            logger.debug("Graph enrichment failed in post_tool_call: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +421,3 @@ def _slash_compile_profile(raw_args: str) -> str:
         f"Use the srh_compile_profile tool with ctx access to execute, "
         f"or wait for session-end auto-compilation."
     )
-
-
-# Embedding engine extracted to embed.py
-from ..search.embed import *  # noqa: F401, F403
-
-
-
-# ---------------------------------------------------------------------------
-# Pending skill candidate approval system
-
-# Reflection pipeline extracted to reflection.py
-from ..reflection.engine import *  # noqa: F401, F403

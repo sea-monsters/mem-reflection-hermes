@@ -10,13 +10,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
+from weakref import WeakValueDictionary
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -474,37 +477,8 @@ def read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
 # Async queues with backpressure
 # ---------------------------------------------------------------------------
 
-# P1-2: Background stat writer
-_stat_queue: "queue.Queue[List[Tuple[str, str]]]" = queue.Queue(maxsize=500)
+# Stat writer (synchronous path — background queue removed as dead code in beta3)
 _stat_write_lock = threading.Lock()
-
-
-def _stat_flush_worker() -> None:
-    """Drain the stat queue and append to JSONL in a single file open per batch."""
-    while True:
-        try:
-            batch = _stat_queue.get(timeout=1)
-        except Exception:
-            continue
-        if batch is None:
-            break
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            sp = _stats_path()
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            with open(sp, "a", encoding="utf-8") as f:
-                for memory_id, event in batch:
-                    f.write(json.dumps({
-                        "memory_id": memory_id,
-                        "event": event,
-                        "at": now,
-                    }, ensure_ascii=False) + "\n")
-        except Exception:
-            logger.debug("Failed to batch record %d memory stats", len(batch))
-
-
-_stat_thread = threading.Thread(target=_stat_flush_worker, daemon=True)
-_stat_thread.start()
 
 
 def _stats_path() -> Path:
@@ -531,7 +505,7 @@ def record_memory_stat(memory_id: str, event: str) -> None:
     try:
         _append_stat_entries([(memory_id, event)])
     except Exception:
-        logger.debug("Failed to record memory stat for %s", memory_id)
+        logger.warning("Failed to record memory stat for %s", memory_id)
 
 
 def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
@@ -539,7 +513,7 @@ def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
     try:
         _append_stat_entries(entries)
     except Exception:
-        logger.debug("Stat sync write failed")
+        logger.warning("Stat sync write failed")
 
 
 import atexit as _atexit
@@ -548,7 +522,7 @@ import atexit as _atexit
 _write_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue(maxsize=500)
 _pending_writes: Set[Path] = set()
 _write_guard_lock = threading.Lock()
-_write_path_locks: Dict[str, threading.RLock] = {}
+_write_path_locks: Dict[str, threading.RLock] = {}  # H8: regular Dict (no GC race)
 _write_generations: Dict[str, int] = {}
 
 
@@ -585,20 +559,47 @@ def _cancel_pending_write(path: Path) -> None:
     with _write_guard_lock:
         _write_generations[key] = _write_generations.get(key, 0) + 1
         _pending_writes.discard(path)
+        _cleanup_write_generations(path)
+
+
+def _cleanup_write_generations(path: Path) -> None:
+    """Remove generation entries for paths with no pending writes (H9)."""
+    with _write_guard_lock:
+        if path not in _pending_writes:
+            key = _write_path_key(path)
+            _write_generations.pop(key, None)
+            _write_path_locks.pop(key, None)
 
 
 def _safe_write(path: Path, content: str) -> None:
-    """Write content to path with fsync for crash-safe persistence.
+    """Atomically write content to path via unique-temp-file + os.replace.
 
     P1: MemoryStore.put() previously used Path.write_text() which does NOT
     call os.fsync(), leaving data in kernel page cache for up to 30 seconds.
     This helper ensures the data reaches the storage device before returning.
+    P0-beta3: Uses temp-file + os.replace to avoid truncated files on crash.
+    Each call creates a unique temp file so concurrent writes on Windows do
+    not race on a shared temporary path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    f = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8",
+        dir=path.parent, suffix=".tmp", delete=False,
+    )
+    try:
         f.write(content)
         f.flush()
         os.fsync(f.fileno())
+    finally:
+        f.close()
+    # On Windows, concurrent os.replace may collide (target deletion vs rename race).
+    for _ in range(5):
+        try:
+            os.replace(f.name, path)
+            return
+        except PermissionError:
+            time.sleep(0.01)
+    os.replace(f.name, path)  # final attempt, let it raise
 
 
 def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
@@ -642,9 +643,10 @@ def _file_flush_worker() -> None:
                     continue
                 _safe_write(path, content)
         except Exception:
-            logger.debug("Async write failed for %s", path)
+            logger.warning("Async write failed for %s", path)
         finally:
             _pending_writes.discard(path)
+            _cleanup_write_generations(path)
 
 
 _write_thread = threading.Thread(target=_file_flush_worker, daemon=True)
@@ -709,8 +711,8 @@ def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
                 at = entry.get("at")
                 if at and (e.last_event_at is None or at > e.last_event_at):
                     e.last_event_at = at
-    except Exception:
-        logger.debug("Failed to load effectiveness stats")
+    except Exception as e:
+        logger.warning("Failed to load effectiveness stats from %s: %s", sp, e)
     return eff
 
 
@@ -785,6 +787,25 @@ _STOPWORDS: Set[str] = {
     "we", "they", "me", "him", "her", "us", "them",
 }
 
+# W2: CJK stopwords for BM25 quality
+_CJK_STOPWORDS: Set[str] = {
+    # 中文
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
+    "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
+    "你", "会", "着", "没有", "看", "好", "自己", "这", "那",
+    "什么", "怎么", "为什么", "如何", "可以", "一下", "一些",
+    "与", "及", "等", "对", "将", "还", "但", "而", "或",
+    "如果", "因为", "所以", "虽然", "但是", "然而", "而且",
+    "使用", "进行", "通过", "根据", "关于", "需要", "应该",
+    # 日文
+    "の", "に", "は", "を", "た", "が", "で", "て", "と", "し",
+    "な", "から", "れる", "られる", "よう", "もの", "こと",
+    "これ", "それ", "あれ", "どれ", "この", "その", "あの",
+    # 韩文
+    "은", "는", "이", "가", "을", "를", "에", "의", "로", "과",
+    "와", "한", "하", "고", "도", "지", "다", "니다", "세요",
+}
+
 
 def _tokenise(s: str) -> List[str]:
     """Tokenize text for BM25 search.
@@ -799,16 +820,21 @@ def _tokenise(s: str) -> List[str]:
         # Check if the part contains CJK characters
         has_cjk = any(is_cjk(c) for c in part)
         if has_cjk:
-            # CJK bigram tokenization: sliding window of 2 chars
-            for i in range(len(part) - 1):
+            # CJK bigram tokenization: non-overlapping window of 2 chars
+            i = 0
+            while i < len(part) - 1:
                 bigram = part[i:i+2]
                 if all(is_cjk(c) for c in bigram):
                     tokens.append(bigram)
-                    i += 1  # skip one for overlap
+                    i += 2  # non-overlapping stride (each char used in exactly one bigram)
+                else:
+                    i += 1
             # Also include the whole part if it has non-CJK
             non_cjk = ''.join(c for c in part if not is_cjk(c))
             if len(non_cjk) >= _MIN_TOKEN_LEN and non_cjk not in _STOPWORDS:
                 tokens.append(non_cjk)
+            # Filter CJK bigrams against stopwords
+            tokens = [t for t in tokens if t not in _CJK_STOPWORDS]
         else:
             if len(part) >= _MIN_TOKEN_LEN and part not in _STOPWORDS:
                 tokens.append(part)
@@ -833,6 +859,7 @@ def _memory_tokens(memory: LoadedMemory) -> Counter:
 def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
                  effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
                  doc_tokens: Optional[List[Tuple[str, Counter]]] = None,
+                 query_tokens: Optional[List[str]] = None,
                  ) -> List[Tuple[LoadedMemory, float]]:
     """BM25 search with IDF-based scoring.
 
@@ -848,7 +875,7 @@ def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
     k1, b = 1.5, 0.75
     if k == 0 or not memories:
         return []
-    q_tokens = _tokenise(query)
+    q_tokens = query_tokens if query_tokens is not None else _tokenise(query)
     if not q_tokens:
         return []
     n = len(memories)
@@ -873,7 +900,7 @@ def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
         df_t = df.get(t, 0)
         if df_t == 0:
             continue
-        idf_cache[t] = (n - df_t + 0.5) / (df_t + 0.5) + 1.0
+        idf_cache[t] = math.log((n - df_t + 0.5) / (df_t + 0.5) + 1.0)
 
     if not idf_cache:
         return []

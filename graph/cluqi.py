@@ -49,6 +49,21 @@ class CLUQI:
     def __init__(self, memory_store, graph_manager=None):
         self.store = memory_store
         self.gm = graph_manager
+        self._superseded_set: Optional[Set[str]] = None  # H17: cached superseded map
+
+    def _build_superseded_set(self) -> Set[str]:
+        """Build set of memory IDs that are superseded by newer memories (H17)."""
+        if self._superseded_set is not None:
+            return self._superseded_set
+        s: Set[str] = set()
+        for m in self.store.list_active():
+            for old_id in (m.frontmatter.supersedes or []):
+                s.add(old_id)
+        self._superseded_set = s
+        return s
+
+    def _invalidate_superseded_cache(self) -> None:
+        self._superseded_set = None
 
     def query(self, query: str, *, zone: Optional[str] = None,
               tags: Optional[List[str]] = None,
@@ -189,18 +204,13 @@ class CLUQI:
                 seed_ids, max_depth=5, min_weight=0.05
             )
             results = []
-            if isinstance(activated, dict):
-                activated_items = activated.items()
-            else:
-                activated_items = (
-                    (item.get("memory_id"), item)
-                    for item in activated
-                    if isinstance(item, dict)
-                )
-            for mem_id, info in activated_items:
-                if mem_id in seed_ids:
-                    continue  # Skip seeds
-                score = info.get("activation", 0.0) * info.get("weight", 1.0)
+            for item in activated:
+                if not isinstance(item, dict):
+                    continue
+                mem_id = item.get("memory_id")
+                if not mem_id or mem_id in seed_ids:
+                    continue
+                score = item.get("activation", 0.0) * item.get("weight", 1.0)
                 results.append((mem_id, score))
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:k]
@@ -219,10 +229,9 @@ class CLUQI:
                 if mem.frontmatter.supersedes:
                     return "current"
                 return "root"
-        # Fallback: check if superseded by another memory
-        for m in self.store.list_active():
-            if mem_id in (m.frontmatter.supersedes or []):
-                return "superseded"
+        # H17: use cached superseded set instead of O(n) scan per result
+        if mem_id in self._build_superseded_set():
+            return "superseded"
         if mem.frontmatter.supersedes:
             return "current"
         return "root"

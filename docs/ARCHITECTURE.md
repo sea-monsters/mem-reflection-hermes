@@ -35,22 +35,23 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the follow-up implementation plan targeting the identified design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v0.9.2-beta2)
+## Module Layout (v1.0-beta)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
-| `core.py` | ~1,051 | MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, frontmatter fallback parser | — |
-| `search/embed.py` | ~501 | ONNX embedding engine, cosine similarity, intent classification | core |
-| `reflection/engine.py` | ~1,518 | Micro/full reflection, auto-rebalance, profile compilation, audit logging | core, embed |
-| `hooks/lifecycle.py` | ~368 | Session hooks (on_session_start/end, pre_llm_call, post_tool_call), slash commands | core, embed, reflection |
-| `tools/handlers.py` | ~1,019 | 12 core SRH tool handlers exposed to Hermes Agent | core, embed, reflection, hooks |
-| `graph/ahe_graph/__init__.py` | ~687 | SQLite-backed Hebbian graph memory layer | core |
-| `graph/cluqi.py` | ~287 | Cross-layer unified query orchestration | core, ahe_graph |
-| `query/cache.py` | ~211 | Query template cache with TTL result caching | core |
-| `graph/cross_zone.py` | ~132 | Cross-zone graph analysis helpers | core, ahe_graph |
-| `graph/pagerank.py` | ~101 | PageRank centrality scoring for graph nodes | ahe_graph |
-| `dashboard/plugin_api.py` | ~638 | FastAPI dashboard routes (14 endpoints) | core, ahe_graph, cluqi, query_cache, cross_zone, pagerank |
-| `__init__.py` | ~1,792 | Registration, 5 graph/health tools, exports, backward compat, standalone bootstrap | all above |
+| `core.py` | ~1,078 | MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, frontmatter fallback parser, BM25 search | — |
+| `search/embed.py` | ~504 | ONNX embedding engine, cosine similarity, intent classification, LRU embed cache | core |
+| `reflection/engine.py` | ~1,692 | Micro/full/embedding/raw-chunk reflection, auto-rebalance, profile compilation, audit logging, session exclusion | core, embed |
+| `hooks/lifecycle.py` | ~423 | Session hooks (start/end/pre_llm_call/post_tool_call), slash commands, graph manager, micro-reflection cadence | core, embed, reflection |
+| `tools/handlers.py` | ~966 | 12 core SRH tool handlers exposed to Hermes Agent | core, embed, reflection, hooks |
+| `graph/ahe_graph.py` | ~1,024 | SQLite-backed Hebbian graph memory, Ebbinghaus decay, spread activation, association engine | core |
+| `graph/cluqi.py` | ~296 | Cross-layer unified query orchestration (Memory + Graph + Supersedes) | core, ahe_graph |
+| `query/cache.py` | ~213 | Query templates and TTL-based result cache with LRU eviction | core |
+| `graph/cross_zone.py` | ~133 | Cross-zone graph analysis (bridges, centrality, recommendations) | core, ahe_graph |
+| `graph/pagerank.py` | ~116 | PageRank centrality for graph nodes | ahe_graph |
+| `dashboard/plugin_api.py` | ~646 | FastAPI dashboard (14 endpoints) | core, ahe_graph, cluqi, query_cache, cross_zone, pagerank |
+| `late_binding.py` | ~38 | Shared late-binding symbol resolution with thread-safe cache | — |
+| `__init__.py` | ~1,870 | Registration, 5 graph/health tools, exports, backward compat, standalone bootstrap | all above |
 
 **Tool split**: 12 core tools live in `tools/handlers.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered in `__init__.py` because they require graph-manager initialization at plugin load time.
 
@@ -67,6 +68,22 @@ When adding new functionality, respect the module boundaries:
 
 Avoid circular dependencies. Use function-level late-binding if cross-module
 references are needed at import time.
+
+### Thread Safety (v1.0-beta)
+
+Key concurrency protections added in v1.0-beta:
+
+| Resource | Protection |
+|----------|-----------|
+| `MemoryStore` mutations | `RLock` on all public mutation methods |
+| `_session_messages` dict | `threading.Lock` |
+| `_turns_since_reflect` counter | `threading.Lock` |
+| `_reflect_log_lock` | Covers both read and write paths |
+| Embedding cache | `threading.Lock` on all cache operations |
+| `_classify_intent_stats` | `threading.Lock` via `_bump_classify_intent_stat` |
+| `_build_adjacency` | mtime check + DB query + cache update inside `self._lock` |
+| `get_cache()` singleton | Double-checked locking |
+| Late-binding cache | `threading.Lock` in `late_binding.py` |
 
 ## Slash Commands
 

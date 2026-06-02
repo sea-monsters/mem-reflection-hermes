@@ -2,7 +2,7 @@
 
 Ported from https://github.com/coder-brzhang/small-rust-hermes
 
-v0.9.2-beta2 Architecture (12 code modules + dashboard, approx 6,900 lines):
+v1.0-beta Architecture (12 code modules + dashboard, approx 7,000 lines):
 - core.py: MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, BM25
 - search/embed.py: ONNX embedding engine, cosine similarity, intent classification
 - reflection/engine.py: micro/full reflection pipelines, auto-rebalance, profile compilation
@@ -39,8 +39,7 @@ Features:
 - Cross-zone analysis: bridge memories, zone centrality, zone recommendations
 - Dashboard: React-based UI with graph visualization, CLUQI search, zone analysis
 
-v0.9.1 (2026-05-31): CLUQI, PageRank, SUPERSEDES edges, query templates, result cache, cross-zone analysis
-v0.9.2-beta (2026-06-01): Dashboard full ahe_graph integration, node click highlighting, zone bridge UI
+v1.0-beta (2026-06-02): Stable plugin architecture, 105-test suite, recency fix,
 """
 
 from __future__ import annotations
@@ -48,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -206,8 +206,8 @@ def build_palace_index(memories: List[LoadedMemory]) -> str:
                             edge_count += 1
                 # Each edge counted twice (once per direction), divide by 2
                 intra_zone_edges[zone] = edge_count // 2
-    except Exception:
-        pass  # Graceful degradation: no graph data
+    except Exception as e:
+        logger.warning("build_palace_index graph annotation failed: %s", e)
 
     # Zones in consistent order: core > work > episode > general > custom
     zone_order = ["core", "work", "episode", "general"]
@@ -283,6 +283,7 @@ class MemoryStore:
     def __init__(self, user_root: Path, project_root: Optional[Path] = None):
         self.user_root = user_root
         self.project_root = project_root
+        self._store_lock = threading.RLock()  # H6: protect all mutation methods
         self._embed_index: Optional[Any] = None
         self._embed_lock = threading.Lock()
         self._effectiveness_cache: Optional[Dict[str, MemoryEffectiveness]] = None  # lazy-loaded from JSONL
@@ -352,6 +353,12 @@ class MemoryStore:
     def _ensure_cache(self) -> None:
         if self._cache_valid:
             return
+        with self._store_lock:
+            if self._cache_valid:
+                return
+            return self._build_cache()
+
+    def _build_cache(self) -> None:
         all_mems: List[LoadedMemory] = []
         self._id_to_path.clear()  # P0-2: rebuild id→path index
         self._id_to_mem.clear()
@@ -384,9 +391,30 @@ class MemoryStore:
         self._ensure_cache()
         return list(self._cache["all"])
 
-    def list_active(self) -> List[LoadedMemory]:
+    def list_active(self, sort_by: Optional[str] = None,
+                    order: Literal["asc", "desc"] = "desc") -> List[LoadedMemory]:
+        """Return active memories, optionally sorted by time.
+
+        W3.4: sort_by options:
+          - None: existing order (rank-based)
+          - "created": sort by frontmatter.created
+          - "valid_from": sort by frontmatter.valid_from
+        """
         self._ensure_cache()
-        return list(self._cache["active"])
+        result = list(self._cache["active"])
+        if sort_by:
+            def _time_key(m: LoadedMemory):
+                val = getattr(m.frontmatter, sort_by, None)
+                if isinstance(val, str):
+                    try:
+                        return datetime.fromisoformat(val.replace("Z", "+00:00"))
+                    except Exception:
+                        return datetime.min.replace(tzinfo=timezone.utc)
+                elif isinstance(val, datetime):
+                    return val
+                return datetime.min.replace(tzinfo=timezone.utc)
+            result.sort(key=_time_key, reverse=(order == "desc"))
+        return result
 
     def list_pinned(self) -> List[LoadedMemory]:
         self._ensure_cache()
@@ -560,12 +588,19 @@ class MemoryStore:
     # -- write ----------------------------------------------------------------
 
     def put(self, scope: str, fm: MemoryFrontmatter, body: str) -> Path:
-        if self.get(fm.id):
+        with self._store_lock:
+            return self._put_impl(scope, fm, body)
+
+    def _put_impl(self, scope: str, fm: MemoryFrontmatter, body: str) -> Path:
+        # beta3-fix: check both cache AND disk index for duplicate id
+        # to avoid race with async writes that have updated _id_to_path
+        # but not yet flushed to cache.
+        if self.get(fm.id) or fm.id in self._id_to_path:
             raise ValueError(f"Duplicate memory id: {fm.id}")
         # WS-1: validate supersedes targets exist and do not create cycles
         if fm.supersedes:
             for sid in fm.supersedes:
-                if self.get(sid) is None:
+                if self.get(sid) is None and sid not in self._id_to_path:
                     raise ValueError(f"supersedes target not found: {sid}")
             cycle = _lineage_cycle_check(self, fm.supersedes[0])
             if cycle is not None:
@@ -582,6 +617,10 @@ class MemoryStore:
         return path
 
     def delete(self, scope: str, mem_id: str) -> bool:
+        with self._store_lock:
+            return self._delete_impl(scope, mem_id)
+
+    def _delete_impl(self, scope: str, mem_id: str) -> bool:
         # P0-2: O(1) lookup via id→path index
         path = self._id_to_path.get(mem_id)
         if path is not None:
@@ -619,6 +658,12 @@ class MemoryStore:
     def update(self, mem_id: str, body: Optional[str] = None,
                zone: Optional[str] = None, confidence: Optional[str] = None,
                tags: Optional[List[str]] = None, pinned: Optional[bool] = None) -> LoadedMemory:
+        with self._store_lock:
+            return self._update_impl(mem_id, body, zone, confidence, tags, pinned)
+
+    def _update_impl(self, mem_id: str, body: Optional[str] = None,
+               zone: Optional[str] = None, confidence: Optional[str] = None,
+               tags: Optional[List[str]] = None, pinned: Optional[bool] = None) -> LoadedMemory:
         """Atomically update a memory's content or metadata.
 
         Handles file write, cache invalidation, and index updates in one
@@ -647,7 +692,7 @@ class MemoryStore:
         new_body = body if body is not None else mem.body
 
         # Write new file FIRST (preserves data on write failure)
-        new_path = self._root_for(mem.scope) / f"{str(fm.created)[:10]}-{fm.id[:16]}.md"
+        new_path = self._root_for(mem.scope) / f"{fm.created.strftime('%Y-%m-%d')}-{fm.id[:16]}.md"
         _write_memory(new_path, fm, new_body)
 
         # Delete old file only after successful write AND only if path changed
@@ -657,7 +702,7 @@ class MemoryStore:
         # Rebuild cache atomically: invalidate + re-add
         self._invalidate_cache()
         self._id_to_path[fm.id] = new_path
-        self._update_cache_for_put(mem.scope, fm, new_body, new_path)
+        self._id_to_mem[fm.id] = LoadedMemory(frontmatter=fm, body=new_body.strip(), source_path=new_path, scope=mem.scope)
         # Force all derived indices dirty even for same-path updates
         self._index_dirty = True
         self._cached_index = ""
@@ -667,6 +712,10 @@ class MemoryStore:
         return LoadedMemory(frontmatter=fm, body=new_body.strip(), source_path=new_path, scope=mem.scope)
 
     def reorder(self, memory_ids: List[str]) -> List[str]:
+        with self._store_lock:
+            return self._reorder_impl(memory_ids)
+
+    def _reorder_impl(self, memory_ids: List[str]) -> List[str]:
         """Reorder memories by assigning explicit rank values.
 
         The new order is determined by the provided memory_ids list.
@@ -705,7 +754,7 @@ class MemoryStore:
             )
 
             # Atomic write via temp file to avoid in-place overwrite corruption
-            new_path = self._root_for(mem.scope) / f"{str(fm.created)[:10]}-{fm.id[:16]}.md"
+            new_path = self._root_for(mem.scope) / f"{fm.created.strftime('%Y-%m-%d')}-{fm.id[:16]}.md"
             tmp_path = new_path.with_suffix(new_path.suffix + ".tmp")
             _write_memory(tmp_path, fm, mem.body)
             os.replace(tmp_path, new_path)  # atomic on POSIX
@@ -755,66 +804,149 @@ class MemoryStore:
 
     def fusion_search(self, query: str, k: int = 5,
                       zone: Optional[str] = None,
-                      alpha: float = 0.7,
-                      beta: float = 0.3,
+                      alpha: float = 0.5,      # cosine weight
+                      beta: float = 0.3,       # BM25 weight
+                      gamma: float = 0.1,      # recency weight (W2)
+                      delta: float = 0.1,      # effectiveness weight (W2)
+                      hebbian_beta: float = 0.0,  # Hebbian boost coeff (W2.3, default off)
+                      hub_bonus: float = 0.05,     # PageRank hub boost (W3.3)
+                      use_reranker: bool = False,  # cross-encoder rerank (W2.1)
                       include_history: bool = False) -> List[LoadedMemory]:
-        """Unified fusion search: BM25 × Graph × Supersedes.
+        """Three-layer retrieval: Recall → Fusion → Rerank (W2 academic alignment).
 
-        final_score = α * bm25_norm + β * (graph_activation / (1 + supersedes_depth))
+        Layer 1 (Recall):   embed top-2k + BM25 top-2k
+        Layer 2 (Fusion):   pool union, dedup, normalize per-channel
+        Layer 3 (Rerank):   weighted fusion + optional Hebbian boost
 
-        This replaces the old two-stage "BM25 → graph_expanded as extra" pattern
-        with a single fused ranking.
-
-        When include_history=True, superseded memories are also included in the
-        search pool (ranked lower via supersedes_depth penalty).
+        Default weights (alpha/beta/gamma/delta) tuned for zero-ONNX fallback.
+        Hebbian boost is additive: final += hebbian_beta * neighbor_weight.
         """
         active = self.list() if include_history else self.list_active()
         if not active:
             return []
 
-        # Step 1: Get BM25 scores with effectiveness
-        effectiveness = self._get_effectiveness()
-        doc_tokens = self._ensure_doc_tokens(active)
-        scored = _bm25_search_scored(active, query, k * 2, effectiveness, doc_tokens)
-        if not scored:
-            return []
-
-        # Step 2: Normalize BM25 scores to [0, 1]
-        max_bm25 = max(s for _, s in scored)
-        if max_bm25 <= 0:
-            max_bm25 = 1.0
-
-        # Step 3: Get graph activation scores
+        recall_k = k * 4  # over-fetch for quality
         gm = _get_graph_mgr()
         has_graph = gm is not None
+        now = datetime.now(timezone.utc)
 
-        fused: List[Tuple[float, LoadedMemory]] = []
-        for mem, bm25_score in scored:
-            bm25_norm = bm25_score / max_bm25
-            graph_score = 0.0
-            supersedes_depth = 0
+        # ── Layer 1: Recall ──────────────────────────────────────────────
+        # Channel: embedding
+        embed_results: Dict[str, float] = {}
+        try:
+            emb = self._embed_search(query, recall_k)
+            if emb is not None:
+                embed_results = {mid: sim for mid, sim in emb}
+        except Exception as e:
+            logger.warning("Embedding search failed, degrading to BM25-only: %s", e)
 
-            if has_graph:
-                # Get graph activation (1-hop BFS weight sum)
+        # Channel: BM25
+        effectiveness = self._get_effectiveness()
+        doc_tokens = self._ensure_doc_tokens(active)
+        bm25_scored = _bm25_search_scored(active, query, recall_k, effectiveness, doc_tokens)
+        bm25_results: Dict[str, float] = {m.id(): s for m, s in bm25_scored}
+
+        # ── Layer 2: Fusion pool ─────────────────────────────────────────
+        pool: Dict[str, Dict[str, float]] = {}  # mem_id -> channel scores
+        active_map: Dict[str, LoadedMemory] = {m.id(): m for m in active}
+
+        for mid, score in embed_results.items():
+            if mid in active_map:
+                pool.setdefault(mid, {})["cosine"] = score
+        for mid, score in bm25_results.items():
+            if mid in active_map:
+                pool.setdefault(mid, {})["bm25"] = score
+
+        if not pool:
+            return []
+
+        # Normalize each channel to [0, 1]
+        for ch in ("cosine", "bm25"):
+            vals = [v.get(ch, 0.0) for v in pool.values()]
+            max_val = max(vals) if vals else 1.0
+            if max_val > 0:
+                for mid in pool:
+                    pool[mid][ch] = pool[mid].get(ch, 0.0) / max_val
+
+        # Fill missing channels with 0
+        for mid in pool:
+            pool[mid].setdefault("cosine", 0.0)
+            pool[mid].setdefault("bm25", 0.0)
+
+        # ── Layer 3: Rerank ──────────────────────────────────────────────
+        # Compute recency and effectiveness per item
+        for mid, channels in pool.items():
+            mem = active_map[mid]
+            # Recency score: exponential decay with 30-day half-life
+            try:
+                created = mem.frontmatter.created
+                if isinstance(created, str):
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                else:
+                    created_dt = created
+                age_days = (now - created_dt).total_seconds() / 86400.0
+                channels["recency"] = math.exp(-age_days / 30.0)
+            except Exception:
+                channels["recency"] = 0.5
+
+            # Effectiveness score
+            if effectiveness:
+                eff = effectiveness.get(mid)
+                if eff:
+                    channels["eff"] = eff.factor() * eff.decay_factor()
+                else:
+                    channels["eff"] = 0.0
+            else:
+                channels["eff"] = 0.0
+
+        # Hebbian boost (W2.3): one-hop neighbor weight for items in pool
+        if hebbian_beta > 0 and has_graph:
+            for mid in list(pool.keys()):
                 try:
-                    neighbors = gm.store.get_neighbors(mem.id(), min_weight=0.1, limit=20)
-                    graph_score = sum(n.get("weight", 0) for n in neighbors) / max(len(neighbors), 1)
-                    # Clamp to [0, 1]
-                    graph_score = min(1.0, graph_score)
+                    neighbors = gm.store.get_neighbors(mid, min_weight=0.1, limit=10)
+                    # Only count neighbors that are also in the pool
+                    max_neighbor_weight = max(
+                        (n.get("weight", 0.0) for n in neighbors
+                         if n.get("memory_id") in pool),
+                        default=0.0
+                    )
+                    pool[mid]["hebbian"] = max_neighbor_weight
                 except Exception:
-                    pass
+                    pool[mid]["hebbian"] = 0.0
 
-            # Calculate supersedes depth
-            supersedes_depth = self._calc_supersedes_depth(mem.id())
+        # Hub Detection (W3.3): PageRank > 0.15 gets hub_bonus
+        hub_ids: Set[str] = set()
+        if hub_bonus > 0 and has_graph:
+            try:
+                from .graph import pagerank as _pr
+                pr_scores = _pr.compute_pagerank(gm.store)
+                hub_ids = {nid for nid, score in pr_scores.items()
+                           if score > 0.15 and nid in pool}
+            except Exception:
+                pass
 
-            # Combined score: α * bm25 + β * (graph / (1 + depth))
-            sup_factor = 1.0 / (1.0 + supersedes_depth)
-            final_score = alpha * bm25_norm + beta * graph_score * sup_factor
-            fused.append((final_score, mem))
+        # Weighted fusion
+        fused: List[Tuple[float, LoadedMemory]] = []
+        for mid, ch in pool.items():
+            mem = active_map[mid]
+            supersedes_depth = self._calc_supersedes_depth(mid)
+            # H2: invert sup_factor — deep chain = current revision = boost
+            # Previously: 1.0/(1.0+depth) penalized the most-revised memories.
+            # Now: (1.0+depth)/(2.0+depth) gives gentle boost to chain members.
+            sup_factor = (1.0 + supersedes_depth) / (2.0 + supersedes_depth)
 
-        # Step 4: Re-sort by fused score
+            score = (
+                alpha * ch["cosine"] +
+                beta * ch["bm25"] +
+                gamma * ch.get("recency", 0.0) +
+                delta * ch.get("eff", 0.0) +
+                hebbian_beta * ch.get("hebbian", 0.0) +
+                (hub_bonus if mid in hub_ids else 0.0)
+            ) * sup_factor
+            fused.append((score, mem))
+
         fused.sort(key=lambda x: x[0], reverse=True)
-        results = [m for _, m in fused[:k * 2]]
+        results = [m for _, m in fused]
 
         # Apply zone filter
         if zone:
@@ -878,18 +1010,17 @@ class MemoryStore:
             threshold: override (None = adaptive: 0.75 for CJK, 0.85 for Latin)
             exclude_ids: skip these memory IDs (e.g. targets being superseded)
         """
+        # M2: tokenize once for both threshold adjustment and BM25
+        tokens = _tokenise(body)
         if threshold is None:
-            threshold = _adaptive_conflict_threshold(body)
-            # HIGH-8: short facts (< 20 tokens) may not trigger BM25 overlap due
-            # to token sparsity. Lower threshold by 0.05 for short texts.
-            tokens = _tokenise(body)
+            threshold = adaptive_conflict_threshold(body)
             if len(tokens) < 20:
                 threshold = max(0.65, threshold - 0.05)
         active = self.list_active()
         if exclude_ids:
             exclude = set(exclude_ids)
             active = [m for m in active if m.id() not in exclude]
-        scored = _bm25_search_scored(active, body, 1)
+        scored = _bm25_search_scored(active, body, 1, query_tokens=tokens)
         if scored:
             m, score = scored[0]
             if score > threshold:
@@ -956,64 +1087,6 @@ class MemoryStore:
             logger.debug("Embedding search failed: %s", e)
             return None
 
-
-# ---------------------------------------------------------------------------
-# TF-IDF search (pure Python, zero dependency)
-# ---------------------------------------------------------------------------
-
-_MIN_TOKEN_LEN = 2
-
-# Pre-compiled regex for tokenisation
-_TOKEN_RE = re.compile(r"[^a-z0-9\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]+")
-
-# Pre-computed CJK code point ranges for faster check
-_CJK_RANGES = [
-    (0x4E00, 0x9FFF),
-    (0x3400, 0x4DBF),
-    (0x3000, 0x303F),
-    (0x3040, 0x309F),
-    (0x30A0, 0x30FF),
-    (0xAC00, 0xD7AF),
-]
-
-
-def _is_cjk(c: str) -> bool:
-    cp = ord(c)
-    return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
-
-
-def _cjk_ratio(text: str) -> float:
-    """Return fraction of alphabet-like chars that are CJK in text.
-
-    Skips whitespace, digits, punctuation. Returns 0.0 for empty/short text.
-    Used for adaptive conflict threshold: CJK BM25 scores are more polarized
-    (0.65-0.75 for related vs 0.85-0.95 for Latin text).
-    """
-    letter_count = 0
-    cjk_count = 0
-    for c in text:
-        if c.isalpha():
-            letter_count += 1
-            if _is_cjk(c):
-                cjk_count += 1
-    if letter_count == 0:
-        return 0.0
-    return cjk_count / letter_count
-
-
-def _adaptive_conflict_threshold(body: str) -> float:
-    """Return conflict threshold based on CJK ratio.
-
-    CJK-dominant text (>40% CJK) → 0.75 (lower threshold catches more collisions)
-    Latin-dominant text → 0.85 (standard)
-    Mixed text (10-40%) → 0.80 (interpolated)
-    """
-    ratio = _cjk_ratio(body)
-    if ratio > 0.40:
-        return 0.75
-    elif ratio > 0.10:
-        return 0.80
-    return 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -1088,7 +1161,7 @@ class SkillStore:
 def _read_skill(path: Path, scope: str) -> Optional[LoadedSkill]:
     try:
         raw = path.read_text(encoding="utf-8")
-        data, body = _parse_frontmatter(raw)
+        data, body = parse_frontmatter(raw)
         fm = SkillFrontmatter(
             name=data.get("name", path.parent.name),
             description=data.get("description", ""),
@@ -1753,6 +1826,10 @@ _package_normalize_zone = _normalize_zone
 _package_micro_reflection_enabled = _micro_reflection_enabled
 _package_estimate_tokens = _estimate_tokens
 
+# Initialize globals set by _register_slash_commands (H1)
+_gm_getter_func = None
+_gm_getter_path = None
+
 
 # Tool handlers extracted to tools/handlers.py
 
@@ -1760,6 +1837,7 @@ _package_estimate_tokens = _estimate_tokens
 from .reflection.engine import *  # noqa: F401, F403
 from .tools.handlers import *  # noqa: F401, F403
 from .hooks.lifecycle import *  # noqa: F401, F403
+from .search.embed import _embed_single, _cosine_sim  # noqa: F401
 
 # engine.py's __all__ exports _get_mem_store/_get_skill_store, so import *
 # overwrites the root-native versions. Restore them here to prevent recursive
@@ -1772,7 +1850,7 @@ _micro_reflection_enabled = _package_micro_reflection_enabled
 _estimate_tokens = _package_estimate_tokens
 
 def _reflection_mode() -> str:
-    return plugin_config().get("reflection_mode", "embedding")
+    return plugin_config().get("reflection_mode", "raw_chunk")  # W2: default to raw_chunk
 
 
 def register(ctx) -> None:
