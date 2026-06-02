@@ -308,23 +308,25 @@ async def get_graph(
                         })
 
             # Get SUPERSEDES edges
+            # old_id is the superseded memory; it is not in seen_nodes (which is
+            # built from list_active), so we skip that guard and add the edge
+            # directly since mem.id() is guaranteed to be in seen_nodes.
             if include_supersedes:
                 for mem in memories:
                     if mem.frontmatter.supersedes:
                         for old_id in mem.frontmatter.supersedes:
-                            if old_id in seen_nodes:
-                                edges.append({
-                                    "source": old_id,
-                                    "target": mem.id(),
-                                    "relation": "SUPERSEDES",
-                                    "weight": 0.95,
-                                    "type": "supersedes",
-                                })
-                                # Also add to graph store if not already there
-                                try:
-                                    gm.store.add_supersedes_edge(old_id, mem.id())
-                                except Exception:
-                                    pass
+                            edges.append({
+                                "source": old_id,
+                                "target": mem.id(),
+                                "relation": "SUPERSEDES",
+                                "weight": 0.95,
+                                "type": "supersedes",
+                            })
+                            # Also add to graph store if not already there
+                            try:
+                                gm.store.add_supersedes_edge(old_id, mem.id())
+                            except Exception:
+                                pass
 
             # Compute PageRank
             try:

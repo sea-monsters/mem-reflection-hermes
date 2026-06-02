@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core import (
-    LoadedMemory, MemoryFrontmatter,
+    LoadedMemory, MemoryFrontmatter, record_memory_stat,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
 )
 from ..reflection.engine import (
