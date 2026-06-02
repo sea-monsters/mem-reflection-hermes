@@ -205,31 +205,25 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
                 "cycle": cycle,
             })
 
-    # Conflict check with enhanced guidance
-    conflict = mem_store.check_conflict(body)
+    # Conflict check — skip targets being superseded to avoid rejecting
+    # intentional replacements (P1)
+    conflict = mem_store.check_conflict(body, exclude_ids=supersedes)
     if conflict:
         existing_id, score = conflict
-        # Allow supersedes writes to bypass conflict rejection:
-        # when the caller explicitly passes supersedes=[existing_id],
-        # the conflict is intentional and will be resolved by the
-        # supersedes mechanism — don't reject it.
-        if supersedes and existing_id in supersedes:
-            pass
-        else:
-            existing = mem_store.get(existing_id)
-            guidance = (
-                "Conflict detected with an existing memory. "
-                "Recommended actions: "
-                "1) pass supersedes=[id] to replace, "
-                "2) change zone/scope for a parallel memory, "
-                "3) keep as episode/history if this is a temporal event."
-            )
-            return _jd({
-                "error": guidance,
-                "conflict_with": existing_id,
-                "similarity": score,
-                "existing_zone": existing.frontmatter.zone if existing else None,
-            })
+        existing = mem_store.get(existing_id)
+        guidance = (
+            "Conflict detected with an existing memory. "
+            "Recommended actions: "
+            "1) pass supersedes=[id] to replace, "
+            "2) change zone/scope for a parallel memory, "
+            "3) keep as episode/history if this is a temporal event."
+        )
+        return _jd({
+            "error": guidance,
+            "conflict_with": existing_id,
+            "similarity": score,
+            "existing_zone": existing.frontmatter.zone if existing else None,
+        })
 
     fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags, zone=zone)
     fm.pinned = pinned

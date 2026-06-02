@@ -865,7 +865,8 @@ class MemoryStore:
         doc_tokens = self._ensure_doc_tokens(candidates)
         return _bm25_search(candidates, query, k, effectiveness, doc_tokens)
 
-    def check_conflict(self, body: str, threshold: Optional[float] = None) -> Optional[Tuple[str, float]]:
+    def check_conflict(self, body: str, threshold: Optional[float] = None,
+                       exclude_ids: Optional[List[str]] = None) -> Optional[Tuple[str, float]]:
         """Check for conflicting memories using BM25 similarity.
 
         Complexity (P2-10): O(n·m) where n=active memories, m=query tokens.
@@ -875,6 +876,7 @@ class MemoryStore:
         Args:
             body: text to check for conflicts
             threshold: override (None = adaptive: 0.75 for CJK, 0.85 for Latin)
+            exclude_ids: skip these memory IDs (e.g. targets being superseded)
         """
         if threshold is None:
             threshold = _adaptive_conflict_threshold(body)
@@ -884,6 +886,9 @@ class MemoryStore:
             if len(tokens) < 20:
                 threshold = max(0.65, threshold - 0.05)
         active = self.list_active()
+        if exclude_ids:
+            exclude = set(exclude_ids)
+            active = [m for m in active if m.id() not in exclude]
         scored = _bm25_search_scored(active, body, 1)
         if scored:
             m, score = scored[0]

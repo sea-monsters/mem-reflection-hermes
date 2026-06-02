@@ -328,8 +328,9 @@ async def get_graph(
 
             # Compute PageRank
             try:
-                from ..graph.pagerank import compute_pagerank
-                pagerank_scores = compute_pagerank(gm.store)
+                import importlib
+                pr_mod = importlib.import_module("mem_reflection_hermes.graph.pagerank")
+                pagerank_scores = pr_mod.compute_pagerank(gm.store)
                 for node in nodes:
                     node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
             except Exception as e:

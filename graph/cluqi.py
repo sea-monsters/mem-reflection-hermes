@@ -155,13 +155,13 @@ class CLUQI:
             return self.store.bm25_search(query, **kwargs)
         # Fallback: use _bm25_search_scored from core
         from ..core import _bm25_search_scored
-        memories = self.store.list_active()
+        include_superseded = kwargs.get("include_superseded", False)
+        memories = self.store.list() if include_superseded else self.store.list_active()
         # Apply filters that list_active() doesn't support natively
         _CONF_ORDER = {"low": 0, "medium": 1, "high": 2}
         zone = kwargs.get("zone")
         tags = kwargs.get("tags")
         min_confidence = kwargs.get("min_confidence")
-        include_superseded = kwargs.get("include_superseded", False)
         if zone or tags or min_confidence or not include_superseded:
             min_level = _CONF_ORDER.get(min_confidence, 0) if min_confidence else 0
             filtered = []

@@ -494,7 +494,7 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
             "Reflection transcript truncated from %d to %d chars",
             len(result), _MAX_REFLECT_TRANSCRIPT_CHARS,
         )
-        result = result[-_MAX_REFLECT_TRANSCRIPT_CHARS:]
+        result = result[:_MAX_REFLECT_TRANSCRIPT_CHARS:]
     return result
 
 
@@ -607,6 +607,7 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             supersedes_reason = cand.get("supersedes_reason", "")
             if not supersedes_reason and fm.supersedes:
                 supersedes_reason = "LLM suggested replacement"
+            fm.supersedes_reason = supersedes_reason
             path = mem_store.put(scope, fm, body)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
             audit_entries.append(_build_audit_entry(
