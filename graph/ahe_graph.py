@@ -257,17 +257,34 @@ class GraphStore(GraphStoreProtocol):
                 return []
 
     def get_neighbors(self, memory_id: str, min_weight: float = 0.1,
-                      limit: int = 20) -> List[dict]:
-        """Get neighbor memories (directly connected)."""
+                      limit: int = 20,
+                      exclude_relations: Optional[List[str]] = None) -> List[dict]:
+        """Get neighbor memories (directly connected).
+
+        W2.5: SUPERSEDES edges are excluded by default — they belong to the
+        lineage layer, not the associative graph.
+        """
+        if exclude_relations is None:
+            exclude_relations = ["SUPERSEDES"]
         with self._lock:
             try:
                 conn = self._connect()
-                rows = conn.execute(
-                    "SELECT source_id, target_id, relation, weight, co_occurrence "
-                    "FROM graph_edges WHERE (source_id=? OR target_id=?) AND weight>=? "
-                    "ORDER BY weight DESC LIMIT ?",
-                    (memory_id, memory_id, min_weight, limit)
-                ).fetchall()
+                if exclude_relations:
+                    placeholders = ",".join("?" * len(exclude_relations))
+                    rows = conn.execute(
+                        f"SELECT source_id, target_id, relation, weight, co_occurrence "
+                        f"FROM graph_edges WHERE (source_id=? OR target_id=?) AND weight>=? "
+                        f"AND relation NOT IN ({placeholders}) "
+                        f"ORDER BY weight DESC LIMIT ?",
+                        (memory_id, memory_id, min_weight, *exclude_relations, limit)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT source_id, target_id, relation, weight, co_occurrence "
+                        "FROM graph_edges WHERE (source_id=? OR target_id=?) AND weight>=? "
+                        "ORDER BY weight DESC LIMIT ?",
+                        (memory_id, memory_id, min_weight, limit)
+                    ).fetchall()
                 results = []
                 for r in rows:
                     neighbor = r["target_id"] if r["source_id"] == memory_id else r["source_id"]
@@ -424,7 +441,12 @@ class GraphStore(GraphStoreProtocol):
                 return []
 
     def add_supersedes_edge(self, old_memory_id: str, new_memory_id: str) -> None:
-        """Record a SUPERSEDES relationship: new_memory supersedes old_memory."""
+        """Record a SUPERSEDES relationship: new_memory supersedes old_memory.
+
+        W2.5 DEPRECATED: SUPERSEDES edges now belong to the lineage layer
+        (MemoryFrontmatter.supersedes). This method is kept for backward
+        compatibility but no longer writes to graph_edges.
+        """
         with self._lock:
             self.ensure_meta(old_memory_id)
             self.ensure_meta(new_memory_id)

@@ -308,10 +308,9 @@ async def get_graph(
                             "type": "hebbian",
                         })
 
-            # Get SUPERSEDES edges
-            # old_id is the superseded memory; it is not in seen_nodes (which is
-            # built from list_active), so we skip that guard and add the edge
-            # directly since mem.id() is guaranteed to be in seen_nodes.
+            # Get SUPERSEDES edges from lineage layer (frontmatter).
+            # W2.5: SUPERSEDES belongs to lineage, not associative graph.
+            # ahe_graph stores only Hebbian edges (co_occurs, co_used_in_task).
             if include_supersedes:
                 for mem in memories:
                     if mem.frontmatter.supersedes:
@@ -323,11 +322,6 @@ async def get_graph(
                                 "weight": 0.95,
                                 "type": "supersedes",
                             })
-                            # Also add to graph store if not already there
-                            try:
-                                gm.store.add_supersedes_edge(old_id, mem.id())
-                            except Exception:
-                                pass
 
             # Compute PageRank
             try:

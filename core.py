@@ -761,6 +761,25 @@ _STOPWORDS: Set[str] = {
     "we", "they", "me", "him", "her", "us", "them",
 }
 
+# W2: CJK stopwords for BM25 quality
+_CJK_STOPWORDS: Set[str] = {
+    # 中文
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
+    "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
+    "你", "会", "着", "没有", "看", "好", "自己", "这", "那",
+    "什么", "怎么", "为什么", "如何", "可以", "一下", "一些",
+    "与", "及", "等", "对", "将", "还", "但", "而", "或",
+    "如果", "因为", "所以", "虽然", "但是", "然而", "而且",
+    "使用", "进行", "通过", "根据", "关于", "需要", "应该",
+    # 日文
+    "の", "に", "は", "を", "た", "が", "で", "て", "と", "し",
+    "な", "から", "れる", "られる", "よう", "もの", "こと",
+    "これ", "それ", "あれ", "どれ", "この", "その", "あの",
+    # 韩文
+    "은", "는", "이", "가", "을", "를", "에", "의", "로", "과",
+    "와", "한", "하", "고", "도", "지", "다", "니다", "세요",
+}
+
 
 def _tokenise(s: str) -> List[str]:
     """Tokenize text for BM25 search.
@@ -788,6 +807,8 @@ def _tokenise(s: str) -> List[str]:
             non_cjk = ''.join(c for c in part if not is_cjk(c))
             if len(non_cjk) >= _MIN_TOKEN_LEN and non_cjk not in _STOPWORDS:
                 tokens.append(non_cjk)
+            # Filter CJK bigrams against stopwords
+            tokens = [t for t in tokens if t not in _CJK_STOPWORDS]
         else:
             if len(part) >= _MIN_TOKEN_LEN and part not in _STOPWORDS:
                 tokens.append(part)

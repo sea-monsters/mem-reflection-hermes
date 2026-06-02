@@ -758,66 +758,133 @@ class MemoryStore:
 
     def fusion_search(self, query: str, k: int = 5,
                       zone: Optional[str] = None,
-                      alpha: float = 0.7,
-                      beta: float = 0.3,
+                      alpha: float = 0.5,      # cosine weight
+                      beta: float = 0.3,       # BM25 weight
+                      gamma: float = 0.1,      # recency weight (W2)
+                      delta: float = 0.1,      # effectiveness weight (W2)
+                      hebbian_beta: float = 0.0,  # Hebbian boost coeff (W2.3, default off)
+                      use_reranker: bool = False,  # cross-encoder rerank (W2.1)
                       include_history: bool = False) -> List[LoadedMemory]:
-        """Unified fusion search: BM25 × Graph × Supersedes.
+        """Three-layer retrieval: Recall → Fusion → Rerank (W2 academic alignment).
 
-        final_score = α * bm25_norm + β * (graph_activation / (1 + supersedes_depth))
+        Layer 1 (Recall):   embed top-2k + BM25 top-2k
+        Layer 2 (Fusion):   pool union, dedup, normalize per-channel
+        Layer 3 (Rerank):   weighted fusion + optional Hebbian boost
 
-        This replaces the old two-stage "BM25 → graph_expanded as extra" pattern
-        with a single fused ranking.
-
-        When include_history=True, superseded memories are also included in the
-        search pool (ranked lower via supersedes_depth penalty).
+        Default weights (alpha/beta/gamma/delta) tuned for zero-ONNX fallback.
+        Hebbian boost is additive: final += hebbian_beta * neighbor_weight.
         """
         active = self.list() if include_history else self.list_active()
         if not active:
             return []
 
-        # Step 1: Get BM25 scores with effectiveness
-        effectiveness = self._get_effectiveness()
-        doc_tokens = self._ensure_doc_tokens(active)
-        scored = _bm25_search_scored(active, query, k * 2, effectiveness, doc_tokens)
-        if not scored:
-            return []
-
-        # Step 2: Normalize BM25 scores to [0, 1]
-        max_bm25 = max(s for _, s in scored)
-        if max_bm25 <= 0:
-            max_bm25 = 1.0
-
-        # Step 3: Get graph activation scores
+        recall_k = k * 4  # over-fetch for quality
         gm = _get_graph_mgr()
         has_graph = gm is not None
+        now = datetime.now(timezone.utc)
 
-        fused: List[Tuple[float, LoadedMemory]] = []
-        for mem, bm25_score in scored:
-            bm25_norm = bm25_score / max_bm25
-            graph_score = 0.0
-            supersedes_depth = 0
+        # ── Layer 1: Recall ──────────────────────────────────────────────
+        # Channel: embedding
+        embed_results: Dict[str, float] = {}
+        try:
+            emb = self._embed_search(query, recall_k)
+            if emb is not None:
+                embed_results = {mid: sim for mid, sim in emb}
+        except Exception:
+            pass
 
-            if has_graph:
-                # Get graph activation (1-hop BFS weight sum)
+        # Channel: BM25
+        effectiveness = self._get_effectiveness()
+        doc_tokens = self._ensure_doc_tokens(active)
+        bm25_scored = _bm25_search_scored(active, query, recall_k, effectiveness, doc_tokens)
+        bm25_results: Dict[str, float] = {m.id(): s for m, s in bm25_scored}
+
+        # ── Layer 2: Fusion pool ─────────────────────────────────────────
+        pool: Dict[str, Dict[str, float]] = {}  # mem_id -> channel scores
+        active_map: Dict[str, LoadedMemory] = {m.id(): m for m in active}
+
+        for mid, score in embed_results.items():
+            if mid in active_map:
+                pool.setdefault(mid, {})["cosine"] = score
+        for mid, score in bm25_results.items():
+            if mid in active_map:
+                pool.setdefault(mid, {})["bm25"] = score
+
+        if not pool:
+            return []
+
+        # Normalize each channel to [0, 1]
+        for ch in ("cosine", "bm25"):
+            vals = [v.get(ch, 0.0) for v in pool.values()]
+            max_val = max(vals) if vals else 1.0
+            if max_val > 0:
+                for mid in pool:
+                    pool[mid][ch] = pool[mid].get(ch, 0.0) / max_val
+
+        # Fill missing channels with 0
+        for mid in pool:
+            pool[mid].setdefault("cosine", 0.0)
+            pool[mid].setdefault("bm25", 0.0)
+
+        # ── Layer 3: Rerank ──────────────────────────────────────────────
+        # Compute recency and effectiveness per item
+        for mid, channels in pool.items():
+            mem = active_map[mid]
+            # Recency score: exponential decay with 30-day half-life
+            try:
+                created = mem.frontmatter.created
+                if isinstance(created, str):
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                else:
+                    created_dt = created
+                age_days = (now - created_dt).total_seconds() / 86400.0
+                channels["recency"] = math.exp(-age_days / 30.0)
+            except Exception:
+                channels["recency"] = 0.5
+
+            # Effectiveness score
+            if effectiveness:
+                eff = effectiveness.get(mid)
+                if eff:
+                    channels["eff"] = eff.factor() * eff.decay_factor()
+                else:
+                    channels["eff"] = 0.0
+            else:
+                channels["eff"] = 0.0
+
+        # Hebbian boost (W2.3): one-hop neighbor weight for items in pool
+        if hebbian_beta > 0 and has_graph:
+            for mid in list(pool.keys()):
                 try:
-                    neighbors = gm.store.get_neighbors(mem.id(), min_weight=0.1, limit=20)
-                    graph_score = sum(n.get("weight", 0) for n in neighbors) / max(len(neighbors), 1)
-                    # Clamp to [0, 1]
-                    graph_score = min(1.0, graph_score)
+                    neighbors = gm.store.get_neighbors(mid, min_weight=0.1, limit=10)
+                    # Only count neighbors that are also in the pool
+                    max_neighbor_weight = max(
+                        (n.get("weight", 0.0) for n in neighbors
+                         if n.get("memory_id") in pool),
+                        default=0.0
+                    )
+                    pool[mid]["hebbian"] = max_neighbor_weight
                 except Exception:
-                    pass
+                    pool[mid]["hebbian"] = 0.0
 
-            # Calculate supersedes depth
-            supersedes_depth = self._calc_supersedes_depth(mem.id())
-
-            # Combined score: α * bm25 + β * (graph / (1 + depth))
+        # Weighted fusion
+        fused: List[Tuple[float, LoadedMemory]] = []
+        for mid, ch in pool.items():
+            mem = active_map[mid]
+            supersedes_depth = self._calc_supersedes_depth(mid)
             sup_factor = 1.0 / (1.0 + supersedes_depth)
-            final_score = alpha * bm25_norm + beta * graph_score * sup_factor
-            fused.append((final_score, mem))
 
-        # Step 4: Re-sort by fused score
+            score = (
+                alpha * ch["cosine"] +
+                beta * ch["bm25"] +
+                gamma * ch.get("recency", 0.0) +
+                delta * ch.get("eff", 0.0) +
+                hebbian_beta * ch.get("hebbian", 0.0)
+            ) * sup_factor
+            fused.append((score, mem))
+
         fused.sort(key=lambda x: x[0], reverse=True)
-        results = [m for _, m in fused[:k * 2]]
+        results = [m for _, m in fused]
 
         # Apply zone filter
         if zone:
@@ -1775,7 +1842,7 @@ _micro_reflection_enabled = _package_micro_reflection_enabled
 _estimate_tokens = _package_estimate_tokens
 
 def _reflection_mode() -> str:
-    return plugin_config().get("reflection_mode", "embedding")
+    return plugin_config().get("reflection_mode", "raw_chunk")  # W2: default to raw_chunk
 
 
 def register(ctx) -> None:

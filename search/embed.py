@@ -8,6 +8,7 @@ Zero-dependency leaf module (only imports from .core, not from __init__).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -467,11 +468,14 @@ def _extract_keywords(text: str, top_k: int = 5) -> List[str]:
     # Count and score by rarity (rarer = higher score)
     tf = Counter(tokens)
     scored = []
+    total_tokens = len(tokens)
     for t, c in tf.items():
         if t in stops or len(t) < 3:
             continue
-        # Prefer longer, less frequent tokens
-        score = c * len(t) / (1 + sum(1 for x in tokens if x == t))
+        # W2: rare terms score higher (IDF-like) × length bonus
+        # c = term frequency; higher tf → lower score (rarer = more distinctive)
+        idf_like = math.log(total_tokens / (c + 1) + 1.0)
+        score = idf_like * len(t)
         scored.append((score, t))
     scored.sort(reverse=True)
     seen = set()

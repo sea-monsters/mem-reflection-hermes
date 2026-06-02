@@ -539,11 +539,15 @@ def _format_inventory() -> str:
 
 
 def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Run a full reflection. Uses embedding-based reflection by default;
-    falls back to LLM only if reflection_mode is 'llm' or 'hybrid'."""
+    """Run a full reflection. Default is raw_chunk (zero LLM cost);
+    falls back to embedding/LLM if configured."""
     mode = _reflection_mode()
 
-    # Default to embedding-based (local, zero cost)
+    # W2: raw_chunk mode — zero LLM calls, store raw conversation chunks
+    if mode == "raw_chunk":
+        return _run_raw_chunk_reflection(messages)
+
+    # embedding-based (local, zero cost)
     if mode in ("embedding", "local"):
         return _run_embedding_reflection(messages)
 
@@ -1386,6 +1390,78 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "accepted_memories": accepted_memories,
         "skill_candidates": skill_candidates,
         "conflicts": conflicts,
+    }
+
+
+def _run_raw_chunk_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Save raw conversation chunks as episode memories. Zero LLM calls.
+
+    Academic basis: [Retrieval Bottleneck] arXiv:2603.02473, Sec.3.1.
+    Basic RAG (zero LLM calls) with hybrid retrieval reaches 81.1%,
+    outperforming Mem0-style Extracted Facts (77.3%).
+    """
+    mem_store = _get_mem_store()
+    accepted = []
+    audit_entries: List[Dict[str, Any]] = []
+
+    # Group messages into 3-turn windows
+    chunk_size = 3
+    for i in range(0, len(messages), chunk_size):
+        chunk = messages[i:i + chunk_size]
+        # Format chunk as readable text
+        lines = []
+        for msg in chunk:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                content = " ".join(texts)
+            if content and isinstance(content, str):
+                lines.append(f"[{role}] {content.strip()}")
+        body = "\n".join(lines)
+
+        if len(body) < 20:
+            continue
+
+        # Direct write without LLM analysis
+        fm = MemoryFrontmatter.new(
+            source="raw_chunk",
+            confidence="low",
+            tags=["episode", "raw_chunk"],
+            zone="episode",
+        )
+        try:
+            path = mem_store.put("user", fm, body)
+            accepted.append({"id": fm.id, "body_preview": body[:120]})
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"chunk_{fm.id}",
+                decision="accepted",
+                decision_reason="raw chunk stored (zero LLM)",
+                assigned_zone="episode",
+            ))
+        except Exception as e:
+            logger.debug("Raw chunk storage failed: %s", e)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"chunk_{uuid.uuid4().hex[:8]}",
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                assigned_zone="episode",
+            ))
+
+    summary = f"Raw chunk reflection: {len(accepted)} chunks stored from {len(messages)} messages."
+    _append_reflect_log({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "raw_chunk",
+        "summary": summary,
+        "accepted_memories": len(accepted),
+        "audit_entries": audit_entries,
+    })
+
+    return {
+        "mode": "raw_chunk",
+        "summary": summary,
+        "accepted_memories": accepted,
+        "chunks_created": len(accepted),
     }
 
 
