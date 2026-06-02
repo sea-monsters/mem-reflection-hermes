@@ -30,6 +30,8 @@ from ..search.embed import (
     _classify_intent,
 )
 
+from ..late_binding import late_bind
+
 logger = logging.getLogger(__name__)
 
 # Thread-safe locks for file-based operations
@@ -78,29 +80,23 @@ __all__ = [
 
 def _get_mem_store():
     """Late-binding accessor for __init__.py MemoryStore singleton."""
-    from mem_reflection_hermes import _get_mem_store as _f
-    return _f()
+    return late_bind("_get_mem_store")()
 
 def _get_skill_store():
-    from mem_reflection_hermes import _get_skill_store as _f
-    return _f()
+    return late_bind("_get_skill_store")()
 
 def _estimate_tokens(text):
-    from mem_reflection_hermes import _estimate_tokens as _f
-    return _f(text)
+    return late_bind("_estimate_tokens")(text)
 
 def _auto_rebalance_zones():
-    from mem_reflection_hermes import _auto_rebalance_zones as _f
-    return _f()
+    return late_bind("_auto_rebalance_zones")()
 
 def _build_context_block(query=""):
-    from mem_reflection_hermes import _build_context_block as _f
-    return _f(query)
+    return late_bind("_build_context_block")(query)
 
 def _reflection_mode() -> str:
     """Reflection mode from config."""
-    from mem_reflection_hermes import _reflection_mode as _f
-    return _f()
+    return late_bind("_reflection_mode")()
 
 
 def _build_audit_entry(
@@ -446,7 +442,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
 
 def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
     """Max BM25 similarity between text and existing memories (0-1 normalized)."""
-    from mem_reflection_hermes import _bm25_search_scored
+    _bm25_search_scored = late_bind("_bm25_search_scored")
     scored = _bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
     if scored:
         # Normalize BM25 score to 0-1 using sigmoid approximation
