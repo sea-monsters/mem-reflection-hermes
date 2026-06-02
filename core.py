@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -17,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
+from weakref import WeakValueDictionary
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -474,37 +476,8 @@ def read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
 # Async queues with backpressure
 # ---------------------------------------------------------------------------
 
-# P1-2: Background stat writer
-_stat_queue: "queue.Queue[List[Tuple[str, str]]]" = queue.Queue(maxsize=500)
+# Stat writer (synchronous path — background queue removed as dead code in beta3)
 _stat_write_lock = threading.Lock()
-
-
-def _stat_flush_worker() -> None:
-    """Drain the stat queue and append to JSONL in a single file open per batch."""
-    while True:
-        try:
-            batch = _stat_queue.get(timeout=1)
-        except Exception:
-            continue
-        if batch is None:
-            break
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            sp = _stats_path()
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            with open(sp, "a", encoding="utf-8") as f:
-                for memory_id, event in batch:
-                    f.write(json.dumps({
-                        "memory_id": memory_id,
-                        "event": event,
-                        "at": now,
-                    }, ensure_ascii=False) + "\n")
-        except Exception:
-            logger.debug("Failed to batch record %d memory stats", len(batch))
-
-
-_stat_thread = threading.Thread(target=_stat_flush_worker, daemon=True)
-_stat_thread.start()
 
 
 def _stats_path() -> Path:
@@ -548,7 +521,7 @@ import atexit as _atexit
 _write_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue(maxsize=500)
 _pending_writes: Set[Path] = set()
 _write_guard_lock = threading.Lock()
-_write_path_locks: Dict[str, threading.RLock] = {}
+_write_path_locks: WeakValueDictionary = WeakValueDictionary()
 _write_generations: Dict[str, int] = {}
 
 
@@ -588,17 +561,20 @@ def _cancel_pending_write(path: Path) -> None:
 
 
 def _safe_write(path: Path, content: str) -> None:
-    """Write content to path with fsync for crash-safe persistence.
+    """Atomically write content to path via temp-file + os.replace.
 
     P1: MemoryStore.put() previously used Path.write_text() which does NOT
     call os.fsync(), leaving data in kernel page cache for up to 30 seconds.
     This helper ensures the data reaches the storage device before returning.
+    P0-beta3: Uses temp-file + os.replace to avoid truncated files on crash.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(content)
         f.flush()
         os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
@@ -800,11 +776,14 @@ def _tokenise(s: str) -> List[str]:
         has_cjk = any(is_cjk(c) for c in part)
         if has_cjk:
             # CJK bigram tokenization: sliding window of 2 chars
-            for i in range(len(part) - 1):
+            i = 0
+            while i < len(part) - 1:
                 bigram = part[i:i+2]
                 if all(is_cjk(c) for c in bigram):
                     tokens.append(bigram)
-                    i += 1  # skip one for overlap
+                    i += 2  # advance by 2 for overlapping bigrams (was 1, fixed for correct overlap)
+                else:
+                    i += 1
             # Also include the whole part if it has non-CJK
             non_cjk = ''.join(c for c in part if not is_cjk(c))
             if len(non_cjk) >= _MIN_TOKEN_LEN and non_cjk not in _STOPWORDS:
@@ -873,7 +852,7 @@ def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
         df_t = df.get(t, 0)
         if df_t == 0:
             continue
-        idf_cache[t] = (n - df_t + 0.5) / (df_t + 0.5) + 1.0
+        idf_cache[t] = math.log((n - df_t + 0.5) / (df_t + 0.5) + 1.0)
 
     if not idf_cache:
         return []

@@ -40,23 +40,29 @@ def compute_pagerank(graph_store, damping: float = 0.85,
     # Initialize scores uniformly
     scores: Dict[str, float] = {nid: 1.0 / n for nid in node_ids}
 
-    # Pre-compute outgoing edges for each node
+    # Pre-compute outgoing edges and build reverse adjacency table
+    # (beta3: O(n^2*d) -> O(n*d) by indexing incoming contributions)
     outgoing: Dict[str, List[Tuple[str, float]]] = {}
+    incoming: Dict[str, List[Tuple[str, float]]] = {nid: [] for nid in node_ids}
     for nid in node_ids:
         neighbors = graph_store.get_neighbors(nid, min_weight=0.0, limit=1000)
-        outgoing[nid] = [(n["target_id"], n.get("weight", 1.0))
-                         for n in neighbors if n.get("target_id") in scores]
+        edges = []
+        for n in neighbors:
+            tgt = n.get("target_id")
+            if tgt and tgt in scores:
+                w = n.get("weight", 1.0)
+                edges.append((tgt, w))
+                incoming[tgt].append((nid, w))
+        outgoing[nid] = edges
 
     for iteration in range(max_iterations):
         new_scores: Dict[str, float] = {}
         for nid in node_ids:
             rank = (1.0 - damping) / n
-            for src_id, src_edges in outgoing.items():
-                for target_id, weight in src_edges:
-                    if target_id == nid:
-                        out_degree = len(outgoing.get(src_id, []))
-                        if out_degree > 0:
-                            rank += damping * scores[src_id] * weight / out_degree
+            for src_id, weight in incoming.get(nid, []):
+                out_degree = len(outgoing.get(src_id, []))
+                if out_degree > 0:
+                    rank += damping * scores[src_id] * weight / out_degree
             new_scores[nid] = rank
 
         # Check convergence (L1 norm)

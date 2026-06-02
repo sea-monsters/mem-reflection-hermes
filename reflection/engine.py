@@ -248,7 +248,8 @@ markdown fences. No commentary.
       "scope": "user" | "project",
       "confidence": "low" | "medium" | "high",
       "rationale": "why this should persist",
-      "supersedes": ["mem_xxxx"]
+      "supersedes": ["mem_xxxx"],
+      "supersedes_reason": "human-readable reason why this replaces the referenced memory(s)"
     }
   ],
   "conflicts": [
@@ -347,7 +348,21 @@ def _repair_truncated_json(s: str) -> Optional[str]:
         i += 1
     if curly <= 0 and square <= 0:
         return None
-    repaired = s[:last_safe].rstrip() if last_safe is not None else s
+    # beta3-fix: if last_safe was never set (flat object with no nested
+    # structures), find the last comma outside a string and truncate there.
+    if last_safe is None:
+        in_str = False
+        for j in range(len(s) - 1, -1, -1):
+            ch = s[j]
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str and ch == ",":
+                last_safe = j
+                break
+        if last_safe is None:
+            # No comma found — truncate right after the opening brace
+            last_safe = 1
+    repaired = s[:last_safe].rstrip()
     if repaired.endswith(","):
         repaired = repaired[:-1]
     # Recount
@@ -377,17 +392,28 @@ def _repair_truncated_json(s: str) -> Optional[str]:
 def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
     json_str = _strip_code_fence(text)
     # P2-26: extract JSON object from surrounding text if present
-    import re as _re
-    json_match = _re.search(r'\{.*\}', json_str, _re.DOTALL)
-    if json_match:
-        json_str = json_match.group(0)
+    # beta3-fix: use json.JSONDecoder.raw_decode to handle nested structures
+    # correctly instead of greedy regex r'\{.*\}' which fails on multi-JSON.
+    import json as _json
+    decoder = _json.JSONDecoder()
+    i = 0
+    while i < len(json_str):
+        if json_str[i] == "{":
+            try:
+                obj, end = decoder.raw_decode(json_str, i)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        i += 1
+    # Fallback: try the whole string
     try:
-        return json.loads(json_str)
+        return _json.loads(json_str)
     except Exception as first_err:
         repaired = _repair_truncated_json(json_str)
         if repaired:
             try:
-                return json.loads(repaired)
+                return _json.loads(repaired)
             except Exception:
                 pass
         logger.warning("Reflection JSON parse failed: %s", first_err)
@@ -842,6 +868,15 @@ def _update_pending_skill_status(pending_id: str, status: str, reason: str = "")
         return False
 
 
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a skill name for filesystem use. Only allow safe characters."""
+    safe = re.sub(r'[^a-zA-Z0-9_\-.]', '_', name)
+    safe = safe.strip('.-')
+    if not safe:
+        safe = "unnamed_skill"
+    return safe
+
+
 def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
     """Approve a pending skill candidate and write it to the skill store."""
     candidates = _load_pending_skill_candidates()
@@ -851,7 +886,7 @@ def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
                 return {"error": f"Skill already {cand['_status']}"}
             try:
                 # Write skill to user skills directory
-                skill_name = cand["name"]
+                skill_name = _sanitize_filename(cand["name"])
                 skill_dir = _user_skills_dir() / skill_name
                 skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1080,6 +1115,11 @@ def _text_similarity(a: str, b: str) -> float:
     return inter / max(len(ta), len(tb))
 
 
+def _infer_zone_from_scope(scope: str) -> str:
+    """Map memory scope to default zone."""
+    return "work" if scope == "project" else "general"
+
+
 def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Run a full reflection using local embeddings + rule engine (zero LLM cost).
 
@@ -1141,7 +1181,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="skipped",
                 decision_reason=f"novelty too low ({novelty:.3f} < 0.3)",
                 novelty_score=novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
             continue
 
@@ -1175,7 +1215,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     conflict_id=mem.id(),
                     supersedes_ids=[mem.id()],
                     supersedes_reason="user correction",
-                    assigned_zone="episode",
+                    assigned_zone=_infer_zone_from_scope("user"),
                 ))
             else:
                 # Just similar, not necessarily conflicting - skip to avoid duplication
@@ -1186,7 +1226,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision_reason=f"similar to {mem.id()} (sim {sim:.2f}) without explicit correction",
                     novelty_score=novelty,
                     conflict_id=mem.id(),
-                    assigned_zone="episode",
+                    assigned_zone=_infer_zone_from_scope("user"),
                 ))
                 continue
         else:
@@ -1203,7 +1243,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="pending_storage",
                 decision_reason="novelty sufficient, no conflict",
                 novelty_score=novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
 
     # Also check if the overall session contains novel concepts not captured by explicit facts
@@ -1225,7 +1265,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 decision="pending_storage",
                 decision_reason="session novelty high but no explicit facts extracted",
                 novelty_score=session_novelty,
-                assigned_zone="episode",
+                assigned_zone=_infer_zone_from_scope("user"),
             ))
 
     # Skill detection: look for reusable procedures
@@ -1265,12 +1305,13 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         body = cand["fact"]
         scope = cand.get("scope", "user")
+        zone = _infer_zone_from_scope(scope)
         try:
             fm = MemoryFrontmatter.new(
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
-                zone="episode",
+                zone=zone,
             )
             fm.supersedes = cand.get("supersedes", [])
             # Final conflict check
@@ -1284,7 +1325,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision_reason=f"late conflict with {existing_id} (score {score:.2f})",
                     conflict_id=existing_id,
                     supersedes_ids=fm.supersedes or [],
-                    assigned_zone="episode",
+                    assigned_zone=zone,
                 ))
                 continue
             path = mem_store.put(scope, fm, body)
@@ -1292,7 +1333,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             # Update the matching pending_storage audit entry if present
             updated = False
             for ae in audit_entries:
-                if ae.get("decision") == "pending_storage" and ae.get("assigned_zone") == "episode":
+                if ae.get("decision") == "pending_storage":
                     ae["decision"] = "accepted" if not fm.supersedes else "superseded"
                     ae["decision_reason"] = "stored successfully" if not fm.supersedes else f"stored and superseded {fm.supersedes}"
                     ae["supersedes_ids"] = fm.supersedes or []
@@ -1304,7 +1345,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     decision="accepted" if not fm.supersedes else "superseded",
                     decision_reason="stored successfully",
                     supersedes_ids=fm.supersedes or [],
-                    assigned_zone="episode",
+                    assigned_zone=zone,
                 ))
         except Exception as e:
             logger.warning("Failed to store embedding reflection memory: %s", e)

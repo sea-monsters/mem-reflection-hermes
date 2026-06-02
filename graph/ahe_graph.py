@@ -123,30 +123,41 @@ class GraphStore(GraphStoreProtocol):
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()  # Per-thread connections (beta3: thread-safety fix)
+        self._all_conns: Set[sqlite3.Connection] = set()
+        self._all_conns_lock = threading.Lock()
         self._known_meta: Set[str] = set()
         self._lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
-        """Get or create SQLite connection with WAL mode for concurrency."""
-        with self._lock:
-            if self._conn is None:
-                try:
-                    self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-                    self._conn.row_factory = sqlite3.Row
-                    self._conn.execute("PRAGMA journal_mode=WAL")
-                    self._conn.execute("PRAGMA busy_timeout=3000")
-                    self._conn.executescript(self.SCHEMA)
-                except sqlite3.Error as e:
-                    logger.exception("graph_store: failed to open DB at %s: %s", self.db_path, e)
-                    raise
-            return self._conn
+        """Get or create per-thread SQLite connection with WAL mode."""
+        conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
+        if conn is None:
+            try:
+                conn = sqlite3.connect(str(self.db_path), check_same_thread=True)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=3000")
+                conn.executescript(self.SCHEMA)
+                self._local.conn = conn
+                with self._all_conns_lock:
+                    self._all_conns.add(conn)
+            except sqlite3.Error as e:
+                logger.exception("graph_store: failed to open DB at %s: %s", self.db_path, e)
+                raise
+        return conn
 
     def close(self):
-        with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+        """Close all connections (called from any thread)."""
+        with self._all_conns_lock:
+            conns = list(self._all_conns)
+            self._all_conns.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
 
     # -- Edge operations --
 

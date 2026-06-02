@@ -560,12 +560,15 @@ class MemoryStore:
     # -- write ----------------------------------------------------------------
 
     def put(self, scope: str, fm: MemoryFrontmatter, body: str) -> Path:
-        if self.get(fm.id):
+        # beta3-fix: check both cache AND disk index for duplicate id
+        # to avoid race with async writes that have updated _id_to_path
+        # but not yet flushed to cache.
+        if self.get(fm.id) or fm.id in self._id_to_path:
             raise ValueError(f"Duplicate memory id: {fm.id}")
         # WS-1: validate supersedes targets exist and do not create cycles
         if fm.supersedes:
             for sid in fm.supersedes:
-                if self.get(sid) is None:
+                if self.get(sid) is None and sid not in self._id_to_path:
                     raise ValueError(f"supersedes target not found: {sid}")
             cycle = _lineage_cycle_check(self, fm.supersedes[0])
             if cycle is not None:

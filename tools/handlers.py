@@ -189,7 +189,7 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
     supersedes_reason = args.get("supersedes_reason")
     zone = _normalize_zone(args.get("zone"))
 
-    # Validate supersedes targets exist
+    # Validate supersedes targets exist and no cycles
     if supersedes:
         for sid in supersedes:
             if mem_store.get(sid) is None:
@@ -197,13 +197,14 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
                     "error": f"supersedes target not found: {sid}",
                     "missing_id": sid,
                 })
-        # Cycle guard
-        cycle = _lineage_cycle_check(mem_store, supersedes[0]) if supersedes else None
-        if cycle:
-            return _jd({
-                "error": f"supersedes would create a cycle: {' -> '.join(cycle)}",
-                "cycle": cycle,
-            })
+        # Cycle guard — check every target (beta3: was only checking supersedes[0])
+        for sid in supersedes:
+            cycle = _lineage_cycle_check(mem_store, sid)
+            if cycle:
+                return _jd({
+                    "error": f"supersedes would create a cycle: {' -> '.join(cycle)}",
+                    "cycle": cycle,
+                })
 
     # Conflict check — skip targets being superseded to avoid rejecting
     # intentional replacements (P1)
@@ -272,7 +273,7 @@ def _tool_srh_memory_history(args: dict, **kwargs) -> str:
     root_id = _lineage_root(mem_store, memory_id)
     latest_id = _lineage_latest(mem_store, root_id)
     if latest_id is None:
-        latest_id = root_id
+        latest_id = memory_id  # beta3: fallback to queried id instead of root_id
 
     for idx, m in enumerate(full_chain):
         is_current = m.id() == latest_id
@@ -413,28 +414,8 @@ def _auto_rebalance_zones(dry_run: bool = False) -> dict:
             overflow_mems = mems[_ZONE_SPLIT_THRESHOLD:]
             if not dry_run:
                 for m in overflow_mems:
-                    # Rewrite memory with new zone via file I/O
-                    m.frontmatter.zone = overflow_zone
-                    data = {
-                        "id": m.frontmatter.id,
-                        "created": m.frontmatter.created,
-                        "source": m.frontmatter.source,
-                        "confidence": m.frontmatter.confidence,
-                        "pinned": m.frontmatter.pinned,
-                        "tags": m.frontmatter.tags,
-                        "supersedes": m.frontmatter.supersedes,
-                        "supersedes_reason": m.frontmatter.supersedes_reason,
-                        "valid_from": m.frontmatter.valid_from,
-                        "valid_until": m.frontmatter.valid_until,
-                        "context_scope": m.frontmatter.context_scope,
-                        "zone": overflow_zone,
-                        "rank": m.frontmatter.rank,
-                    }
-                    content = _serialize_frontmatter(data, m.body)
-                    m.source_path.write_text(content, encoding="utf-8")
-                # Invalidate cache
-                mem_store._cache_valid = False
-                mem_store._index_dirty = True
+                    # Use MemoryStore.update for atomic write (beta3: was bypassing store)
+                    mem_store.update(m.id(), zone=overflow_zone)
             actions.append({
                 "action": "split",
                 "source_zone": zone,
@@ -447,26 +428,8 @@ def _auto_rebalance_zones(dry_run: bool = False) -> dict:
         elif len(mems) < _ZONE_MERGE_THRESHOLD and len(mems) > 0:
             if not dry_run:
                 for m in mems:
-                    m.frontmatter.zone = "general"
-                    data = {
-                        "id": m.frontmatter.id,
-                        "created": m.frontmatter.created,
-                        "source": m.frontmatter.source,
-                        "confidence": m.frontmatter.confidence,
-                        "pinned": m.frontmatter.pinned,
-                        "tags": m.frontmatter.tags,
-                        "supersedes": m.frontmatter.supersedes,
-                        "supersedes_reason": m.frontmatter.supersedes_reason,
-                        "valid_from": m.frontmatter.valid_from,
-                        "valid_until": m.frontmatter.valid_until,
-                        "context_scope": m.frontmatter.context_scope,
-                        "zone": "general",
-                        "rank": m.frontmatter.rank,
-                    }
-                    content = _serialize_frontmatter(data, m.body)
-                    m.source_path.write_text(content, encoding="utf-8")
-                mem_store._cache_valid = False
-                mem_store._index_dirty = True
+                    # Use MemoryStore.update for atomic write (beta3: was bypassing store)
+                    mem_store.update(m.id(), zone="general")
             actions.append({
                 "action": "merge",
                 "source_zone": zone,
@@ -1013,7 +976,8 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("pre_llm_call", _pre_llm_call)
+    ctx.register_hook("post_tool_call", _post_tool_call)
 
 
 # Hooks imported from hooks.py
-from ..hooks.lifecycle import _on_session_start, _on_session_end, _pre_llm_call  # noqa: F401
+from ..hooks.lifecycle import _on_session_start, _on_session_end, _pre_llm_call, _post_tool_call  # noqa: F401

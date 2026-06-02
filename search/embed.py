@@ -57,7 +57,7 @@ _EMBED_CACHE_MAX = 500
 def _embed_cache_key(text: str) -> str:
     """Hash text for cache key."""
     import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _get_cached_embed(text: str) -> Optional[Any]:

@@ -86,6 +86,10 @@ def _build_context_block(query=""):
 def _estimate_tokens(text):
     return _lb("_estimate_tokens")(text)
 
+
+def _reflection_mode():
+    return _lb("_reflection_mode")()
+
 def _auto_rebalance_zones():
     return _lb("_auto_rebalance_zones")()
 
@@ -200,9 +204,70 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
         # P2-22: phase failure should silently skip rather than fail the whole hook
         logger.warning("Context block build failed in pre_llm_call, skipping injection: %s", e)
         context = None
+
+    # Token budget enforcement (beta3: truncate or skip if context too large)
     if context:
+        try:
+            tok = _estimate_tokens(context)
+            # Default 2000-token budget for injected context; overridable via config
+            budget = 2000
+            try:
+                from ..core import plugin_config
+                budget = plugin_config().get("memory", {}).get("context_token_budget", 2000)
+            except Exception:
+                pass
+            if tok > budget:
+                # Hard truncate to budget (rough: 4 chars/token for ASCII)
+                trunc_len = int(budget * 3.5)
+                context = context[:trunc_len] + "\n...[context truncated]"
+                logger.debug("Context truncated from %d to ~%d tokens", tok, budget)
+        except Exception:
+            pass  # Budget check failure is non-fatal
         return {"context": context}
     return None
+
+
+def _post_tool_call(**kwargs) -> None:
+    """Hook called after a tool invocation to enrich graph with co-accessed memories.
+
+    Extracts memory IDs from tool results (search, read, recall, write)
+    and creates Hebbian associations between memories used together.
+    """
+    tool_name = kwargs.get("tool_name", "")
+    result = kwargs.get("result", "")
+    mem_ids: List[str] = []
+
+    # Only process memory-related tools
+    if not any(t in tool_name for t in ("memory", "palace", "skill")):
+        return
+
+    # Try to extract memory IDs from JSON result
+    try:
+        if isinstance(result, str):
+            result_obj = json.loads(result)
+        else:
+            result_obj = result
+        if isinstance(result_obj, dict):
+            # Direct id fields
+            if "id" in result_obj:
+                mem_ids.append(result_obj["id"])
+            # Results array
+            for key in ("results", "memories", "chain", "graph_expanded"):
+                for item in result_obj.get(key, []):
+                    if isinstance(item, dict):
+                        mid = item.get("id") or item.get("memory_id")
+                        if mid:
+                            mem_ids.append(mid)
+    except Exception:
+        return
+
+    if len(mem_ids) >= 2:
+        try:
+            gm = _get_graph_mgr()
+            if gm:
+                gm.associator.on_co_occurrence(mem_ids, context=tool_name)
+        except Exception as e:
+            logger.debug("Graph enrichment failed in post_tool_call: %s", e)
 
 
 # ---------------------------------------------------------------------------

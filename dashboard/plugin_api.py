@@ -29,7 +29,10 @@ except ImportError:
 else:
     class _ModuleProxy:
         def __getattr__(self, name: str) -> Any:
-            return _srh_dict[name]
+            try:
+                return _srh_dict[name]
+            except KeyError:
+                raise AttributeError(f"module has no attribute '{name}'")
         def __dir__(self) -> List[str]:
             return list(_srh_dict.keys())
     srh = _ModuleProxy()
@@ -175,14 +178,12 @@ async def create_memory(payload: MemoryCreate):
     gm = _get_graph_manager()
     if gm:
         try:
-            # Find memories with overlapping tags
-            all_mems = _get_store().list_active()
-            new_mem = None
-            for m in all_mems:
-                if m.body == payload.body:
-                    new_mem = m
-                    break
+            # Parse the new memory ID from tool result (beta3: was race-prone body matching)
+            result_obj = json.loads(result) if isinstance(result, str) else result
+            new_id = result_obj.get("id") if isinstance(result_obj, dict) else None
+            new_mem = _get_store().get(new_id) if new_id else None
             if new_mem:
+                all_mems = _get_store().list_active()
                 related = [m.id() for m in all_mems
                           if m.id() != new_mem.id()
                           and set(m.frontmatter.tags or []) & set(payload.tags)]
@@ -224,15 +225,15 @@ async def delete_memory(mem_id: str):
         ok = _get_store().delete("project", mem_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
-    # Clean up graph edges
+    # Clean up graph edges (beta3: wrap in transaction, fix context-manager misuse)
     gm = _get_graph_manager()
     if gm:
         try:
-            # Remove all edges connected to this memory
-            with gm.store._connect() as conn:
-                conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
-                conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
-                conn.commit()
+            conn = gm.store._connect()
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
+            conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
+            conn.commit()
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
