@@ -190,6 +190,7 @@ class GraphStore(GraphStoreProtocol):
                         (source_id, target_id, relation, w, now, now)
                     )
                 conn.commit()
+                self._invalidate_adj_cache()
             except sqlite3.Error as e:
                 logger.exception("graph_store: set_edge_weight error: %s", e)
 
@@ -230,6 +231,7 @@ class GraphStore(GraphStoreProtocol):
                         (source_id, target_id, relation, weight, now, now)
                     )
                 conn.commit()
+                self._invalidate_adj_cache()
             except sqlite3.Error as e:
                 logger.exception("graph_store: upsert_edge error %s→%s: %s", source_id, target_id, e)
 
@@ -300,22 +302,127 @@ class GraphStore(GraphStoreProtocol):
                 logger.exception("graph_store: get_neighbors error for %s: %s", memory_id, e)
                 return []
 
+    # W3.1: cached sparse adjacency for iterative spreading activation
+    _cached_adj: Optional[Dict[str, List[Tuple[str, float]]]] = None
+    _cached_adj_mtime: int = 0
+
+    def _build_adjacency(self, min_weight: float = 0.0) -> Dict[str, List[Tuple[str, float]]]:
+        """Build normalized sparse adjacency table from graph_edges.
+
+        Returns dict: node_id -> [(neighbor_id, normalized_weight), ...]
+        Weights are normalized by out-degree (row-stochastic).
+        """
+        # Cache check: only rebuild if DB mtime changed
+        try:
+            mtime = self.db_path.stat().st_mtime_ns
+        except Exception:
+            mtime = 0
+        if self._cached_adj is not None and self._cached_adj_mtime == mtime:
+            return self._cached_adj
+
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT source_id, target_id, weight FROM graph_edges WHERE weight >= ?",
+                (min_weight,)
+            ).fetchall()
+
+        # Build raw adjacency + compute out-degree sums
+        raw: Dict[str, List[Tuple[str, float]]] = {}
+        out_sum: Dict[str, float] = {}
+        for src, tgt, w in rows:
+            raw.setdefault(src, []).append((tgt, w))
+            out_sum[src] = out_sum.get(src, 0.0) + w
+
+        # Normalize by out-degree (row-stochastic)
+        adj: Dict[str, List[Tuple[str, float]]] = {}
+        for src, edges in raw.items():
+            total = out_sum.get(src, 1.0)
+            if total > 0:
+                adj[src] = [(tgt, w / total) for tgt, w in edges]
+
+        self._cached_adj = adj
+        self._cached_adj_mtime = mtime
+        return adj
+
+    def _invalidate_adj_cache(self) -> None:
+        """Call after any edge mutation to force adjacency rebuild."""
+        self._cached_adj = None
+        self._cached_adj_mtime = 0
+
+    def spread_activation(self, seed_ids: List[str],
+                          decay: float = 0.7,
+                          max_iter: int = 50,
+                          threshold: float = 1e-4,
+                          min_weight: float = 0.0) -> Dict[str, float]:
+        """Iterative fixed-point spreading activation (HeLa-Mem Sec.3.4).
+
+        Computes steady-state activation vector via power iteration:
+            A_{t+1} = decay * W^T * A_t + seeds
+        where W is the row-stochastic adjacency matrix.
+
+        Args:
+            seed_ids: initial activated memory IDs (seed vector = 1.0 each)
+            decay: damping factor per iteration (default 0.7)
+            max_iter: max iterations before forced stop
+            threshold: L1 convergence threshold
+            min_weight: minimum edge weight to include in adjacency
+
+        Returns:
+            Dict mapping memory_id -> activation score (excluding seeds)
+        """
+        if not seed_ids:
+            return {}
+
+        adj = self._build_adjacency(min_weight=min_weight)
+        if not adj:
+            return {}
+
+        # Collect all node IDs from adjacency
+        all_nodes: Set[str] = set(adj.keys())
+        for edges in adj.values():
+            for tgt, _ in edges:
+                all_nodes.add(tgt)
+
+        # Initialize activation: seeds = 1.0, others = 0.0
+        act: Dict[str, float] = {nid: 0.0 for nid in all_nodes}
+        for sid in seed_ids:
+            if sid in act:
+                act[sid] = 1.0
+
+        # Power iteration
+        for _ in range(max_iter):
+            new_act: Dict[str, float] = {nid: 0.0 for nid in all_nodes}
+            # Propagate along edges: new_act[tgt] += decay * act[src] * W[src,tgt]
+            for src, edges in adj.items():
+                src_act = act.get(src, 0.0)
+                if src_act == 0.0:
+                    continue
+                for tgt, w in edges:
+                    new_act[tgt] = new_act.get(tgt, 0.0) + decay * src_act * w
+            # Re-inject seeds
+            for sid in seed_ids:
+                if sid in new_act:
+                    new_act[sid] += 1.0
+
+            # Convergence check (L1 norm)
+            diff = sum(abs(new_act.get(nid, 0.0) - act.get(nid, 0.0)) for nid in all_nodes)
+            act = new_act
+            if diff < threshold:
+                break
+
+        # Exclude seeds from result
+        for sid in seed_ids:
+            act.pop(sid, None)
+        return act
+
     def propagate_activation(self, seed_ids: List[str], max_depth: int = 2,
                              decay_factor: float = 0.5, min_weight: float = 0.1,
                              limit: int = 10) -> List[dict]:
         """Breadth-first graph traversal from seed memories.
 
-        Returns related memories with accumulated activation scores.
-
-        Args:
-            seed_ids: starting memory IDs for traversal
-            max_depth: max traversal depth (default 2, max 5)
-            decay_factor: activation decay per depth level (0.0-1.0)
-            min_weight: minimum edge weight to traverse (0.0-1.0)
-            limit: max results to return (default 10, max 100)
-
-        Returns:
-            List of dicts with memory_id, relation, weight, activation, depth, via
+        DEPRECATED: use spread_activation() for steady-state activation.
+        Kept for backward compatibility.
         """
         if not seed_ids:
             return []
@@ -419,26 +526,25 @@ class GraphStore(GraphStoreProtocol):
                 logger.exception("graph_store: update_importance error: %s", e)
 
     def get_meta(self, memory_id: str) -> Optional[dict]:
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute(
-                "SELECT * FROM graph_memory_meta WHERE id=?", (memory_id,)
-            ).fetchone()
-            return dict(row) if row else None
+        # W3.2: reads use WAL multi-read, no lock needed
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM graph_memory_meta WHERE id=?", (memory_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def get_all_nodes(self) -> List[dict]:
         """Get all memory nodes in the graph."""
-        with self._lock:
-            try:
-                conn = self._connect()
-                rows = conn.execute(
-                    "SELECT id as memory_id, zone, importance, strength, status "
-                    "FROM graph_memory_meta WHERE status != 'archived'"
-                ).fetchall()
-                return [dict(r) for r in rows]
-            except sqlite3.Error as e:
-                logger.exception("graph_store: get_all_nodes error: %s", e)
-                return []
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT id as memory_id, zone, importance, strength, status "
+                "FROM graph_memory_meta WHERE status != 'archived'"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.exception("graph_store: get_all_nodes error: %s", e)
+            return []
 
     def add_supersedes_edge(self, old_memory_id: str, new_memory_id: str) -> None:
         """Record a SUPERSEDES relationship: new_memory supersedes old_memory.
@@ -536,29 +642,30 @@ class GraphStore(GraphStoreProtocol):
                 )
             # SUPERSEDES edges are structural, not Hebbian — never decay
             conn.commit()
+            self._invalidate_adj_cache()
 
     def stats(self) -> dict:
         """Return graph statistics with connection pool health."""
-        with self._lock:
-            try:
-                conn = self._connect()
-                edge_count = conn.execute("SELECT COUNT(*) as c FROM graph_edges").fetchone()["c"]
-                node_count = conn.execute("SELECT COUNT(*) as c FROM graph_memory_meta").fetchone()["c"]
-                avg_weight = conn.execute("SELECT AVG(weight) as a FROM graph_edges").fetchone()["a"] or 0.0
-                # Health info
-                status = conn.execute("PRAGMA journal_mode").fetchone()[0]
-                return {
-                    "node_count": node_count,
-                    "edge_count": edge_count,
-                    "avg_weight": round(avg_weight, 4),
-                    "db_path": str(self.db_path),
-                    "journal_mode": status,
-                    "healthy": True,
-                }
-            except sqlite3.Error as e:
-                logger.exception("graph_store: stats error: %s", e)
-                return {"node_count": 0, "edge_count": 0, "avg_weight": 0.0,
-                        "db_path": str(self.db_path), "healthy": False, "error": str(e)}
+        # W3.2: reads use WAL multi-read, no lock needed
+        try:
+            conn = self._connect()
+            edge_count = conn.execute("SELECT COUNT(*) as c FROM graph_edges").fetchone()["c"]
+            node_count = conn.execute("SELECT COUNT(*) as c FROM graph_memory_meta").fetchone()["c"]
+            avg_weight = conn.execute("SELECT AVG(weight) as a FROM graph_edges").fetchone()["a"] or 0.0
+            # Health info
+            status = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            return {
+                "node_count": node_count,
+                "edge_count": edge_count,
+                "avg_weight": round(avg_weight, 4),
+                "db_path": str(self.db_path),
+                "journal_mode": status,
+                "healthy": True,
+            }
+        except sqlite3.Error as e:
+            logger.exception("graph_store: stats error: %s", e)
+            return {"node_count": 0, "edge_count": 0, "avg_weight": 0.0,
+                    "db_path": str(self.db_path), "healthy": False, "error": str(e)}
 
 
 # ======================================================================
@@ -798,6 +905,13 @@ class GraphMemoryManager:
     def propagate_activation(self, seed_ids: List[str], **kwargs) -> List[dict]:
         """Compatibility wrapper exposing store activation at manager level."""
         return self.store.propagate_activation(seed_ids, **kwargs)
+
+    def spread_activation(self, seed_ids: List[str], **kwargs) -> Dict[str, float]:
+        """Iterative fixed-point spreading activation (W3.1).
+
+        Returns steady-state activation scores for non-seed nodes.
+        """
+        return self.store.spread_activation(seed_ids, **kwargs)
 
     def get_neighbors(self, memory_id: str,
                       min_weight: float = 0.1,

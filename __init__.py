@@ -384,9 +384,30 @@ class MemoryStore:
         self._ensure_cache()
         return list(self._cache["all"])
 
-    def list_active(self) -> List[LoadedMemory]:
+    def list_active(self, sort_by: Optional[str] = None,
+                    order: Literal["asc", "desc"] = "desc") -> List[LoadedMemory]:
+        """Return active memories, optionally sorted by time.
+
+        W3.4: sort_by options:
+          - None: existing order (rank-based)
+          - "created": sort by frontmatter.created
+          - "valid_from": sort by frontmatter.valid_from
+        """
         self._ensure_cache()
-        return list(self._cache["active"])
+        result = list(self._cache["active"])
+        if sort_by:
+            def _time_key(m: LoadedMemory):
+                val = getattr(m.frontmatter, sort_by, None)
+                if isinstance(val, str):
+                    try:
+                        return datetime.fromisoformat(val.replace("Z", "+00:00"))
+                    except Exception:
+                        return datetime.min.replace(tzinfo=timezone.utc)
+                elif isinstance(val, datetime):
+                    return val
+                return datetime.min.replace(tzinfo=timezone.utc)
+            result.sort(key=_time_key, reverse=(order == "desc"))
+        return result
 
     def list_pinned(self) -> List[LoadedMemory]:
         self._ensure_cache()
@@ -763,6 +784,7 @@ class MemoryStore:
                       gamma: float = 0.1,      # recency weight (W2)
                       delta: float = 0.1,      # effectiveness weight (W2)
                       hebbian_beta: float = 0.0,  # Hebbian boost coeff (W2.3, default off)
+                      hub_bonus: float = 0.05,     # PageRank hub boost (W3.3)
                       use_reranker: bool = False,  # cross-encoder rerank (W2.1)
                       include_history: bool = False) -> List[LoadedMemory]:
         """Three-layer retrieval: Recall → Fusion → Rerank (W2 academic alignment).
@@ -867,6 +889,17 @@ class MemoryStore:
                 except Exception:
                     pool[mid]["hebbian"] = 0.0
 
+        # Hub Detection (W3.3): PageRank > 0.15 gets hub_bonus
+        hub_ids: Set[str] = set()
+        if hub_bonus > 0 and has_graph:
+            try:
+                from .graph import pagerank as _pr
+                pr_scores = _pr.compute_pagerank(gm.store)
+                hub_ids = {nid for nid, score in pr_scores.items()
+                           if score > 0.15 and nid in pool}
+            except Exception:
+                pass
+
         # Weighted fusion
         fused: List[Tuple[float, LoadedMemory]] = []
         for mid, ch in pool.items():
@@ -879,7 +912,8 @@ class MemoryStore:
                 beta * ch["bm25"] +
                 gamma * ch.get("recency", 0.0) +
                 delta * ch.get("eff", 0.0) +
-                hebbian_beta * ch.get("hebbian", 0.0)
+                hebbian_beta * ch.get("hebbian", 0.0) +
+                (hub_bonus if mid in hub_ids else 0.0)
             ) * sup_factor
             fused.append((score, mem))
 
