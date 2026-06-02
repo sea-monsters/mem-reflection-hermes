@@ -1,4 +1,4 @@
-"""reflection.py — Micro and full reflection pipelines for mem-reflection-hermes.
+"""reflection/engine.py — Micro and full reflection pipelines for mem-reflection-hermes.
 Reflection log, prompts, runner, LLM-powered reflection, skill approval.
 Uses late-binding for __init__.py functions (get_mem_store, etc.).
 """
@@ -10,18 +10,21 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .core import (
+from ..core import (
     LoadedMemory, MemoryFrontmatter,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
+    user_skills_dir as _user_skills_dir,
     micro_reflection_enabled, profile_mode_enabled,
     parse_frontmatter, serialize_frontmatter,
+    _tokenise,
 )
-from .embed import (
+from ..search.embed import (
     _embed_single, _cosine_sim, _extract_keywords,
     _is_explicit_memory_intent, _is_correction, _is_procedure,
     _classify_intent,
@@ -29,12 +32,17 @@ from .embed import (
 
 logger = logging.getLogger(__name__)
 
+# Thread-safe locks for file-based operations
+_reflect_log_lock = threading.Lock()
+_pending_skills_lock = threading.Lock()
+
 __all__ = [
     "_FULL_REFLECT_SYSTEM",
     "_MICRO_REFLECT_SYSTEM",
     "_append_reflect_log",
     "_approve_skill",
     "_auto_rebalance_zones",
+    "_build_audit_entry",
     "_build_context_block",
     "_build_reflect_schema",
     "_compute_novelty_score",
@@ -93,6 +101,34 @@ def _reflection_mode() -> str:
     return _f()
 
 
+def _build_audit_entry(
+    candidate_id: str = "",
+    decision: str = "",
+    decision_reason: str = "",
+    novelty_score: float = 0.0,
+    conflict_id: str = "",
+    supersedes_ids: Optional[List[str]] = None,
+    supersedes_reason: str = "",
+    assigned_zone: str = "",
+    graph_migration: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a structured reflection audit entry for the reflect log.
+
+    decision values: accepted | rejected | conflicted | superseded | skipped
+    """
+    return {
+        "candidate_id": candidate_id,
+        "decision": decision,
+        "decision_reason": decision_reason,
+        "novelty_score": round(novelty_score, 4),
+        "conflict_id": conflict_id,
+        "supersedes_ids": supersedes_ids or [],
+        "supersedes_reason": supersedes_reason,
+        "assigned_zone": assigned_zone,
+        "graph_migration": graph_migration or {},
+    }
+
+
 # # Block 1: Reflection log
 
 # ---------------------------------------------------------------------------
@@ -101,30 +137,39 @@ def _reflection_mode() -> str:
 
 REFLECT_LOG_PATH = _plugin_data_dir() / "reflect-log.jsonl"
 _MAX_REFLECT_LOG_LINES = 5000  # P2-29: auto-rotate after this many entries
+# MED-7: approximate line count to avoid reading the full file on every append
+_reflect_log_line_count: int = 0
 
 
 def _append_reflect_log(entry: Dict[str, Any]) -> None:
+    global _reflect_log_line_count
     try:
-        REFLECT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # P2-29: auto-rotate when exceeding _MAX_REFLECT_LOG_LINES
-        if REFLECT_LOG_PATH.exists():
-            try:
-                line_count = 0
-                with open(REFLECT_LOG_PATH, "rb") as f:
-                    for _ in f:
-                        line_count += 1
-                if line_count >= _MAX_REFLECT_LOG_LINES:
-                    archive_path = REFLECT_LOG_PATH.with_suffix(
-                        f".{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.jsonl"
-                    )
-                    REFLECT_LOG_PATH.rename(archive_path)
-                    logger.debug(
-                        "Reflect log rotated to %s (%d lines archived)", archive_path, line_count
-                    )
-            except Exception:
-                pass
-        with open(REFLECT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with _reflect_log_lock:
+            REFLECT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # P2-29: auto-rotate when exceeding _MAX_REFLECT_LOG_LINES
+            if REFLECT_LOG_PATH.exists():
+                try:
+                    if _reflect_log_line_count == 0:
+                        # First call after module load: count existing lines
+                        with open(REFLECT_LOG_PATH, "rb") as f:
+                            for _ in f:
+                                _reflect_log_line_count += 1
+                    if _reflect_log_line_count >= _MAX_REFLECT_LOG_LINES:
+                        archive_path = REFLECT_LOG_PATH.with_suffix(
+                            f".{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.jsonl"
+                        )
+                        REFLECT_LOG_PATH.rename(archive_path)
+                        logger.debug(
+                            "Reflect log rotated to %s (%d lines archived)",
+                            archive_path,
+                            _reflect_log_line_count,
+                        )
+                        _reflect_log_line_count = 0
+                except Exception:
+                    pass
+            with open(REFLECT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                _reflect_log_line_count += 1
     except Exception:
         pass
 
@@ -449,7 +494,7 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
             "Reflection transcript truncated from %d to %d chars",
             len(result), _MAX_REFLECT_TRANSCRIPT_CHARS,
         )
-        result = result[-_MAX_REFLECT_TRANSCRIPT_CHARS:]
+        result = result[:_MAX_REFLECT_TRANSCRIPT_CHARS:]
     return result
 
 
@@ -521,21 +566,36 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.warning("Reflection produced no parsed output")
         return {"error": "No parsed output"}
 
-    # Log the reflection outcome
-    _append_reflect_log({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mode": "full_llm",
-        "summary": parsed.get("summary", ""),
-        "skill_candidates": len(parsed.get("skill_candidates", [])),
-        "memory_candidates": len(parsed.get("memory_candidates", [])),
-        "conflicts": len(parsed.get("conflicts", [])),
-        "raw": result.text,
-    })
-
-    # Store memory candidates automatically (they're conservative)
+    # Collect audit entries for each memory candidate
+    audit_entries: List[Dict[str, Any]] = []
     mem_store = _get_mem_store()
     accepted_memories = []
+
     for cand in parsed.get("memory_candidates", []):
+        body = cand.get("fact", "")
+        scope = cand.get("scope", "user")
+        cand_id = f"cand_{uuid.uuid4().hex[:12]}"
+        novelty = 0.0
+        try:
+            novelty = _compute_novelty_score(body, mem_store.list_active())
+        except Exception:
+            pass
+
+        # Conflict check
+        conflict = mem_store.check_conflict(body)
+        if conflict:
+            existing_id, score = conflict
+            logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="skipped",
+                decision_reason=f"conflict with existing memory {existing_id} (score {score:.2f})",
+                novelty_score=novelty,
+                conflict_id=existing_id,
+                assigned_zone=cand.get("zone", "episode"),
+            ))
+            continue
+
         try:
             fm = MemoryFrontmatter.new(
                 source="reflection",
@@ -544,24 +604,55 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
-            # Conflict check
-            conflict = mem_store.check_conflict(body)
-            if conflict:
-                existing_id, score = conflict
-                logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
-                continue
+            supersedes_reason = cand.get("supersedes_reason", "")
+            if not supersedes_reason and fm.supersedes:
+                supersedes_reason = "LLM suggested replacement"
+            fm.supersedes_reason = supersedes_reason
             path = mem_store.put(scope, fm, body)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="accepted" if not fm.supersedes else "superseded",
+                decision_reason="novelty sufficient, no conflict" if not fm.supersedes else f"supersedes {fm.supersedes}",
+                novelty_score=novelty,
+                supersedes_ids=fm.supersedes or [],
+                supersedes_reason=supersedes_reason,
+                assigned_zone="episode",
+            ))
         except Exception as e:
             logger.warning("Failed to store memory candidate: %s", e)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            ))
 
     # Log skill candidates (require manual approval)
     skill_candidates = parsed.get("skill_candidates", [])
+    for sk in skill_candidates:
+        audit_entries.append(_build_audit_entry(
+            candidate_id=f"skill_{uuid.uuid4().hex[:12]}",
+            decision="pending",
+            decision_reason="skill candidates require manual approval",
+            assigned_zone="skill",
+        ))
+
+    # Log the reflection outcome with audit trail
+    _append_reflect_log({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "full_llm",
+        "summary": parsed.get("summary", ""),
+        "skill_candidates": len(skill_candidates),
+        "memory_candidates": len(parsed.get("memory_candidates", [])),
+        "conflicts": len(parsed.get("conflicts", [])),
+        "audit_entries": audit_entries,
+        "raw": result.text,
+    })
+
     if skill_candidates:
         logger.info("Reflection produced %d skill candidates (manual approval required)", len(skill_candidates))
-        # Save pending skill candidates for user approval
         _save_pending_skill_candidates(skill_candidates)
 
     logger.info(
@@ -618,7 +709,31 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
     # Store at most 1 memory from micro-reflection (auto-accepted for micro)
     mem_store = _get_mem_store()
     accepted = None
+    audit_entries: List[Dict[str, Any]] = []
+
     for cand in parsed.get("memory_candidates", [])[:1]:
+        body = cand.get("fact", "")
+        scope = cand.get("scope", "user")
+        cand_id = f"cand_{uuid.uuid4().hex[:12]}"
+        novelty = 0.0
+        try:
+            novelty = _compute_novelty_score(body, mem_store.list_active())
+        except Exception:
+            pass
+
+        conflict = mem_store.check_conflict(body)
+        if conflict:
+            existing_id, score = conflict
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="skipped",
+                decision_reason=f"conflict with {existing_id} (score {score:.2f})",
+                novelty_score=novelty,
+                conflict_id=existing_id,
+                assigned_zone=cand.get("zone", "episode"),
+            ))
+            continue
+
         try:
             fm = MemoryFrontmatter.new(
                 source="micro_reflection",
@@ -626,22 +741,33 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
                 tags=cand.get("tags", []),
             )
             fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
-            conflict = mem_store.check_conflict(body)
-            if conflict:
-                continue
             path = mem_store.put(scope, fm, body)
             accepted = {"id": fm.id, "body": body, "path": str(path)}
-        except Exception:
-            pass
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="accepted" if not fm.supersedes else "superseded",
+                decision_reason="micro-reflection auto-accepted",
+                novelty_score=novelty,
+                supersedes_ids=fm.supersedes or [],
+                supersedes_reason=cand.get("supersedes_reason", "LLM suggested replacement"),
+                assigned_zone="episode",
+            ))
+        except Exception as e:
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            ))
 
-    if accepted:
+    if accepted or audit_entries:
         _append_reflect_log({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "mode": "micro_llm",
             "summary": parsed.get("summary", ""),
             "accepted_memory": accepted,
+            "audit_entries": audit_entries,
         })
 
     return parsed
@@ -660,27 +786,29 @@ _MAX_PENDING_SKILLS = 200  # P2-27: max pending items before archive
 def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
     """Save skill candidates to pending approval file."""
     try:
-        PENDING_SKILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing = []
-        if PENDING_SKILLS_PATH.exists():
-            with open(PENDING_SKILLS_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        # P2-27: archive old pending skills when too many accumulated
-        if len(existing) > _MAX_PENDING_SKILLS:
-            archive_path = PENDING_SKILLS_PATH.with_suffix(
-                f".{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
-            )
-            PENDING_SKILLS_PATH.rename(archive_path)
+        with _pending_skills_lock:
+            PENDING_SKILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
             existing = []
-            logger.info("Pending skills archived to %s (%d items)", archive_path, len(existing))
-        # Add timestamp and unique id to each candidate
-        for cand in candidates:
-            cand["_pending_id"] = f"pending_{uuid.uuid4().hex[:12]}"
-            cand["_submitted_at"] = datetime.now(timezone.utc).isoformat()
-            cand["_status"] = "pending"
-        existing.extend(candidates)
-        with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
+            if PENDING_SKILLS_PATH.exists():
+                with open(PENDING_SKILLS_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            # P2-27: archive old pending skills when too many accumulated
+            if len(existing) > _MAX_PENDING_SKILLS:
+                archive_count = len(existing)
+                archive_path = PENDING_SKILLS_PATH.with_suffix(
+                    f".{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+                )
+                PENDING_SKILLS_PATH.rename(archive_path)
+                existing = []
+                logger.info("Pending skills archived to %s (%d items)", archive_path, archive_count)
+            # Add timestamp and unique id to each candidate
+            for cand in candidates:
+                cand["_pending_id"] = f"pending_{uuid.uuid4().hex[:12]}"
+                cand["_submitted_at"] = datetime.now(timezone.utc).isoformat()
+                cand["_status"] = "pending"
+            existing.extend(candidates)
+            with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Failed to save pending skill candidates: %s", e)
 
@@ -735,7 +863,7 @@ def _approve_skill(pending_id: str) -> Optional[Dict[str, Any]]:
                     "license": "MIT",
                 }
                 body = cand.get("body", "")
-                skill_md = _serialize_frontmatter(fm_data, body)
+                skill_md = serialize_frontmatter(fm_data, body)
                 (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
 
                 _update_pending_skill_status(pending_id, "approved", "User approved via UI")
@@ -888,13 +1016,16 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
                 })
 
     # Heuristic 3: Preference statements
+    # HIGH-9: use restrictive char classes instead of `.` to avoid capturing
+    # trailing punctuation / half-sentences. Stop at sentence boundaries.
+    _NOT_SENTENCE_END = r"[^\n。！？.!?]"
     pref_patterns = [
-        r"(?:我|i)\s+(?:喜欢|prefer|like|want|想|要)\s+(.{5,80})",
-        r"(?:我|i)\s+(?:不喜欢|hate|dislike|不想)\s+(.{5,80})",
-        r"(?:我|i)\s+(?:总是|always|usually|never)\s+(.{5,80})",
-        r"(?:用|use)\s+(.{3,40})\s+(?:因为|because)",
+        (r"(?:我|i)\s+(?:喜欢|prefer|like|want|想|要)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
+        (r"(?:我|i)\s+(?:不喜欢|hate|dislike|不想)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
+        (r"(?:我|i)\s+(?:总是|always|usually|never)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
+        (r"(?:用|use)\s+(" + _NOT_SENTENCE_END + r"{3,40})\s+(?:因为|because)", "preference"),
     ]
-    for pat in pref_patterns:
+    for pat, source in pref_patterns:
         for m in re.finditer(pat, combined, re.IGNORECASE):
             text = m.group(0).strip()
             if len(text) > 10:
@@ -902,7 +1033,7 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
                     "text": text,
                     "confidence": "medium",
                     "rationale": "Detected preference statement",
-                    "source": "preference",
+                    "source": source,
                 })
 
     # Heuristic 4: Convention / config statements
@@ -996,13 +1127,22 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # Extract facts
     facts = _extract_facts_from_turn(full_user, full_assistant)
+    audit_entries: List[Dict[str, Any]] = []
 
     for fact in facts:
         text = fact["text"]
+        cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         # Check novelty
         novelty = _compute_novelty_score(text, active_memories)
         if novelty < 0.3:
             logger.debug("Fact too similar to existing memory (novelty %.3f), skipping: %s", novelty, text[:60])
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="skipped",
+                decision_reason=f"novelty too low ({novelty:.3f} < 0.3)",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            ))
             continue
 
         # Check for conflicts
@@ -1027,9 +1167,27 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "rationale": fact["rationale"],
                     "supersedes": [mem.id()],
                 })
+                audit_entries.append(_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="superseded",
+                    decision_reason=f"user corrected previous info; similarity {sim:.2f}",
+                    novelty_score=novelty,
+                    conflict_id=mem.id(),
+                    supersedes_ids=[mem.id()],
+                    supersedes_reason="user correction",
+                    assigned_zone="episode",
+                ))
             else:
                 # Just similar, not necessarily conflicting - skip to avoid duplication
                 logger.debug("Similar to existing memory %s (%.3f), skipping", mem.id(), sim)
+                audit_entries.append(_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="skipped",
+                    decision_reason=f"similar to {mem.id()} (sim {sim:.2f}) without explicit correction",
+                    novelty_score=novelty,
+                    conflict_id=mem.id(),
+                    assigned_zone="episode",
+                ))
                 continue
         else:
             memory_candidates.append({
@@ -1040,21 +1198,35 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "rationale": fact["rationale"],
                 "supersedes": [],
             })
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="pending_storage",
+                decision_reason="novelty sufficient, no conflict",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            ))
 
     # Also check if the overall session contains novel concepts not captured by explicit facts
     if session_novelty > 0.5 and len(memory_candidates) == 0:
         # Generate a summary memory from the session
-        summary = _generate_session_summary(transcript)
-        if summary and len(summary) > 20:
-            tags = _extract_keywords(summary, top_k=3)
+        summary_text = _generate_session_summary(transcript)
+        if summary_text and len(summary_text) > 20:
+            tags = _extract_keywords(summary_text, top_k=3)
             memory_candidates.append({
-                "fact": summary,
+                "fact": summary_text,
                 "tags": tags,
                 "scope": "user",
                 "confidence": "low",
                 "rationale": "Session contained novel concepts not matching existing memories",
                 "supersedes": [],
             })
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
+                decision="pending_storage",
+                decision_reason="session novelty high but no explicit facts extracted",
+                novelty_score=session_novelty,
+                assigned_zone="episode",
+            ))
 
     # Skill detection: look for reusable procedures
     skill_candidates = []
@@ -1074,16 +1246,25 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             name = _generate_skill_name(full_assistant)
             skill_candidates.append({
                 "name": name,
-                "description": f"Procedure extracted from session: {summary[:80] if summary else 'multi-step workflow'}",
+                "description": f"Procedure extracted from session: {summary_text[:80] if summary_text else 'multi-step workflow'}",
                 "triggers": tags[:3] if tags else ["procedure"],
                 "body": f"## {name}\n\n{full_assistant[:800]}",
                 "rationale": "Assistant provided a multi-step procedure that may be reusable",
                 "confidence": "low",
             })
+            audit_entries.append(_build_audit_entry(
+                candidate_id=f"skill_{uuid.uuid4().hex[:12]}",
+                decision="pending",
+                decision_reason="skill candidate detected, manual approval required",
+                assigned_zone="skill",
+            ))
 
     # Store memory candidates
     accepted_memories = []
     for cand in memory_candidates:
+        cand_id = f"cand_{uuid.uuid4().hex[:12]}"
+        body = cand["fact"]
+        scope = cand.get("scope", "user")
         try:
             fm = MemoryFrontmatter.new(
                 source="reflection",
@@ -1092,18 +1273,47 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 zone="episode",
             )
             fm.supersedes = cand.get("supersedes", [])
-            scope = cand.get("scope", "user")
-            body = cand["fact"]
             # Final conflict check
             conflict = mem_store.check_conflict(body)
             if conflict:
                 existing_id, score = conflict
                 logger.info("Embedding reflection: memory conflicts with %s (%.2f), skipping", existing_id, score)
+                audit_entries.append(_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="skipped",
+                    decision_reason=f"late conflict with {existing_id} (score {score:.2f})",
+                    conflict_id=existing_id,
+                    supersedes_ids=fm.supersedes or [],
+                    assigned_zone="episode",
+                ))
                 continue
             path = mem_store.put(scope, fm, body)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
+            # Update the matching pending_storage audit entry if present
+            updated = False
+            for ae in audit_entries:
+                if ae.get("decision") == "pending_storage" and ae.get("assigned_zone") == "episode":
+                    ae["decision"] = "accepted" if not fm.supersedes else "superseded"
+                    ae["decision_reason"] = "stored successfully" if not fm.supersedes else f"stored and superseded {fm.supersedes}"
+                    ae["supersedes_ids"] = fm.supersedes or []
+                    updated = True
+                    break
+            if not updated:
+                audit_entries.append(_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="accepted" if not fm.supersedes else "superseded",
+                    decision_reason="stored successfully",
+                    supersedes_ids=fm.supersedes or [],
+                    assigned_zone="episode",
+                ))
         except Exception as e:
             logger.warning("Failed to store embedding reflection memory: %s", e)
+            audit_entries.append(_build_audit_entry(
+                candidate_id=cand_id,
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                assigned_zone="episode",
+            ))
 
     # Save skill candidates for approval
     if skill_candidates:
@@ -1122,6 +1332,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "accepted_memories": len(accepted_memories),
         "conflicts": len(conflicts),
         "novelty": session_novelty,
+        "audit_entries": audit_entries,
     })
 
     logger.info(
@@ -1146,6 +1357,7 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
     active_memories = mem_store.list_active()
 
     combined = f"{user_msg} {assistant_msg}"
+    cand_id = f"cand_{uuid.uuid4().hex[:12]}"
 
     # Extract facts first - if user has explicit intent, always process
     facts = _extract_facts_from_turn(user_msg, assistant_msg)
@@ -1155,6 +1367,18 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
     novelty = _compute_novelty_score(combined, active_memories)
     if not has_explicit_intent and novelty < 0.25:
         logger.debug("Micro-reflection: turn too similar to existing memories (%.3f), skipping", novelty)
+        _append_reflect_log({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "embedding_micro",
+            "summary": "Micro-reflection skipped: turn too similar",
+            "audit_entries": [_build_audit_entry(
+                candidate_id=cand_id,
+                decision="skipped",
+                decision_reason=f"novelty too low ({novelty:.3f} < 0.25) without explicit intent",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            )],
+        })
         return None
 
     if not facts:
@@ -1168,6 +1392,18 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
                 "source": "novelty",
             }]
         else:
+            _append_reflect_log({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mode": "embedding_micro",
+                "summary": "Micro-reflection skipped: no facts detected",
+                "audit_entries": [_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="skipped",
+                    decision_reason="no heuristic facts and novelty not high enough",
+                    novelty_score=novelty,
+                    assigned_zone="episode",
+                )],
+            })
             return None
 
     # Only take the highest-confidence fact
@@ -1188,6 +1424,19 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             supersedes = [mem.id()]
         else:
             logger.debug("Micro-reflection: similar to %s (%.3f), skipping", mem.id(), sim)
+            _append_reflect_log({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mode": "embedding_micro",
+                "summary": f"Micro-reflection skipped: similar to {mem.id()}",
+                "audit_entries": [_build_audit_entry(
+                    candidate_id=cand_id,
+                    decision="skipped",
+                    decision_reason=f"similar to {mem.id()} (sim {sim:.2f}) without correction or explicit intent",
+                    novelty_score=novelty,
+                    conflict_id=mem.id(),
+                    assigned_zone="episode",
+                )],
+            })
             return None
 
     try:
@@ -1207,6 +1456,15 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             "summary": f"Micro-reflection accepted: {best['text'][:60]}",
             "accepted_memory": accepted,
             "novelty": novelty,
+            "audit_entries": [_build_audit_entry(
+                candidate_id=cand_id,
+                decision="accepted" if not supersedes else "superseded",
+                decision_reason="micro-reflection auto-accepted" if not supersedes else f"supersedes {supersedes}",
+                novelty_score=novelty,
+                supersedes_ids=supersedes,
+                supersedes_reason="user correction" if _is_correction(user_msg) else "explicit intent update",
+                assigned_zone="episode",
+            )],
         })
 
         return {
@@ -1217,6 +1475,18 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
         }
     except Exception as e:
         logger.debug("Micro-reflection storage failed: %s", e)
+        _append_reflect_log({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "embedding_micro",
+            "summary": "Micro-reflection storage failed",
+            "audit_entries": [_build_audit_entry(
+                candidate_id=cand_id,
+                decision="rejected",
+                decision_reason=f"storage error: {e}",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            )],
+        })
         return None
 
 

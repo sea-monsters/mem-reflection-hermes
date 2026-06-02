@@ -1,6 +1,6 @@
 name: mem-reflection-hermes
-version: 0.9.2-beta
-description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, ahe_graph graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache. v0.8: 6-module architecture. v0.9: CLUQI cross-layer query, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis. v0.9.2: Dashboard full ahe_graph integration with Hebbian edges, node click highlighting, zone bridge visualization, CLUQI search UI."
+version: 0.9.2-beta2
+description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 16 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, ahe_graph graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache. v0.8: 6-module architecture. v0.9: CLUQI cross-layer query, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis. v0.9.2: Dashboard full ahe_graph integration with Hebbian edges, node click highlighting, zone bridge visualization, CLUQI search UI."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:
   - srh_memory_search
@@ -19,6 +19,7 @@ provides_tools:
   - srh_graph_retrieve
   - srh_graph_stats
   - srh_graph_viz
+  - srh_memory_health
 provides_hooks:
   - on_session_start
   - on_session_end

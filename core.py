@@ -204,8 +204,30 @@ class MemoryFrontmatter:
     pinned: bool = False
     tags: List[str] = field(default_factory=list)
     supersedes: List[str] = field(default_factory=list)
+    supersedes_reason: Optional[str] = None
+    valid_from: Optional[str] = None
+    valid_until: Optional[str] = None
+    context_scope: Optional[str] = None
     zone: str = "general"
     rank: int = 0
+
+    @classmethod
+    def new(
+        cls,
+        source: str,
+        confidence: str = "medium",
+        tags: Optional[List[str]] = None,
+        zone: Optional[str] = None,
+    ) -> "MemoryFrontmatter":
+        """Create frontmatter for a new memory with the current timestamp."""
+        return cls(
+            id=str(uuid.uuid4()),
+            created=datetime.now(timezone.utc).isoformat(),
+            source=source,
+            confidence=confidence,
+            tags=list(tags or []),
+            zone=normalize_zone(zone),
+        )
 
 
 @dataclass
@@ -279,71 +301,108 @@ class LoadedSkill:
 def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from a memory file.
 
-    Note (P2-3): Uses manual re.search instead of pyyaml to avoid the
-    dependency. Only supports simple key-value pairs and lists. Does NOT
-    support multi-line strings, nested lists, or special YAML escapes.
-
-    Uses msgspec for fast YAML parsing if available (8x faster than PyYAML),
-    with fallback to PyYAML for edge cases.
+    The parser supports full YAML frontmatter when a YAML backend is
+    available, including nested mappings, nested lists, and multiline values.
+    Unknown keys are preserved in the returned dict.
     """
     s = text.strip()
     if s.startswith("\ufeff"):
         s = s[1:]
     if not s.startswith("---"):
         return {}, text
-    after_open = s[3:].lstrip("-\n")
-    close_idx = after_open.find("\n---")
-    if close_idx == -1:
-        return {}, raw
-    yaml_part = after_open[:close_idx]
-    body_part = after_open[close_idx + 4:].lstrip("-\n")
+    lines = s.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    yaml_lines: List[str] = []
+    body_start = None
+    for idx, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            body_start = idx + 1
+            break
+        yaml_lines.append(line)
+
+    if body_start is None:
+        return {}, text
+
+    yaml_part = "".join(yaml_lines)
+    body_part = "".join(lines[body_start:])
+    data = _load_frontmatter_yaml(yaml_part)
+    if not isinstance(data, dict):
+        return {}, text
+    data = dict(data)
+    data.setdefault("id", "")
+    data.setdefault("created", "")
+    data.setdefault("source", "conversation")
+    data.setdefault("confidence", "medium")
+    data.setdefault("pinned", False)
+    data.setdefault("tags", [])
+    data.setdefault("supersedes", [])
+    data.setdefault("supersedes_reason", None)
+    data.setdefault("valid_from", None)
+    data.setdefault("valid_until", None)
+    data.setdefault("context_scope", None)
+    data.setdefault("zone", "general")
+    data.setdefault("always_active", False)
+    data.setdefault("rank", 0)
+    return data, body_part.strip()
+
+
+def _load_frontmatter_yaml(yaml_part: str) -> Dict[str, Any]:
+    """Load YAML frontmatter into a dict, preserving nested structures."""
     try:
         import msgspec
-        class _FrontmatterStruct(msgspec.Struct):
-            id: str = ""
-            created: str = ""
-            source: str = "conversation"
-            confidence: str = "medium"
-            pinned: bool = False
-            tags: List[str] = []
-            supersedes: List[str] = []
-            zone: str = "general"
-            always_active: bool = False
-            rank: int = 0
-        decoded = msgspec.yaml.decode(yaml_part, type=_FrontmatterStruct)
-        data: Dict[str, Any] = {
-            "id": decoded.id,
-            "created": decoded.created,
-            "source": decoded.source,
-            "confidence": decoded.confidence,
-            "pinned": decoded.pinned,
-            "tags": decoded.tags,
-            "supersedes": decoded.supersedes,
-            "zone": decoded.zone,
-            "always_active": decoded.always_active,
-            "rank": decoded.rank,
-        }
-        return data, body_part.strip()
+        decoded = msgspec.yaml.decode(yaml_part)
+        if isinstance(decoded, dict):
+            return dict(decoded)
     except Exception:
         pass
     try:
         import yaml
         data = yaml.safe_load(yaml_part) or {}
-        if not isinstance(data, dict):
-            return {}, raw
-        data.setdefault("id", "")
-        data.setdefault("created", "")
-        data.setdefault("source", "conversation")
-        data.setdefault("confidence", "medium")
-        data.setdefault("pinned", False)
-        data.setdefault("tags", [])
-        data.setdefault("supersedes", [])
-        data.setdefault("zone", "general")
-        data.setdefault("always_active", False)
-        data.setdefault("rank", 0)
-        return data, body_part.strip()
+        if isinstance(data, dict):
+            return dict(data)
     except Exception:
-        return {}, raw
+        pass
+    # Dependency-free fallback: parse simple key-value YAML used by Hermes memories
+    data: Dict[str, Any] = {}
+    current_list_key: Optional[str] = None
+    for line in yaml_part.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- ") and current_list_key is not None:
+            item = stripped[2:].strip()
+            lst = data.setdefault(current_list_key, [])
+            if isinstance(lst, list):
+                lst.append(item)
+            continue
+        if ":" in stripped:
+            key, _, raw_val = stripped.partition(":")
+            key = key.strip()
+            val = raw_val.strip()
+            current_list_key = None
+            if val == "":
+                # Could be the start of a list block
+                current_list_key = key
+                continue
+            # Boolean and None parsing
+            if val.lower() == "true":
+                data[key] = True
+            elif val.lower() == "false":
+                data[key] = False
+            elif val.lower() == "null" or val.lower() == "~":
+                data[key] = None
+            else:
+                # Try number parsing
+                try:
+                    if "." in val:
+                        data[key] = float(val)
+                    else:
+                        data[key] = int(val)
+                except (ValueError, TypeError):
+                    data[key] = val
+    return data
 
 
 def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
@@ -369,6 +428,10 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
         buf.append("supersedes:")
         for s in supersedes:
             buf.append(f"  - {s}")
+    for key in ("supersedes_reason", "valid_from", "valid_until", "context_scope"):
+        val = data.get(key)
+        if val is not None:
+            buf.append(f"{key}: {val}")
     if data.get("always_active"):
         buf.append("always_active: true")
     rank = data.get("rank")
@@ -394,6 +457,10 @@ def read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
             pinned=bool(data.get("pinned", False)),
             tags=data.get("tags", []),
             supersedes=data.get("supersedes", []),
+            supersedes_reason=data.get("supersedes_reason"),
+            valid_from=data.get("valid_from"),
+            valid_until=data.get("valid_until"),
+            context_scope=data.get("context_scope"),
             zone=normalize_zone(data.get("zone", "general")),
             rank=int(data.get("rank", 0)),
         )
@@ -409,6 +476,7 @@ def read_memory(path: Path, scope: str) -> Optional[LoadedMemory]:
 
 # P1-2: Background stat writer
 _stat_queue: "queue.Queue[List[Tuple[str, str]]]" = queue.Queue(maxsize=500)
+_stat_write_lock = threading.Lock()
 
 
 def _stat_flush_worker() -> None:
@@ -443,37 +511,80 @@ def _stats_path() -> Path:
     return plugin_data_dir() / "memory-stats.jsonl"
 
 
+def _append_stat_entries(entries: List[Tuple[str, str]]) -> None:
+    """Append memory stat entries synchronously so cache refresh is immediate."""
+    now = datetime.now(timezone.utc).isoformat()
+    sp = _stats_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    with _stat_write_lock:
+        with open(sp, "a", encoding="utf-8") as f:
+            for memory_id, event in entries:
+                f.write(json.dumps({
+                    "memory_id": memory_id,
+                    "event": event,
+                    "at": now,
+                }, ensure_ascii=False) + "\n")
+
+
 def record_memory_stat(memory_id: str, event: str) -> None:
-    """Append a memory stat entry to stats.jsonl. Best-effort."""
-    batch_record_stats([(memory_id, event)])
+    """Append a memory stat entry to stats.jsonl synchronously."""
+    try:
+        _append_stat_entries([(memory_id, event)])
+    except Exception:
+        logger.debug("Failed to record memory stat for %s", memory_id)
 
 
 def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
-    """Append multiple stat entries. Uses bounded queue (maxsize=500).
-    Falls back to synchronous write when queue is full."""
+    """Append multiple stat entries synchronously."""
     try:
-        _stat_queue.put_nowait(entries)
-    except queue.Full:
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            sp = _stats_path()
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            with open(sp, "a", encoding="utf-8") as f:
-                for memory_id, event in entries:
-                    f.write(json.dumps({
-                        "memory_id": memory_id,
-                        "event": event,
-                        "at": now,
-                    }, ensure_ascii=False) + "\n")
-        except Exception:
-            logger.debug("Stat sync fallback write failed")
+        _append_stat_entries(entries)
+    except Exception:
+        logger.debug("Stat sync write failed")
 
 
 import atexit as _atexit
 
 # P2-2: Async file writer
-_write_queue: "queue.Queue[Tuple[Path, str]]" = queue.Queue(maxsize=500)
+_write_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue(maxsize=500)
 _pending_writes: Set[Path] = set()
+_write_guard_lock = threading.Lock()
+_write_path_locks: Dict[str, threading.RLock] = {}
+_write_generations: Dict[str, int] = {}
+
+
+def _write_path_key(path: Path) -> str:
+    return str(path.resolve(strict=False))
+
+
+def _write_path_lock(path: Path) -> threading.RLock:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        lock = _write_path_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _write_path_locks[key] = lock
+        return lock
+
+
+def _reserve_write_generation(path: Path) -> int:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        token = _write_generations.get(key, 0) + 1
+        _write_generations[key] = token
+        return token
+
+
+def _is_current_write_generation(path: Path, token: int) -> bool:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        return _write_generations.get(key, 0) == token
+
+
+def _cancel_pending_write(path: Path) -> None:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        _write_generations[key] = _write_generations.get(key, 0) + 1
+        _pending_writes.discard(path)
 
 
 def _safe_write(path: Path, content: str) -> None:
@@ -490,6 +601,31 @@ def _safe_write(path: Path, content: str) -> None:
         os.fsync(f.fileno())
 
 
+def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
+    """Convert frontmatter to a serializable dict without dropping optional fields."""
+    return {
+        "id": fm.id,
+        "created": fm.created,
+        "source": fm.source,
+        "confidence": fm.confidence,
+        "pinned": fm.pinned,
+        "tags": fm.tags,
+        "supersedes": fm.supersedes,
+        "supersedes_reason": fm.supersedes_reason,
+        "valid_from": fm.valid_from,
+        "valid_until": fm.valid_until,
+        "context_scope": fm.context_scope,
+        "zone": fm.zone,
+        "rank": fm.rank,
+    }
+
+
+def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
+    """Synchronous memory write (used by update/reorder)."""
+    content = serialize_frontmatter(_frontmatter_to_data(fm), body)
+    _safe_write(path, content)
+
+
 def _file_flush_worker() -> None:
     """Drain write queue in background, writing files to disk."""
     while True:
@@ -499,9 +635,12 @@ def _file_flush_worker() -> None:
             continue
         if item is None:
             break
-        path, content = item
+        path, content, token = item
         try:
-            _safe_write(path, content)
+            with _write_path_lock(path):
+                if not _is_current_write_generation(path, token):
+                    continue
+                _safe_write(path, content)
         except Exception:
             logger.debug("Async write failed for %s", path)
         finally:
@@ -516,25 +655,17 @@ def async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
     """Submit memory file write to background thread.
     Uses bounded queue (maxsize=500). Falls back to sync write when queue is full.
     """
-    data = {
-        "id": fm.id,
-        "created": fm.created,
-        "source": fm.source,
-        "confidence": fm.confidence,
-        "pinned": fm.pinned,
-        "tags": fm.tags,
-        "supersedes": fm.supersedes,
-        "zone": fm.zone,
-        "rank": fm.rank,
-    }
-    content = serialize_frontmatter(data, body)
+    content = serialize_frontmatter(_frontmatter_to_data(fm), body)
+    token = _reserve_write_generation(path)
     _pending_writes.add(path)
     try:
-        _write_queue.put_nowait((path, content))
+        _write_queue.put_nowait((path, content, token))
     except queue.Full:
         _pending_writes.discard(path)
         try:
-            _safe_write(path, content)
+            with _write_path_lock(path):
+                if _is_current_write_generation(path, token):
+                    _safe_write(path, content)
         except Exception as e:
             logger.warning("Sync write fallback failed for %s: %s", path, e)
 
@@ -692,7 +823,7 @@ def _memory_tokens(memory: LoadedMemory) -> Counter:
     unexpected tokens like ["gpt", "4", "模型"] rather than ["gpt-4模型"].
     Future improvement: apply CJK n-gram post-processing.
     """
-    return _tokenise(m.body)
+    return _tokenise(memory.body + " " + " ".join(memory.frontmatter.tags or []))
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +848,7 @@ def _bm25_search_scored(memories: List[LoadedMemory], query: str, k: int = 5,
     k1, b = 1.5, 0.75
     if k == 0 or not memories:
         return []
-    q_tokens = tokenise(query)
+    q_tokens = _tokenise(query)
     if not q_tokens:
         return []
     n = len(memories)
@@ -789,3 +920,132 @@ def _cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
+# Lineage helpers (WS-1 / WS-2)
+# ---------------------------------------------------------------------------
+
+def _lineage_latest(store, mem_id: str) -> Optional[str]:
+    """Return the latest memory ID in the supersedes chain starting at mem_id.
+
+    Walks forward through supersedes links (memories that supersede the given
+    one) until no successor is found.
+    """
+    current = mem_id
+    visited: Set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        successor = None
+        for m in store.list():
+            if current in (m.frontmatter.supersedes or []):
+                successor = m.id()
+                break
+        if successor is None:
+            break
+        current = successor
+    return current if current != mem_id else None
+
+
+def _lineage_root(store, mem_id: str) -> str:
+    """Return the root (first) memory ID in the supersedes chain.
+
+    Walks backward through supersedes links. If no parent, mem_id is its own root.
+    """
+    current = mem_id
+    visited: Set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        m = store.get(current)
+        if m is None or not m.frontmatter.supersedes:
+            break
+        current = m.frontmatter.supersedes[0]
+    return current
+
+
+def _lineage_depth(store, mem_id: str, visited: Optional[Set[str]] = None) -> int:
+    """Depth of mem_id in its supersedes chain (0 = root, never superseded)."""
+    if visited is None:
+        visited = set()
+    if mem_id in visited:
+        return 0
+    visited.add(mem_id)
+    m = store.get(mem_id)
+    if m is None or not m.frontmatter.supersedes:
+        return 0
+    parent = m.frontmatter.supersedes[0]
+    return 1 + _lineage_depth(store, parent, visited)
+
+
+def _lineage_cycle_check(store, mem_id: str) -> Optional[List[str]]:
+    """Detect a cycle in the supersedes chain starting at mem_id.
+
+    Returns the cycle path (list of IDs) if a cycle exists, otherwise None.
+    """
+    path: List[str] = []
+    current = mem_id
+    while current is not None:
+        if current in path:
+            cycle_start = path.index(current)
+            return path[cycle_start:] + [current]
+        path.append(current)
+        m = store.get(current)
+        if m is None or not m.frontmatter.supersedes:
+            break
+        current = m.frontmatter.supersedes[0]
+    return None
+
+
+def _classify_update_intent(old_body: str, new_body: str) -> str:
+    """Classify the semantic relationship between an old and new memory.
+
+    Returns one of: replacement, correction, elaboration, scoped_exception,
+    historical_episode.
+
+    This is a lightweight heuristic; the reflection pipeline can override it
+    with explicit supersedes_reason.
+    """
+    old_lower = old_body.lower()
+    new_lower = new_body.lower()
+
+    # Correction markers
+    correction_markers = ["actually", "wrong", "incorrect", "not anymore", "no longer", "changed", "updated"]
+    if any(m in new_lower for m in correction_markers):
+        return "correction"
+
+    # Scoped exception markers
+    if "except" in new_lower or "unless" in new_lower or "but for" in new_lower:
+        return "scoped_exception"
+
+    # Historical episode markers
+    if any(m in new_lower for m in ["on monday", "on tuesday", "yesterday", "last week", "then"]):
+        if any(m in old_lower for m in ["on monday", "on tuesday", "yesterday", "last week", "then"]):
+            return "historical_episode"
+
+    # Elaboration: new significantly longer and contains old
+    if len(new_body) > len(old_body) * 1.3 and old_lower in new_lower:
+        return "elaboration"
+
+    return "replacement"
+
+
+def _is_expired(fm: MemoryFrontmatter, now: Optional[datetime] = None) -> bool:
+    """Check if a memory's valid_until date has passed."""
+    if fm.valid_until is None:
+        return False
+    try:
+        until_dt = datetime.fromisoformat(fm.valid_until)
+        now_dt = now or datetime.now(timezone.utc)
+        return now_dt > until_dt
+    except Exception:
+        return False
+
+
+def _is_context_mismatch(fm: MemoryFrontmatter, current_scope: Optional[str] = None) -> bool:
+    """Check if a memory's context_scope does not match current scope.
+
+    Returns False if context_scope is None or matches current_scope.
+    """
+    if fm.context_scope is None or current_scope is None:
+        return False
+    return fm.context_scope != current_scope

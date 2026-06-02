@@ -48,8 +48,23 @@ import yaml
 
 plugin_dir = str(Path.home() / ".hermes" / "plugins" / "mem-reflection-hermes")
 sys.path.insert(0, plugin_dir)
-import importlib
-import __init__ as plugin
+# Also add repo root for running from source tree
+repo_root = str(Path(__file__).resolve().parent.parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+import importlib.util
+# Register mem_reflection_hermes package so subpackage imports work
+if "mem_reflection_hermes" not in sys.modules:
+    spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes",
+        str(Path(repo_root) / "__init__.py"),
+        submodule_search_locations=[repo_root],
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    sys.modules["mem_reflection_hermes"] = plugin
+    spec.loader.exec_module(plugin)
+else:
+    plugin = sys.modules["mem_reflection_hermes"]
 
 # Disable embedding path
 plugin._onnx_session = "DISABLED"

@@ -1,8 +1,9 @@
 # mem-reflection-hermes Plugin — 完整代码审查框架文档
 
-> **版本:** v0.7.0  
-> **审查日期:** 2026-05-30  
-> **总代码行:** ~5,249 LOC (__init__.py 3,908 + ahe_graph 710 + dashboard 295 + bench 336)  
+> **版本:** v0.7.0（历史审查快照）
+> **审查日期:** 2026-05-30
+> **备注:** 当前代码主线已演进到 v0.9.2-beta；当前工具与 Dashboard 路由口径请以 `README.md`、`docs/ARCHITECTURE.md` 和 `docs/DASHBOARD.md` 为准。
+> **总代码行:** ~6,753 LOC（当前仓库快照）
 > **Git 仓库:** https://github.com/sea-monsters/mem-reflection-hermes  
 > **上游来源:** https://github.com/coder-brzhang/small-rust-hermes  
 
@@ -46,13 +47,13 @@
 │  │  on_session_end       → Run full reflection              │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │  Tool Layer (12 tools)                                   │  │
+│  │  Tool Layer (16 tools)                                   │  │
 │  │  ┌─────────────┐ ┌──────────┐ ┌──────────────────┐     │  │
-│  │  │ Memory CRUD  │ │Palace     │ │ Graph (ahe_graph)│     │  │
-│  │  │ srh_memory_* │ │Navigation │ │ srh_associate    │     │  │
-│  │  └─────────────┘ │srh_palace*│ │ srh_graph_retrieve│    │  │
-│  │                   │Profile    │ │ srh_graph_stats   │     │  │
-│  │                   │srh_compile│ └──────────────────┘     │  │
+│  │  │ Memory CRUD  │ │Palace     │ │ Graph / Dashboard│     │  │
+│  │  │ srh_memory_* │ │Navigation │ │ CLUQI + graph API │     │  │
+│  │  └─────────────┘ │srh_palace*│ │ pagerank/query    │     │  │
+│  │                   │Profile    │ └───────────────────┘     │  │
+│  │                   │srh_compile│                          │  │
 │  │                   │Reflection │                          │  │
 │  │                   │srh_reflect│                          │  │
 │  │                   │Skill      │                          │  │
@@ -96,7 +97,7 @@
 
 ### 2.1 `/home/ubuntu/.hermes/plugins/mem-reflection-hermes/__init__.py` (3,908 行)
 
-**核心插件实现**，包含全部 12 个工具 + 3 个钩子 + 所有数据逻辑。
+**核心插件实现**，包含 12 个基础工具、4 个图工具、3 个钩子和所有数据逻辑。
 
 ```python
 # 文件结构 (按行号):
@@ -145,7 +146,7 @@
 
 ### 2.3 `dashboard/plugin_api.py` (295 行)
 
-**FastAPI 后端**，5 个路由 + Pydantic 模型。
+**FastAPI 后端**，13 个路由 + Pydantic 模型。
 
 ### 2.4 `bench_latency.py` (336 行)
 

@@ -1,4 +1,4 @@
-"""embed.py — ONNX embedding engine for mem-reflection-hermes.
+"""search/embed.py — ONNX embedding engine for mem-reflection-hermes.
 
 Lazy-loaded embedding infrastructure: ONNX Runtime model session, LRU cache,
 intent classification (zero-shot + keyword fallback), batch encoding.
@@ -8,6 +8,7 @@ Zero-dependency leaf module (only imports from .core, not from __init__).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
@@ -15,7 +16,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .core import hermes_home as _hermes_home, _tokenise
+from ..core import hermes_home as _hermes_home, _tokenise
 
 logger = logging.getLogger(__name__)
 
@@ -79,65 +80,80 @@ def _put_cached_embed(text: str, vector: Any) -> None:
             _embed_cache.popitem(last=False)  # O(1) evict oldest
 
 
-def _intent_prototypes() -> Dict[str, str]:
+def _intent_prototypes() -> Dict[str, List[str]]:
     """Semantic intent prototypes for embedding-based zero-shot classification.
-    
-    Each prototype is a template sentence capturing the intent's semantic space.
-    Used by _classify_intent() to replace keyword-based detection.
-    
-    P2-4: Users can override prototypes via config.yaml:
-      plugins:
-        mem_reflection_hermes:
-          intent_prototypes:
-            memory: "Custom description for memory intent"
-            correction: "Custom description for correction intent"
-            procedure: "Custom description for procedure intent"
+
+    Each intent keeps multiple prototype phrasings so the classifier can pick
+    the strongest semantic match across languages and styles. Users can
+    override any intent with either a single string or a list of strings in
+    config.yaml.
     """
-    # Check for user-configured prototypes
+    defaults: Dict[str, List[str]] = {
+        "memory": [
+            "This is something important I want to remember about the user's preferences and habits.",
+            "这是我需要记住的重要信息，关于用户的偏好、习惯或长期事实。",
+        ],
+        "correction": [
+            "That was wrong, let me correct what I said previously.",
+            "刚才那句话不对，我来更正前面的说法。",
+        ],
+        "procedure": [
+            "Here is a step-by-step workflow or process I need to follow.",
+            "这里是需要遵循的步骤、流程或操作说明。",
+        ],
+    }
+
     try:
-        from .core import plugin_config, CONFIG_KEY_INTENT_PROTOTYPES
+        from ..core import plugin_config, CONFIG_KEY_INTENT_PROTOTYPES
         cfg = plugin_config()
         custom = cfg.get(CONFIG_KEY_INTENT_PROTOTYPES)
         if isinstance(custom, dict) and custom:
-            # Validate required keys
-            defaults = {
-                "memory": "This is something important I want to remember about the user's preferences and habits.",
-                "correction": "That was wrong, let me correct what I said previously.",
-                "procedure": "Here is a step-by-step workflow or process I need to follow.",
-            }
-            merged = {k: custom.get(k, v) for k, v in defaults.items()}
+            merged: Dict[str, List[str]] = {}
+            for key, default_values in defaults.items():
+                value = custom.get(key, default_values)
+                if isinstance(value, str):
+                    values = [value.strip()] if value.strip() else list(default_values)
+                elif isinstance(value, (list, tuple)):
+                    values = [str(v).strip() for v in value if str(v).strip()]
+                    if not values:
+                        values = list(default_values)
+                else:
+                    values = list(default_values)
+                merged[key] = values
             return merged
     except Exception:
         pass
-    
-    # Default prototypes (English)
-    return {
-        "memory": "This is something important I want to remember about the user's preferences and habits.",
-        "correction": "That was wrong, let me correct what I said previously.",
-        "procedure": "Here is a step-by-step workflow or process I need to follow.",
-    }
+
+    return defaults
 
 
-_INTENT_PROTOTYPE_EMBEDDINGS: Optional[Dict[str, Any]] = None
+_INTENT_PROTOTYPE_EMBEDDINGS: Optional[Dict[str, List[Any]]] = None
+_INTENT_PROTOTYPE_SIGNATURE: Optional[Tuple[Tuple[str, Tuple[str, ...]], ...]] = None
 _INTENT_PROTOTYPE_LOCK = threading.Lock()
 
 
-def _ensure_intent_prototypes() -> Optional[Dict[str, Any]]:
+def _ensure_intent_prototypes() -> Optional[Dict[str, List[Any]]]:
     """Lazy-load intent prototype embeddings for zero-shot classification."""
-    global _INTENT_PROTOTYPE_EMBEDDINGS
-    if _INTENT_PROTOTYPE_EMBEDDINGS is not None:
+    global _INTENT_PROTOTYPE_EMBEDDINGS, _INTENT_PROTOTYPE_SIGNATURE
+    prototypes = _intent_prototypes()
+    signature = tuple((intent, tuple(texts)) for intent, texts in sorted(prototypes.items()))
+    if _INTENT_PROTOTYPE_EMBEDDINGS is not None and _INTENT_PROTOTYPE_SIGNATURE == signature:
         return _INTENT_PROTOTYPE_EMBEDDINGS
     with _INTENT_PROTOTYPE_LOCK:
-        if _INTENT_PROTOTYPE_EMBEDDINGS is not None:
+        if _INTENT_PROTOTYPE_EMBEDDINGS is not None and _INTENT_PROTOTYPE_SIGNATURE == signature:
             return _INTENT_PROTOTYPE_EMBEDDINGS
         try:
-            prototypes = _intent_prototypes()
-            texts = list(prototypes.values())
-            embs = _embed_texts(texts)
-            if embs is not None:
-                _INTENT_PROTOTYPE_EMBEDDINGS = {
-                    intent: vec for intent, vec in zip(prototypes.keys(), embs)
-                }
+            embs: Dict[str, List[Any]] = {}
+            for intent, texts in prototypes.items():
+                vecs = _embed_texts(texts)
+                if vecs is None:
+                    continue
+                valid_vecs = [vec for vec in vecs if vec is not None]
+                if valid_vecs:
+                    embs[intent] = valid_vecs
+            if embs:
+                _INTENT_PROTOTYPE_EMBEDDINGS = embs
+                _INTENT_PROTOTYPE_SIGNATURE = signature
                 return _INTENT_PROTOTYPE_EMBEDDINGS
         except Exception:
             pass
@@ -171,12 +187,13 @@ def _classify_intent(text: str) -> str:
                 text_norm = text_emb / (np.linalg.norm(text_emb) + 1e-8)
                 best_intent = "none"
                 best_score = 0.30  # minimum threshold
-                for intent, proto_vec in proto_embs.items():
-                    proto_norm = proto_vec / (np.linalg.norm(proto_vec) + 1e-8)
-                    sim = float(np.dot(text_norm, proto_norm))
-                    if sim > best_score:
-                        best_score = sim
-                        best_intent = intent
+                for intent, proto_vecs in proto_embs.items():
+                    for proto_vec in proto_vecs:
+                        proto_norm = proto_vec / (np.linalg.norm(proto_vec) + 1e-8)
+                        sim = float(np.dot(text_norm, proto_norm))
+                        if sim > best_score:
+                            best_score = sim
+                            best_intent = intent
                 if best_intent != "none":
                     _classify_intent_stats["embedding"] += 1
                     return best_intent

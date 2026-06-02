@@ -80,8 +80,10 @@ class CLUQI:
             include_superseded=include_superseded,
             k=k * 3
         )
+        # Determine lineage status for each result
         for mem, score in mem_results:
             r = results.get(mem.id())
+            lineage_status = self._lineage_status(mem.id())
             if r is None:
                 r = CLUQIResult(
                     memory_id=mem.id(),
@@ -92,11 +94,13 @@ class CLUQI:
                         "confidence": mem.frontmatter.confidence,
                         "pinned": mem.frontmatter.pinned,
                         "supersedes": mem.frontmatter.supersedes,
+                        "lineage_status": lineage_status,
                     },
                     sources=["memory"],
                 )
                 results[mem.id()] = r
             r.layer_scores["memory"] = max(r.layer_scores.get("memory", 0.0), score)
+            r.metadata["lineage_status"] = lineage_status
 
         # ---- Layer 2: GraphStore (Hebbian activation) ----
         if self.gm is not None:
@@ -150,9 +154,29 @@ class CLUQI:
         if hasattr(self.store, 'bm25_search'):
             return self.store.bm25_search(query, **kwargs)
         # Fallback: use _bm25_search_scored from core
-        from .core import _bm25_search_scored
-        memories = self.store.list_active()
-        return _bm25_search_scored(memories, query, k=kwargs.get('k', 30))
+        from ..core import _bm25_search_scored
+        include_superseded = kwargs.get("include_superseded", False)
+        memories = self.store.list() if include_superseded else self.store.list_active()
+        # Apply filters that list_active() doesn't support natively
+        _CONF_ORDER = {"low": 0, "medium": 1, "high": 2}
+        zone = kwargs.get("zone")
+        tags = kwargs.get("tags")
+        min_confidence = kwargs.get("min_confidence")
+        if zone or tags or min_confidence or not include_superseded:
+            min_level = _CONF_ORDER.get(min_confidence, 0) if min_confidence else 0
+            filtered = []
+            for m in memories:
+                if zone and m.frontmatter.zone != zone:
+                    continue
+                if tags and not any(t in m.frontmatter.tags for t in tags):
+                    continue
+                if min_confidence and _CONF_ORDER.get(m.frontmatter.confidence, 0) < min_level:
+                    continue
+                if not include_superseded and self.store.is_superseded(m.id()):
+                    continue
+                filtered.append(m)
+            memories = filtered
+        return _bm25_search_scored(memories, query, k=kwargs.get("k", 30))
 
     def _query_graph_layer(self, query: str, seed_ids: List[str],
                            k: int) -> List[Tuple[str, float]]:
@@ -165,7 +189,15 @@ class CLUQI:
                 seed_ids, max_depth=5, min_weight=0.05
             )
             results = []
-            for mem_id, info in activated.items():
+            if isinstance(activated, dict):
+                activated_items = activated.items()
+            else:
+                activated_items = (
+                    (item.get("memory_id"), item)
+                    for item in activated
+                    if isinstance(item, dict)
+                )
+            for mem_id, info in activated_items:
                 if mem_id in seed_ids:
                     continue  # Skip seeds
                 score = info.get("activation", 0.0) * info.get("weight", 1.0)
@@ -176,26 +208,37 @@ class CLUQI:
             logger.warning("Graph layer query failed: %s", e)
             return []
 
+    def _lineage_status(self, mem_id: str) -> str:
+        """Return lineage status: current, superseded, or root."""
+        mem = self.store.get_by_id(mem_id)
+        if mem is None:
+            return "unknown"
+        if hasattr(self.store, "latest_for"):
+            latest = self.store.latest_for(mem_id)
+            if latest is not None and latest.id() == mem_id:
+                if mem.frontmatter.supersedes:
+                    return "current"
+                return "root"
+        # Fallback: check if superseded by another memory
+        for m in self.store.list_active():
+            if mem_id in (m.frontmatter.supersedes or []):
+                return "superseded"
+        if mem.frontmatter.supersedes:
+            return "current"
+        return "root"
+
     def _query_supersedes_layer(self, mem_id: str) -> float:
         """Calculate supersedes chain score for a memory.
 
-        Memories deeper in a supersedes chain (more recent versions)
-        get a small boost. Root memories (no superseder) get base score.
+        Latest active memory in a chain gets highest boost.
+        Root memories get base score. Superseded memories get reduced score.
         """
-        mem = self.store.get_by_id(mem_id)
-        if mem is None:
-            return 0.0
-        supersedes = mem.frontmatter.supersedes
-        if not supersedes:
-            return 0.1  # Base score for root memories
-        # Check if this memory is the latest in its chain
-        all_mems = self.store.list_active()
-        is_latest = True
-        for m in all_mems:
-            if mem_id in (m.frontmatter.supersedes or []):
-                is_latest = False
-                break
-        return 0.3 if is_latest else 0.15
+        status = self._lineage_status(mem_id)
+        if status == "current":
+            return 0.35
+        if status == "root":
+            return 0.15
+        return 0.05  # superseded or unknown
 
     def get_neighbors(self, mem_id: str, min_weight: float = 0.1,
                       limit: int = 20) -> List[Dict[str, Any]]:

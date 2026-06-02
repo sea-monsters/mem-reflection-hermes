@@ -1,7 +1,7 @@
 # mem-reflection-hermes — 代码审查修复状态跟踪
 
-**更新日期**: 2026-05-31
-**版本**: v0.8.0 — 所有代码审查问题已清理完毕 ✅
+**更新日期**: 2026-06-01
+**版本**: v0.9.2-beta — Hermes Agent 宿主对照二次审查问题已快速修复 ✅
 
 ---
 
@@ -11,6 +11,25 @@
 |---|------|------|------|
 | - | register 未导出 | tools.py | __all__ 添加 "register" |
 | - | _bm25_search_scored 签名不一致 | core.py | 返回类型统一为 List[Tuple[LoadedMemory, float]] |
+
+---
+
+## P0 (严重) — 2026-06-01 宿主对照二次审查新增 🔴
+
+本节基于 `D:\Codex_lib\code_reference\hermes-agent` 的当前插件契约复核。Hermes Agent 目录插件只调用包顶层 `register(ctx)`，hook 参数由 `agent/conversation_loop.py` 和 `model_tools.py` 提供。
+
+| # | 问题 | 模块 | 当前状态 | 影响 |
+|---|------|------|----------|------|
+| H-1 | 包顶层 `register(ctx)` 实际来自 `tools.py`，未调用 `__init__.py` 中的 graph/slash 注册块 | `__init__.py`, `tools.py` | ✅ FIXED | 新增包顶层聚合 `register(ctx)`，宿主模拟验证 16 个工具、4 个 hook、8 个 slash command 均可注册 |
+| H-2 | `pre_llm_call` 读取 `messages/ctx`，但 Hermes 当前传 `user_message/conversation_history/...` | `hooks.py` | ✅ FIXED | hook 同时支持 Hermes 当前 kwargs 与旧 `messages/ctx`，并验证能返回可注入 context |
+| H-3 | `on_session_end` 期待 `messages/ctx`，但 Hermes 当前只传 session/model/completed/interrupted 等元数据 | `hooks.py`, `reflection.py` | ✅ FIXED | `register(ctx)` 保存宿主 ctx，`pre_llm_call` 缓存 session 消息，session-end 可使用缓存消息与 ctx 运行 |
+| H-4 | 记忆写入/反射/CLUQI/Dashboard 调用不存在或层级不匹配的 API | `core.py`, `__init__.py`, `tools.py`, `cluqi.py`, `ahe_graph/__init__.py`, `dashboard/plugin_api.py` | ✅ FIXED | 补齐 `MemoryFrontmatter.new()`、`MemoryStore.get_by_id()`、manager activation/association aliases、Dashboard 包内导入和 CLUQI list/dict 兼容 |
+
+**验证摘要**:
+
+- Fake Hermes `PluginContext` 调用包顶层 `register(ctx)` 后得到 16 个工具、4 个 hook、8 个 command。
+- 最小导入检查显示 `MemoryFrontmatter.new`、`MemoryStore.get_by_id`、`GraphMemoryManager.propagate_activation`、`AssociationEngine.on_memory_coactivation` 均存在。
+- `srh_memory_write`、`pre_llm_call` context 注入、`post_tool_call` graph auto-associate、Dashboard 包导入和 CLUQI graph query 均已 smoke 验证。
 
 ---
 
@@ -111,16 +130,28 @@
 
 ## 代码量统计 (更新)
 
-| 模块 | 当前行数 | 函数数 | 状态 |
-|------|---------|--------|------|
-| core.py | 790 | 49 | ✅ 零依赖叶节点 |
-| embed.py | 458 | 19 | ✅ LRU 缓存已存在 |
-| __init__.py | 1571 | 65 | ✅ 重构完成 |
-| ahe_graph/__init__.py | 741 | 44 | ✅ 图记忆系统 |
-| hooks.py | 324 | 21 | ✅ 生命周期钩子 |
-| reflection.py | 1248 | 31 | ✅ 反射管线 |
-| tools.py | 944 | 31 | ✅ 17 个工具 handler |
-| **合计** | **~6076** | **~260** | |
+| 模块 | 当前行数 | 状态 |
+|------|---------|------|
+| `__init__.py` | 1416 | ✅ 注册/导出/兼容层 |
+| `core.py` | 652 | ✅ 存储与基础模型 |
+| `embed.py` | 411 | ✅ ONNX 嵌入引擎 |
+| `reflection.py` | 1085 | ✅ 反射管线可通过保存的宿主 ctx 与 session 消息缓存接入 |
+| `hooks.py` | 276 | ✅ 生命周期钩子已兼容 Hermes 当前 kwargs |
+| `tools.py` | 830 | ✅ 12 个基础工具可注册，写入路径 smoke 通过 |
+| `__init__.py` graph tools | — | ✅ 4 个图工具已通过包顶层 `register(ctx)` 注册 |
+| `ahe_graph/__init__.py` | 687 | ✅ 图记忆系统 |
+| `cluqi.py` | 217 | ✅ CLUQI 跨层查询 smoke 通过 |
+| `query_cache.py` | 163 | ✅ 查询缓存 |
+| `cross_zone.py` | 112 | ✅ 跨区分析 |
+| `pagerank.py` | 81 | ✅ 中心性计算 |
+| `dashboard/plugin_api.py` | 487 | ✅ Dashboard API 包导入与 graph auto-associate 兼容层已修 |
+| `bench_latency.py` | 336 | ✅ 性能基准 |
+| **合计** | **~6,753** | |
+
+## 当前监控项
+
+- 暂无已知宿主集成阻断级残余风险。
+- 后续如记忆规模继续扩大，可再评估 `effectiveness` 文件大小、SQLite 图边规模和反射日志轮转阈值。
 
 ---
 

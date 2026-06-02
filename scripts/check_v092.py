@@ -7,12 +7,26 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+repo_root = str(Path(__file__).resolve().parent.parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+# Register mem_reflection_hermes package so subpackage imports work
+if "mem_reflection_hermes" not in sys.modules:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes",
+        str(Path(repo_root) / "__init__.py"),
+        submodule_search_locations=[repo_root],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["mem_reflection_hermes"] = mod
+    spec.loader.exec_module(mod)
 
 
 def test_cluqi():
     """Test CLUQI module loads and has expected interface."""
-    from cluqi import CLUQI, CLUQIResult
+    from mem_reflection_hermes.graph.cluqi import CLUQI, CLUQIResult
     assert hasattr(CLUQI, 'query')
     assert hasattr(CLUQI, 'get_neighbors')
     assert hasattr(CLUQI, 'cross_zone_bridge')
@@ -22,13 +36,13 @@ def test_cluqi():
 
 def test_pagerank():
     """Test PageRank module loads and has expected interface."""
-    from pagerank import compute_pagerank, get_top_pagerank
+    from mem_reflection_hermes.graph.pagerank import compute_pagerank, get_top_pagerank
     print("  PASS: PageRank interface")
 
 
 def test_query_cache():
     """Test query cache and templates."""
-    from query_cache import ResultCache, get_cache, build_query, QUERY_TEMPLATES
+    from mem_reflection_hermes.query.cache import ResultCache, get_cache, build_query, QUERY_TEMPLATES
     cache = ResultCache(default_ttl=1.0)
     cache.set("test", "key1")
     assert cache.get("key1") == "test"
@@ -38,13 +52,13 @@ def test_query_cache():
 
 def test_cross_zone():
     """Test cross-zone analysis module."""
-    from cross_zone import analyze_zone_connections, get_zone_recommendations
+    from mem_reflection_hermes.graph.cross_zone import analyze_zone_connections, get_zone_recommendations
     print("  PASS: Cross-zone analysis interface")
 
 
 def test_ahe_graph_extensions():
     """Test ahe_graph has new methods."""
-    from ahe_graph import GraphStore
+    from mem_reflection_hermes.graph.ahe_graph import GraphStore
     assert hasattr(GraphStore, 'get_all_nodes')
     assert hasattr(GraphStore, 'add_supersedes_edge')
     assert hasattr(GraphStore, 'remove_supersedes_edge')
@@ -55,7 +69,7 @@ def test_dashboard_api():
     """Test dashboard API module has expected endpoints."""
     # Skip when run as standalone script (relative import issue)
     try:
-        from dashboard.plugin_api import router
+        from mem_reflection_hermes.dashboard.plugin_api import router
         routes = [getattr(r, 'path', str(r)) for r in router.routes]
         assert any("/graph" in r for r in routes), f"No /graph route in {routes}"
         assert any("/query" in r for r in routes), f"No /query route in {routes}"
@@ -68,15 +82,15 @@ def test_dashboard_api():
 def test_version():
     """Test version is updated."""
     import yaml
-    with open(Path(__file__).parent / "plugin.yaml") as f:
+    with open(Path(__file__).parent.parent / "plugin.yaml") as f:
         data = yaml.safe_load(f)
-    assert data['version'] == '0.9.2-beta', f"Expected 0.9.2-beta, got {data['version']}"
-    print("  PASS: Version is 0.9.2-beta")
+    assert data['version'] == '0.9.2-beta2', f"Expected 0.9.2-beta2, got {data['version']}"
+    print("  PASS: Version is 0.9.2-beta2")
 
 
 def main():
     print("=" * 60)
-    print("v0.9.2-beta Verification")
+    print("v0.9.2-beta2 Verification")
     print("=" * 60)
 
     tests = [

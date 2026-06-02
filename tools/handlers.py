@@ -1,4 +1,4 @@
-"""tools.py — Tool handlers for mem-reflection-hermes.
+"""tools/handlers.py — Tool handlers for mem-reflection-hermes.
 SRH tools, palace tools, profile compilation tool.
 Uses late-binding for __init__.py functions.
 """
@@ -7,19 +7,22 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .core import (
+from ..core import (
     LoadedMemory, MemoryFrontmatter, SkillFrontmatter, LoadedSkill,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
-    serialize_frontmatter, record_memory_stat,
+    serialize_frontmatter, read_memory, record_memory_stat,
+    _lineage_latest, _lineage_root, _lineage_depth, _lineage_cycle_check,
+    _is_expired, _is_context_mismatch, _classify_update_intent,
 )
-from .embed import _extract_keywords
-from .reflection import (
+from ..search.embed import _extract_keywords
+from ..reflection.engine import (
     _append_reflect_log, _recent_reflect_outcomes,
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_reflection, _run_embedding_micro_reflection,
@@ -39,11 +42,21 @@ def _jd(obj, **kw) -> str:
 _late_bindings: Dict[str, Any] = {}
 
 def _lb(name: str):
-    """Get a late-bound function, caching the lookup."""
+    """Get a late-bound function, caching the lookup.
+
+    Always resolves from the root plugin module (mem_reflection_hermes)
+    rather than the child package so that functions defined in __init__.py
+    (e.g. _get_mem_store, _build_context_block) are found regardless of
+    which sub-module calls _lb.
+    """
     fn = _late_bindings.get(name)
     if fn is None:
-        from mem_reflection_hermes import __dict__ as _mod
-        fn = _mod[name]
+        mod = sys.modules.get("mem_reflection_hermes")
+        if mod is None:
+            raise KeyError("Plugin module not loaded for late binding: mem_reflection_hermes")
+        fn = getattr(mod, name, None)
+        if fn is None:
+            raise KeyError(f"Root plugin module has no attribute: {name}")
         _late_bindings[name] = fn
     return fn
 
@@ -105,6 +118,26 @@ def _enrich_with_graph(*a, **kw):
 def build_palace_index(*a, **kw):
     return _lb("build_palace_index")(*a, **kw)
 
+def load_zone_summary(zone):
+    return _lb("load_zone_summary")(zone)
+
+def save_zone_summary(zone, content):
+    return _lb("save_zone_summary")(zone, content)
+
+def _palace_index_path():
+    return _lb("_palace_index_path")()
+
+def _sanitize_zone_filename(zone):
+    return _lb("_sanitize_zone_filename")(zone)
+
+def _serialize_frontmatter(data, body):
+    return serialize_frontmatter(data, body)
+
+def _read_memory(path):
+    return read_memory(path)
+
+from .. import match_skills  # noqa: E402
+
 # Tool handlers
 # ---------------------------------------------------------------------------
 
@@ -112,11 +145,14 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     query = args.get("query", "")
     k = int(args.get("k", 5))
     zone_filter = args.get("zone")  # Optional zone scope
+    include_history = bool(args.get("include_history", False))
     mem_store = _get_mem_store()
     # ── Scheme C: Fusion search (BM25 × Graph × Supersedes) instead of two-stage ──
-    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None)
+    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None,
+                                       include_history=include_history)
     out = []
     for m in results:
+        is_superseded = mem_store.is_superseded(m.id())
         out.append({
             "id": m.id(),
             "scope": m.scope,
@@ -125,6 +161,7 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
             "tags": m.frontmatter.tags,
             "zone": m.frontmatter.zone,
             "body": m.body[:500],
+            "lineage_status": "superseded" if is_superseded else "active",
         })
         record_memory_stat(m.id(), "accessed")
 
@@ -143,29 +180,57 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     body = args.get("body", "").strip()
     if not body:
-        return json.dumps({"error": "body is required"})
+        return _jd({"error": "body is required"})
     scope = args.get("scope", "user")
     confidence = args.get("confidence", "medium")
     tags = args.get("tags", [])
     pinned = bool(args.get("pinned", False))
     supersedes = args.get("supersedes", [])
+    supersedes_reason = args.get("supersedes_reason")
     zone = _normalize_zone(args.get("zone"))
 
-    # Conflict check
-    conflict = mem_store.check_conflict(body)
+    # Validate supersedes targets exist
+    if supersedes:
+        for sid in supersedes:
+            if mem_store.get(sid) is None:
+                return _jd({
+                    "error": f"supersedes target not found: {sid}",
+                    "missing_id": sid,
+                })
+        # Cycle guard
+        cycle = _lineage_cycle_check(mem_store, supersedes[0]) if supersedes else None
+        if cycle:
+            return _jd({
+                "error": f"supersedes would create a cycle: {' -> '.join(cycle)}",
+                "cycle": cycle,
+            })
+
+    # Conflict check — skip targets being superseded to avoid rejecting
+    # intentional replacements (P1)
+    conflict = mem_store.check_conflict(body, exclude_ids=supersedes)
     if conflict:
         existing_id, score = conflict
-        return json.dumps({
-            "error": f"Conflict detected with {existing_id} (similarity {score:.2f}). Use supersedes to override.",
+        existing = mem_store.get(existing_id)
+        guidance = (
+            "Conflict detected with an existing memory. "
+            "Recommended actions: "
+            "1) pass supersedes=[id] to replace, "
+            "2) change zone/scope for a parallel memory, "
+            "3) keep as episode/history if this is a temporal event."
+        )
+        return _jd({
+            "error": guidance,
             "conflict_with": existing_id,
             "similarity": score,
+            "existing_zone": existing.frontmatter.zone if existing else None,
         })
 
     fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags, zone=zone)
     fm.pinned = pinned
     fm.supersedes = supersedes
+    fm.supersedes_reason = supersedes_reason
     path = mem_store.put(scope, fm, body)
-    return json.dumps({
+    return _jd({
         "success": True,
         "id": fm.id,
         "path": str(path),
@@ -177,9 +242,9 @@ def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     mem_id = args.get("id", "")
     scope = args.get("scope", "user")
     if not mem_id:
-        return json.dumps({"error": "id is required"})
+        return _jd({"error": "id is required"})
     ok = mem_store.delete(scope, mem_id)
-    return json.dumps({"success": ok, "id": mem_id})
+    return _jd({"success": ok, "id": mem_id})
 
 
 # ── P2-4: Memory version history (supersedes chain) ───────
@@ -188,33 +253,32 @@ def _tool_srh_memory_history(args: dict, **kwargs) -> str:
     """Trace supersedes chain for a memory, returning full version lineage."""
     memory_id = args.get("id", "")
     if not memory_id:
-        return json.dumps({"error": "id is required"})
+        return _jd({"error": "id is required"})
     max_depth = min(int(args.get("max_depth", 5)), 20)
 
     mem_store = _get_mem_store()
-    chain = []
-    current_id = memory_id
-    visited = set()
+    # Cycle guard
+    cycle = _lineage_cycle_check(mem_store, memory_id)
+    if cycle:
+        return _jd({
+            "memory_id": memory_id,
+            "error": f"Cycle detected in supersedes chain: {' -> '.join(cycle)}",
+            "cycle": cycle,
+        })
 
-    for depth in range(max_depth):
-        if current_id in visited:
-            break
-        visited.add(current_id)
-        m = mem_store.get(current_id)
-        if m is None:
-            path = mem_store._id_to_path.get(current_id)
-            if path:
-                m = _read_memory(path, "user")
-            if m is None:
-                chain.append({
-                    "depth": depth,
-                    "id": current_id,
-                    "status": "orphaned",
-                    "body": "(file not found)",
-                })
-                break
+    # Walk backward to root, then forward to current
+    full_chain = mem_store.lineage_chain(memory_id, max_depth=max_depth)
+    chain = []
+    root_id = _lineage_root(mem_store, memory_id)
+    latest_id = _lineage_latest(mem_store, root_id)
+    if latest_id is None:
+        latest_id = root_id
+
+    for idx, m in enumerate(full_chain):
+        is_current = m.id() == latest_id
+        is_superseded = mem_store.is_superseded(m.id())
         chain.append({
-            "depth": depth,
+            "depth": idx,
             "id": m.id(),
             "zone": m.frontmatter.zone,
             "created": m.frontmatter.created,
@@ -222,17 +286,16 @@ def _tool_srh_memory_history(args: dict, **kwargs) -> str:
             "pinned": m.frontmatter.pinned,
             "tags": m.frontmatter.tags,
             "supersedes": m.frontmatter.supersedes,
+            "supersedes_reason": m.frontmatter.supersedes_reason,
             "body": m.body[:200],
-            "status": "active" if depth == 0 else "archived",
+            "status": "current" if is_current else ("superseded" if is_superseded else "root"),
         })
-        supers = m.frontmatter.supersedes
-        if not supers:
-            break
-        current_id = supers[0]
 
     return json.dumps({
         "memory_id": memory_id,
         "chain_length": len(chain),
+        "chain_depth": len(chain) - 1,
+        "current_id": latest_id,
         "chain": chain,
     }, ensure_ascii=False)
 
@@ -262,7 +325,7 @@ def _tool_srh_palace_zones(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     groups = mem_store.group_by_zone()
     if not groups:
-        return json.dumps({"zones": [], "total": 0, "message": "Memory Palace is empty — no memories yet."})
+        return _jd({"zones": [], "total": 0, "message": "Memory Palace is empty — no memories yet."})
     zones = []
     total = 0
     for zone, mems in sorted(groups.items()):
@@ -360,6 +423,10 @@ def _auto_rebalance_zones(dry_run: bool = False) -> dict:
                         "pinned": m.frontmatter.pinned,
                         "tags": m.frontmatter.tags,
                         "supersedes": m.frontmatter.supersedes,
+                        "supersedes_reason": m.frontmatter.supersedes_reason,
+                        "valid_from": m.frontmatter.valid_from,
+                        "valid_until": m.frontmatter.valid_until,
+                        "context_scope": m.frontmatter.context_scope,
                         "zone": overflow_zone,
                         "rank": m.frontmatter.rank,
                     }
@@ -389,6 +456,10 @@ def _auto_rebalance_zones(dry_run: bool = False) -> dict:
                         "pinned": m.frontmatter.pinned,
                         "tags": m.frontmatter.tags,
                         "supersedes": m.frontmatter.supersedes,
+                        "supersedes_reason": m.frontmatter.supersedes_reason,
+                        "valid_from": m.frontmatter.valid_from,
+                        "valid_until": m.frontmatter.valid_until,
+                        "context_scope": m.frontmatter.context_scope,
                         "zone": "general",
                         "rank": m.frontmatter.rank,
                     }
@@ -423,7 +494,7 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     """Search memories by topic, optionally scoped to a zone."""
     query = args.get("topic", "")
     if not query:
-        return json.dumps({"error": "topic is required"})
+        return _jd({"error": "topic is required"})
     k = int(args.get("limit", 5))
     zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
 
@@ -477,7 +548,7 @@ def _tool_srh_palace_search(args: dict, **kwargs) -> str:
     """
     query = args.get("query", "")
     if not query:
-        return json.dumps({"error": "query is required"})
+        return _jd({"error": "query is required"})
     k = int(args.get("limit", 10))
 
     mem_store = _get_mem_store()
@@ -519,17 +590,17 @@ def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
     ctx = args.get("ctx")
     messages = args.get("messages", [])
     if not ctx:
-        return json.dumps({
+        return _jd({
             "error": "Reflection requires ctx with LLM access. Run via /reflect slash command or wait for session-end auto-reflection.",
             "recent_outcomes": _recent_reflect_outcomes(5),
         })
     if not messages:
-        return json.dumps({"error": "No messages to reflect on"})
+        return _jd({"error": "No messages to reflect on"})
     try:
         result = _run_full_reflection(ctx, messages)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return _jd({"error": str(e)})
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +649,7 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
         Dict with 'success', 'path', 'mode', 'token_count' or 'error'
     """
     # P2-32: quick return when profile mode is disabled
-    from .core import profile_mode_enabled as _profile_mode_enabled
+    from ..core import profile_mode_enabled as _profile_mode_enabled
     if not _profile_mode_enabled():
         return {"error": "Profile mode is disabled (enable via config.yaml memory.palace_mode or memory.profile_mode)"}
 
@@ -687,7 +758,7 @@ def _tool_srh_compile_profile(args: dict, **kwargs) -> str:
     """Compile memories into a structured profile via LLM."""
     ctx = args.get("ctx")
     if not ctx:
-        return json.dumps({
+        return _jd({
             "error": "Compilation requires ctx with LLM access. Use /compile-profile slash command.",
         })
     mode = args.get("mode", "profile")
@@ -714,6 +785,7 @@ def register(ctx) -> None:
                     "query": {"type": "string", "description": "Search query"},
                     "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
                     "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
+                    "include_history": {"type": "boolean", "description": "Include superseded memories in search results (lineage-aware recall)", "default": False},
                 },
                 "required": ["query"],
             },
@@ -737,6 +809,7 @@ def register(ctx) -> None:
                     "tags": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 20},
                     "pinned": {"type": "boolean", "default": False},
                     "supersedes": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 5},
+                    "supersedes_reason": {"type": "string", "description": "Human-readable reason why this memory supersedes the referenced memory IDs", "default": ""},
                     "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
                 },
                 "required": ["body"],
@@ -943,4 +1016,4 @@ def register(ctx) -> None:
 
 
 # Hooks imported from hooks.py
-from .hooks import _on_session_start, _on_session_end, _pre_llm_call  # noqa: F401
+from ..hooks.lifecycle import _on_session_start, _on_session_end, _pre_llm_call  # noqa: F401

@@ -1,13 +1,29 @@
 # Changelog
 
+## v0.9.2-beta2 — Reflection Audit + Supersedes Governance + Lineage Recall
+
+- **WS-1 Supersedes governance**: `supersedes_reason` frontmatter field, lineage helpers (`latest_for`, `is_superseded`, `lineage_chain`), cycle detection, missing-target validation
+- **WS-2 Lineage-aware recall**: Default search excludes superseded memories; `include_history` flag; CLUQI boosts latest active memory in chain
+- **WS-3 Reflection quality audit**: Structured `audit_entries` in reflect log with `candidate_id`, `decision`, `decision_reason`, `novelty_score`, `conflict_id`, `supersedes_ids`, `supersedes_reason`, `assigned_zone`, `graph_migration`. Dashboard `/reflections/audit` endpoint for querying audit entries.
+- **WS-6 Temporal/context hints**: `valid_from`, `valid_until`, `context_scope`, `supersedes_reason` frontmatter fields with round-trip preservation and expired-memory detection
+- **Beta2 plan**: Added `docs/design/PLAN_0_9_2_BETA2.md` to turn review gaps into prioritized workstreams
+
+### Codex Review Fix Rounds (Round 1–4)
+
+- **Round 1** (`467629f`): Late bindings resolve from root package (`mem_reflection_hermes`) instead of child subpackage (`mem_reflection_hermes.tools` / `.hooks`)
+- **Round 2** (`78e3466`/`5cab32c`): Restore `_get_mem_store`/`_get_skill_store` after `reflection.engine` star import; CLUQI fallback applies `zone`/`tags`/`min_confidence`/`include_superseded` filters; `search/embed.py` fixes relative import for custom `intent_prototypes`
+- **Round 3** (`cf7c6e0`/`15dbf62`/`30d805a`): Dependency-free YAML frontmatter fallback parser; standalone dashboard import via `importlib.util`; `fusion_search` supports `include_history`; CLUQI correctly uses `is_superseded()` instead of `frontmatter.supersedes`
+- **Round 4** (`7c21c91`/`c6388ef`/`da12b39`/`4ed9f35`/`8255dcf`/`c7dad3e`/`94a3045`/`655cdf2`/`0796ec8`/`3ea5dbc`): `sys.modules` registration before `exec_module`; `record_memory_stat` import in lifecycle; transcript truncation preserves recent turns; conflict check accepts `exclude_ids` for supersede targets; `include_history` exposed in search schema; `_read_memory` alias restored for cold delete; beta2 metadata preserved during rebalance; `supersedes_reason` exposed in write schema; SUPERSEDES edge filter fixed in dashboard graph endpoint
+
 ## v0.9.2-beta — Dashboard Graph Integration + CLUQI + PageRank
 
+- **Design evaluation**: Added `docs/review/DESIGN_EVALUATION.md` evaluating supersedes chains, associative graph memory, reflection refinement, and recall against Mem0, Letta/MemGPT, Zep/Graphiti, Memary, and Cognee.
 - **CLUQI** (`cluqi.py`): Cross-Layer Unified Query Interface joining MemoryStore, GraphStore, and supersedes chains
 - **PageRank** (`pagerank.py`): Centrality scores for identifying hub memories in the graph
 - **Query templates** (`query_cache.py`): 8 predefined patterns + TTL-based result cache
 - **Cross-zone analysis** (`cross_zone.py`): Bridge memories, zone centrality, zone recommendations
 - **SUPERSEDES graph edges**: Structural version lineage edges in ahe_graph (preserved from decay)
-- **Dashboard v0.9.2**:
+- **Dashboard v0.9.2**: 13 API routes
   - `GET /graph` returns real Hebbian edges from ahe_graph SQLite + PageRank scores
   - `GET /graph/neighbors/{id}` with CLUQI metadata enrichment
   - `GET /graph/zones` for cross-zone bridge visualization
@@ -26,8 +42,8 @@
 ## v0.8.0 — Module Split + ahe_graph Integration
 
 - **6-way module split**: `__init__.py` reduced from ~4,500 to ~1,588 lines; logic moved to `core`, `embed`, `reflection`, `hooks`, `tools`
-- **17 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`, `srh_associate/graph_retrieve/graph_stats/graph_viz`
-- **ahe_graph integration**: Graph memory with `srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`
+- **12 SRH tools**: `srh_memory_search/write/delete/history`, `srh_skill_search`, `srh_reflect_now`, `srh_palace_zones/read_zone/recall/search/rebalance`, `srh_compile_profile`
+- **ahe_graph integration**: Graph memory layer surfaced through dashboard graph endpoints and CLUQI query
 - **Backpressure queue**: Micro-reflection bounded queue (max 20) with overflow logging
 - **CJK adaptive threshold**: Per-language similarity threshold (CJK 0.55, Latin 0.65)
 - **LRU embed cache**: 128-entry LRU cache for embedding vectors

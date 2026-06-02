@@ -15,12 +15,24 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-# Ensure the plugin's __init__ is importable
-plugin_dir = Path(__file__).resolve().parent.parent
-if str(plugin_dir) not in sys.path:
-    sys.path.insert(0, str(plugin_dir))
-
-import __init__ as srh
+try:
+    from .. import __dict__ as _srh_dict
+except ImportError:
+    import importlib.util
+    plugin_dir = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes", plugin_dir / "__init__.py"
+    )
+    srh = importlib.util.module_from_spec(spec)  # type: ignore
+    sys.modules["mem_reflection_hermes"] = srh  # Register before exec so sub-imports resolve
+    spec.loader.exec_module(srh)  # type: ignore
+else:
+    class _ModuleProxy:
+        def __getattr__(self, name: str) -> Any:
+            return _srh_dict[name]
+        def __dir__(self) -> List[str]:
+            return list(_srh_dict.keys())
+    srh = _ModuleProxy()
 
 router = APIRouter()
 
@@ -75,9 +87,13 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
         "pinned": m.frontmatter.pinned,
         "tags": m.frontmatter.tags,
         "supersedes": m.frontmatter.supersedes,
+        "supersedes_reason": m.frontmatter.supersedes_reason,
         "zone": m.frontmatter.zone,
         "rank": getattr(m.frontmatter, "rank", 0),
         "created": created_str,
+        "valid_from": m.frontmatter.valid_from,
+        "valid_until": m.frontmatter.valid_until,
+        "context_scope": m.frontmatter.context_scope,
         "source": m.frontmatter.source,
     }
 
@@ -85,8 +101,9 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
 def _get_graph_manager():
     """Get the graph manager if available."""
     try:
-        from ahe_graph import get_graph_manager
-        return get_graph_manager()
+        import importlib
+        mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        return mod.get_graph_manager()
     except Exception:
         return None
 
@@ -94,9 +111,11 @@ def _get_graph_manager():
 def _get_cluqi():
     """Get CLUQI instance if available."""
     try:
-        from cluqi import CLUQI
-        gm = _get_graph_manager()
-        return CLUQI(srh._store, gm)
+        import importlib
+        ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
+        gm = ahe.get_graph_manager()
+        return cluqi_mod.CLUQI(srh._get_mem_store(), gm)
     except Exception:
         return None
 
@@ -116,7 +135,9 @@ async def list_memories(
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
     if query:
-        memories = [m for m in memories if query.lower() in m.body.lower()]
+        memories = _get_store().search(query, k=100)
+        if zone:
+            memories = [m for m in memories if m.frontmatter.zone == zone]
 
     sort_key = {
         "rank": lambda m: getattr(m.frontmatter, "rank", 0),
@@ -208,12 +229,13 @@ async def delete_memory(mem_id: str):
     if gm:
         try:
             # Remove all edges connected to this memory
-            conn = gm.store._connect()
-            conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
-            conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
-            conn.commit()
-        except Exception:
-            pass
+            with gm.store._connect() as conn:
+                conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
+                conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
+                conn.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
     return {"status": "deleted", "id": mem_id}
 
 
@@ -286,28 +308,31 @@ async def get_graph(
                         })
 
             # Get SUPERSEDES edges
+            # old_id is the superseded memory; it is not in seen_nodes (which is
+            # built from list_active), so we skip that guard and add the edge
+            # directly since mem.id() is guaranteed to be in seen_nodes.
             if include_supersedes:
                 for mem in memories:
                     if mem.frontmatter.supersedes:
                         for old_id in mem.frontmatter.supersedes:
-                            if old_id in seen_nodes:
-                                edges.append({
-                                    "source": old_id,
-                                    "target": mem.id(),
-                                    "relation": "SUPERSEDES",
-                                    "weight": 0.95,
-                                    "type": "supersedes",
-                                })
-                                # Also add to graph store if not already there
-                                try:
-                                    gm.store.add_supersedes_edge(old_id, mem.id())
-                                except Exception:
-                                    pass
+                            edges.append({
+                                "source": old_id,
+                                "target": mem.id(),
+                                "relation": "SUPERSEDES",
+                                "weight": 0.95,
+                                "type": "supersedes",
+                            })
+                            # Also add to graph store if not already there
+                            try:
+                                gm.store.add_supersedes_edge(old_id, mem.id())
+                            except Exception:
+                                pass
 
             # Compute PageRank
             try:
-                from pagerank import compute_pagerank
-                pagerank_scores = compute_pagerank(gm.store)
+                import importlib
+                pr_mod = importlib.import_module("mem_reflection_hermes.graph.pagerank")
+                pagerank_scores = pr_mod.compute_pagerank(gm.store)
                 for node in nodes:
                     node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
             except Exception as e:
@@ -335,8 +360,8 @@ async def get_graph(
     # Skill tag overlap edges
     try:
         skill_store = srh.SkillStore(
-            srh._user_memories_dir(),
-            srh._project_memories_dir(),
+            srh._user_skills_dir(),
+            srh._project_skills_dir(),
         )
         skills = skill_store.list()
         skill_nodes = []
@@ -384,6 +409,8 @@ async def get_graph(
             "supersedes_edges": len([e for e in edges if e.get("type") == "supersedes"]),
             "skill_edges": len([e for e in edges if e.get("type") == "skill"]),
             "pagerank_computed": len(pagerank_scores) > 0,
+            "graph_semantics": "associative_coactivation",
+            "graph_semantics_note": "Hebbian co-occurrence edges (memories used together), not factual entity relations",
         },
     }
 
@@ -413,10 +440,11 @@ async def get_graph_neighbors(
 async def get_zone_analysis():
     """Get cross-zone graph analysis."""
     try:
-        from cross_zone import analyze_zone_connections
+        import importlib
+        cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
         gm = _get_graph_manager()
         if gm:
-            result = analyze_zone_connections(_get_store(), gm.store)
+            result = cz.analyze_zone_connections(_get_store(), gm.store)
             return result
     except Exception as e:
         import logging
@@ -431,10 +459,7 @@ async def get_zone_analysis():
 @router.get("/skills")
 async def list_skills():
     """Return all loaded skills."""
-    skill_store = srh.SkillStore(
-        srh._user_memories_dir(),
-        srh._project_memories_dir(),
-    )
+    skill_store = srh._get_skill_store()
     skills = skill_store.list()
     return {
         "skills": [
@@ -455,8 +480,13 @@ async def list_skills():
 # ---------------------------------------------------------------------------
 
 @router.get("/reflections")
-async def list_reflections(limit: int = 50):
-    """Return recent reflection history."""
+async def list_reflections(limit: int = 50, mode: Optional[str] = None):
+    """Return recent reflection history.
+
+    Args:
+        limit: Maximum number of entries to return
+        mode: Filter by reflection mode (full_llm, micro_llm, embedding, embedding_micro)
+    """
     log_path = srh._plugin_data_dir() / "reflect-log.jsonl"
     entries = []
     if log_path.exists():
@@ -466,11 +496,48 @@ async def list_reflections(limit: int = 50):
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
+                    if mode and entry.get("mode") != mode:
+                        continue
+                    entries.append(entry)
                 except json.JSONDecodeError:
                     continue
     entries.reverse()
     return {"reflections": entries[:limit]}
+
+
+@router.get("/reflections/audit")
+async def list_reflection_audit(limit: int = 100, decision: Optional[str] = None):
+    """Return flattened reflection audit entries from all reflection logs.
+
+    Args:
+        limit: Maximum number of audit entries to return
+        decision: Filter by decision type (accepted, rejected, skipped, superseded, pending)
+    """
+    log_path = srh._plugin_data_dir() / "reflect-log.jsonl"
+    audit_entries = []
+    if log_path.exists():
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("timestamp", "")
+                    mode = entry.get("mode", "unknown")
+                    for ae in entry.get("audit_entries", []):
+                        if decision and ae.get("decision") != decision:
+                            continue
+                        audit_entries.append({
+                            "timestamp": ts,
+                            "mode": mode,
+                            **ae,
+                        })
+                except json.JSONDecodeError:
+                    continue
+    audit_entries.reverse()
+    return {"audit_entries": audit_entries[:limit], "total": len(audit_entries)}
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +568,7 @@ async def get_stats():
     # Cache stats
     cache_stats = {"available": False}
     try:
-        from query_cache import get_cache
+        from ..query.cache import get_cache
         cache_stats = {
             "available": True,
             **get_cache().stats(),
@@ -509,11 +576,15 @@ async def get_stats():
     except Exception:
         pass
 
+    # Health metrics (WS-5)
+    health = _get_store().health_metrics()
+
     return {
         "memory_count": len(memories),
         "zones": zones,
         "graph": graph_stats,
         "cache": cache_stats,
+        "health": health,
     }
 
 
@@ -547,7 +618,13 @@ async def cluqi_query(
             ],
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import logging, uuid
+        trace_id = str(uuid.uuid4())[:8]
+        logging.getLogger(__name__).exception("CLUQI query failed (trace=%s)", trace_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed. Trace ID: {trace_id}. Error: {type(e).__name__}",
+        )
 
 
 # ---------------------------------------------------------------------------
