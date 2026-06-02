@@ -15,6 +15,10 @@ tags:
 zone: general
 rank: 0
 supersedes: []
+supersedes_reason: ""
+valid_from: null
+valid_until: null
+context_scope: null
 version: "1.0"
 ---
 
@@ -35,6 +39,10 @@ Always use anyhow for app-level error handling in Rust.
 | `rank` | int (v0.6.1+) | Explicit ordering. Higher rank = appears earlier. Default 0 |
 | `supersedes` | string[] | Memory IDs this memory replaces (version lineage) |
 | `version` | string (v0.8.0+) | Optional version string for tracking iterations |
+| `supersedes_reason` | string (v0.9.2-beta2+) | Human-readable reason why this memory supersedes the referenced IDs |
+| `valid_from` | ISO 8601 (v0.9.2-beta2+) | Earliest date this memory is considered active |
+| `valid_until` | ISO 8601 (v0.9.2-beta2+) | Expiration date; memories past this date are flagged as expired in health checks |
+| `context_scope` | string (v0.9.2-beta2+) | Context qualifier (e.g., `project:X`, `domain:backend`) for scoped filtering |
 
 ## Supersedes Semantics
 
@@ -116,12 +124,12 @@ valid and readable.
 │       ├── hooks/
 │       │   └── lifecycle.py         # Session hooks (~276 lines)
 │       ├── tools/
-│       │   └── handlers.py          # 12 SRH tool handlers (~830 lines)
+│       │   └── handlers.py          # 12 core SRH tool handlers (~1,019 lines)
 │       ├── graph/
 │       │   ├── ahe_graph/__init__.py # SQLite-backed graph memory (~687 lines)
-│       │   ├── cluqi.py             # Cross-layer query orchestration (~217 lines)
-│       │   ├── pagerank.py          # PageRank centrality (~81 lines)
-│       │   └── cross_zone.py        # Cross-zone analysis (~112 lines)
+│       │   ├── cluqi.py             # Cross-layer query orchestration (~287 lines)
+│       │   ├── pagerank.py          # PageRank centrality (~101 lines)
+│       │   └── cross_zone.py        # Cross-zone analysis (~132 lines)
 │       ├── query/
 │       │   └── cache.py             # TTL query cache (~163 lines)
 │       ├── plugin.yaml              # Plugin manifest
@@ -130,7 +138,7 @@ valid and readable.
 │       │   └── bench_latency.py     # Performance benchmark
 │       ├── PERF_REPORT.md           # Optimization report
 │       └── dashboard/
-│           ├── plugin_api.py        # FastAPI routes (13 endpoints)
+│           ├── plugin_api.py        # FastAPI routes (14 endpoints)
 │           ├── dist/index.js        # React frontend (Memory Manager)
 │           └── manifest.json         # Dashboard tab registration
 └── models/                          # ONNX model (optional)

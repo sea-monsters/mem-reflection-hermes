@@ -23,6 +23,8 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Query Templates & Cache**: 8 predefined patterns with TTL-based result caching
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
 - **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + CLUQI search + zone analysis
+- **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
+- **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
 
 ## Documentation
 

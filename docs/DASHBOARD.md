@@ -17,7 +17,7 @@ The dashboard communicates with MemoryStore through **atomic store methods** (`u
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 13 routes.
+Current surface: 14 routes.
 
 | Method | Path | Purpose |
 |--------|------|---------|

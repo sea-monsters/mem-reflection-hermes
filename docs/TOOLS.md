@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface in this commit: 16 registered tools.
+Current SRH tool surface in this commit: 17 registered tools.
 
 Graph-related capabilities are exposed both as SRH tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`) and through the dashboard API.
 
@@ -105,22 +105,33 @@ Returns:
 - `expired_count`: memories past their `valid_until` date
 - `reflection_acceptance_rate`: ratio of accepted to total audit entries
 
-## Registered Tools
+## Registered Tools (17 total)
 
+### Core Memory (4)
 - `srh_memory_search`
 - `srh_memory_write`
 - `srh_memory_delete`
 - `srh_memory_history`
-- `srh_skill_search`
-- `srh_reflect_now`
+
+### Palace Navigation (5)
 - `srh_palace_zones`
 - `srh_palace_read_zone`
 - `srh_palace_recall`
 - `srh_palace_search`
 - `srh_palace_rebalance`
+
+### Reflection & Profile (2)
+- `srh_reflect_now`
 - `srh_compile_profile`
+
+### Skills (1)
+- `srh_skill_search`
+
+### Graph Memory (4)
 - `srh_associate`
 - `srh_graph_retrieve`
 - `srh_graph_stats`
 - `srh_graph_viz`
+
+### Health & Governance (1)
 - `srh_memory_health` (v0.9.2-beta2)
