@@ -105,7 +105,10 @@ def _get_graph_manager():
     """Get the graph manager if available."""
     try:
         import importlib
-        mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        try:
+            mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        except ImportError:
+            mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.ahe_graph")
         return mod.get_graph_manager()
     except Exception:
         return None
@@ -115,8 +118,12 @@ def _get_cluqi():
     """Get CLUQI instance if available."""
     try:
         import importlib
-        ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-        cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
+        try:
+            ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+            cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
+        except ImportError:
+            ahe = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.ahe_graph")
+            cluqi_mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.cluqi")
         gm = ahe.get_graph_manager()
         return cluqi_mod.CLUQI(srh._get_mem_store(), gm)
     except Exception:
@@ -335,7 +342,10 @@ async def get_graph(
             # Compute PageRank
             try:
                 import importlib
-                pr_mod = importlib.import_module("mem_reflection_hermes.graph.pagerank")
+                try:
+                    pr_mod = importlib.import_module("mem_reflection_hermes.graph.pagerank")
+                except ImportError:
+                    pr_mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.pagerank")
                 pagerank_scores = pr_mod.compute_pagerank(gm.store)
                 for node in nodes:
                     node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
@@ -449,7 +459,10 @@ async def get_zone_analysis():
     """Get cross-zone graph analysis."""
     try:
         import importlib
-        cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
+        try:
+            cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
+        except ImportError:
+            cz = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.cross_zone")
         gm = _get_graph_manager()
         if gm:
             result = cz.analyze_zone_connections(_get_store(), gm.store)

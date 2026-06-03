@@ -132,6 +132,7 @@ def _on_session_end(**kwargs) -> None:
                 _run_full_reflection(ctx, messages)
             except Exception as e:
                 logger.warning("Full reflection failed: %s", e)
+                logger.warning("Full reflection traceback:", exc_info=True)
         else:
             logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
     finally:
