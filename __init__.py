@@ -1009,6 +1009,12 @@ class MemoryStore:
             body: text to check for conflicts
             threshold: override (None = adaptive: 0.75 for CJK, 0.85 for Latin)
             exclude_ids: skip these memory IDs (e.g. targets being superseded)
+
+        Note:
+            BM25 raw scores are unbounded. We normalize via sigmoid (score /
+            (score + 1)) so the result is in (0, 1), matching the adaptive
+            threshold range (0.60-0.85). Without this normalization a short
+            overlapping phrase easily scores 7-35 and blocks legitimate writes.
         """
         # M2: tokenize once for both threshold adjustment and BM25
         tokens = _tokenise(body)
@@ -1022,9 +1028,11 @@ class MemoryStore:
             active = [m for m in active if m.id() not in exclude]
         scored = _bm25_search_scored(active, body, 1, query_tokens=tokens)
         if scored:
-            m, score = scored[0]
-            if score > threshold:
-                return (m.id(), score)
+            m, raw_score = scored[0]
+            # Normalize BM25 raw score to (0, 1) via sigmoid
+            normalized = raw_score / (raw_score + 1.0)
+            if normalized > threshold:
+                return (m.id(), normalized)
         return None
 
     # -- optional embedding index ---------------------------------------------
