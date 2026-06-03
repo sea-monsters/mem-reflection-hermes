@@ -59,6 +59,7 @@ __all__ = [
     "_generate_skill_name",
     "_get_mem_store",
     "_get_skill_store",
+    "_is_noise_text",
     "_load_pending_skill_candidates",
     "_parse_reflect_output",
     "_recent_reflect_outcomes",
@@ -1130,6 +1131,9 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     deduped = []
     seen_texts = []
     for f in facts:
+        # Filter out system notes and tool call artifacts
+        if _is_noise_text(f["text"]):
+            continue
         is_dup = False
         for st in seen_texts:
             if _text_similarity(f["text"], st) > 0.8:
@@ -1140,6 +1144,36 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
             deduped.append(f)
 
     return deduped
+
+
+def _is_noise_text(text: str) -> bool:
+    """Check if extracted text is a system note or tool artifact, not genuine user content.
+
+    These texts should never be saved as memories.
+    """
+    stripped = text.strip()
+
+    # System-level bookkeeping notes
+    if stripped.startswith("[System note:") or stripped.startswith("[System]"):
+        return True
+
+    # Tool placeholder markers
+    if stripped.startswith("[tool]") or stripped.startswith("{"):
+        return True
+
+    # "Review the conversation above and update the skill library" — auto-injected task
+    if "Review the conversation above and update the skill library" in stripped:
+        return True
+
+    # Gateway shutdown / restart notes
+    if "gateway shutdown" in stripped.lower() or "interrupted by a gateway" in stripped.lower():
+        return True
+
+    # Pure JSON / data dumps (tool outputs leaked into message text)
+    if stripped.startswith('{"') or stripped.startswith('['):
+        return True
+
+    return False
 
 
 def _text_similarity(a: str, b: str) -> float:
