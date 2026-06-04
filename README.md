@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.0-beta** — R1 review fixes: thread safety, session-scoped reflection, robust error handling across all modules.
+**Current version: v1.0-beta2** — SQLite-indexed memory store, retrieval/graph/reflection runtime services, and host-contract test coverage.
 
 ## Features
 
@@ -41,6 +41,9 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
 | [docs/review/DESIGN_EVALUATION.md](docs/review/DESIGN_EVALUATION.md) | Design-level evaluation of supersedes chains, graph memory, refinement, and recall |
 | [docs/design/PLAN_0_9_2_BETA2.md](docs/design/PLAN_0_9_2_BETA2.md) | v0.9.2-beta2 development plan based on design-review gaps |
+| [docs/research/beta2-architecture.md](docs/research/beta2-architecture.md) | Current runtime module architecture and service wiring |
+| [docs/research/beta2-code-review.md](docs/research/beta2-code-review.md) | Current code review, fixes, and naming cleanup record |
+| [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Current test coverage map and host-contract smoke status |
 | [docs/review/CODE_REVIEW_v1.0-beta_R1.md](docs/review/CODE_REVIEW_v1.0-beta_R1.md) | v1.0-beta Round 1 code review with 19 CRITICAL and 52 HIGH fixes |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
 | [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |

@@ -514,10 +514,23 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
     """Format message list into a transcript string for reflection.
     Truncates to _MAX_REFLECT_TRANSCRIPT_CHARS to keep costs bounded on
     ultra-long sessions (P1).
+
+    Filters out tool role messages and assistant messages that contain
+    tool_calls to prevent storing tool outputs and invocation records
+    in memory.
     """
     lines = []
     for msg in messages:
         role = msg.get("role", "unknown")
+
+        # Skip tool role messages (tool outputs) entirely
+        if role == "tool":
+            continue
+
+        # Skip assistant messages that are tool invocations
+        if role == "assistant" and "tool_calls" in msg:
+            continue
+
         content = msg.get("content", "")
         if isinstance(content, list):
             # Extract text from multi-modal content
@@ -526,6 +539,9 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
                 if isinstance(part, dict) and part.get("type") == "text":
                     texts.append(part.get("text", ""))
             content = "\n".join(texts)
+        elif not isinstance(content, str):
+            content = str(content)
+
         lines.append(f"[{role}] {content}")
     result = "\n\n".join(lines)
     if len(result) > _MAX_REFLECT_TRANSCRIPT_CHARS:
@@ -1068,7 +1084,7 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
         for s in sentences:
             if _is_explicit_memory_intent(s):
                 s = s.strip()
-                if len(s) > 10:
+                if len(s) > 10 and _is_memorable_content(s):
                     facts.append({
                         "text": s,
                         "confidence": "high",
@@ -1080,7 +1096,7 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     if _is_correction(user_msg):
         sentences = re.split(r'[。！？.!?\n]+', user_msg)
         for s in sentences:
-            if _is_correction(s) and len(s) > 10:
+            if _is_correction(s) and len(s) > 10 and _is_memorable_content(s):
                 facts.append({
                     "text": s.strip(),
                     "confidence": "medium",
@@ -1101,7 +1117,7 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     for pat, source in pref_patterns:
         for m in re.finditer(pat, combined, re.IGNORECASE):
             text = m.group(0).strip()
-            if len(text) > 10:
+            if len(text) > 10 and _is_memorable_content(text):
                 facts.append({
                     "text": text,
                     "confidence": "medium",
@@ -1119,7 +1135,7 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     for pat in conv_patterns:
         for m in re.finditer(pat, combined, re.IGNORECASE):
             text = m.group(0).strip()
-            if len(text) > 10:
+            if len(text) > 10 and _is_memorable_content(text):
                 facts.append({
                     "text": text,
                     "confidence": "medium",
@@ -1184,6 +1200,66 @@ def _text_similarity(a: str, b: str) -> float:
         return 0.0
     inter = len(ta & tb)
     return inter / max(len(ta), len(tb))
+
+
+def _is_memorable_content(text: str) -> bool:
+    """Filter out non-memorable content that shouldn't be stored as memory.
+
+    Rejects:
+    - Tool output patterns (code blocks, exit codes, stdout/stderr)
+    - File paths and code patterns
+    - Very short or very repetitive content
+    - System-like messages
+
+    Returns True if content is worth remembering, False otherwise.
+    """
+    if not text or not isinstance(text, str):
+        return False
+
+    text = text.strip()
+
+    # Too short
+    if len(text) < 15:
+        return False
+
+    # Tool output patterns
+    tool_indicators = [
+        "```", "Exit code", "stdout", "stderr", "Tool ran without output",
+        "Process completed", "Command output", "Execution result",
+        "File created", "File modified", "File deleted",
+    ]
+    text_lower = text.lower()
+    for indicator in tool_indicators:
+        if indicator.lower() in text_lower:
+            return False
+
+    # File paths (Windows and Unix)
+    if re.search(r'[a-zA-Z]:\\[\w\\.-]+|/[\w/\-._]+', text):
+        # Only reject if looks like a file path, not just a path-like string
+        if re.search(r'[\\/]([\w-]+\.[\w]{2,4}|[\w-]+[\\/])', text):
+            return False
+
+    # Code patterns (function/class definitions, imports)
+    code_patterns = [
+        r'^def\s+\w+\s*\(', r'^class\s+\w+', r'^import\s+\w+',
+        r'^from\s+\w+\s+import', r'^\s*(public|private|protected)\s+(void|int|String)',
+        r'^function\s+\w+\s*\(', r'^const\s+\w+\s*=',
+    ]
+    for pat in code_patterns:
+        if re.match(pat, text, re.MULTILINE):
+            return False
+
+    # Very repetitive content (e.g., "------" or "aaaaa")
+    if len(set(text[:50])) < 5:
+        return False
+
+    # System-like messages
+    system_prefixes = ["[system]", "[error]", "[warning]", "[info]", "[debug]"]
+    for prefix in system_prefixes:
+        if text_lower.startswith(prefix.lower()):
+            return False
+
+    return True
 
 
 def _infer_zone_from_scope(scope: str) -> str:
@@ -1584,29 +1660,21 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
         return None
 
     if not facts:
-        # Even without heuristic facts, if novelty is high and user said something substantive,
-        # create a generic memory
-        if novelty > 0.6 and len(user_msg) > 20:
-            facts = [{
-                "text": user_msg[:200],
-                "confidence": "low",
-                "rationale": "Novel user message with no explicit intent markers",
-                "source": "novelty",
-            }]
-        else:
-            _append_reflect_log({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "mode": "embedding_micro",
-                "summary": "Micro-reflection skipped: no facts detected",
-                "audit_entries": [_build_audit_entry(
-                    candidate_id=cand_id,
-                    decision="skipped",
-                    decision_reason="no heuristic facts and novelty not high enough",
-                    novelty_score=novelty,
-                    assigned_zone="episode",
-                )],
-            })
-            return None
+        # If no heuristic facts were extracted, do NOT create a generic memory.
+        # This prevents storing tool outputs, code blocks, and other non-memorable content.
+        _append_reflect_log({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "embedding_micro",
+            "summary": "Micro-reflection skipped: no facts detected",
+            "audit_entries": [_build_audit_entry(
+                candidate_id=cand_id,
+                decision="skipped",
+                decision_reason="no heuristic facts detected",
+                novelty_score=novelty,
+                assigned_zone="episode",
+            )],
+        })
+        return None
 
     # Only take the highest-confidence fact
     facts.sort(key=lambda f: 0 if f["confidence"] == "high" else (1 if f["confidence"] == "medium" else 2))

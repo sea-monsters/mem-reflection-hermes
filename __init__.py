@@ -820,7 +820,7 @@ class MemoryStore:
                       beta: float = 0.3,       # BM25 weight
                       gamma: float = 0.1,      # recency weight (W2)
                       delta: float = 0.1,      # effectiveness weight (W2)
-                      hebbian_beta: float = 0.0,  # Hebbian boost coeff (W2.3, default off)
+                      hebbian_beta: float = 0.0,  # Hebbian boost coefficient, default off
                       hub_bonus: float = 0.05,     # PageRank hub boost (W3.3)
                       use_reranker: bool = False,  # cross-encoder rerank (W2.1)
                       include_history: bool = False) -> List[LoadedMemory]:
@@ -1888,3 +1888,87 @@ def register(ctx) -> None:
     if _gm_getter_func is not None:
         _hooks_mod._gm_getter_func = _gm_getter_func
         _hooks_mod._gm_getter_path = _gm_getter_path
+
+
+# ---------------------------------------------------------------------------
+# Runtime services
+# ---------------------------------------------------------------------------
+
+from . import store as _storage_module      # noqa: E402
+from . import search as _search_module      # noqa: E402
+from . import graph as _graph_module        # noqa: E402
+from . import reflect as _reflection_module # noqa: E402
+from . import context as _context_module    # noqa: E402
+
+_memory_store = None
+_search_index = None
+_graph_index = None
+_reflection_engine = None
+
+
+def _get_indexed_mem_store():
+    """Get the SQLite-indexed memory store."""
+    global _memory_store
+    if _memory_store is None:
+        _memory_store = _storage_module.MemoryStore(
+            _storage_module.user_memories_dir(),
+            _storage_module.project_memories_dir(),
+        )
+        _memory_store.set_graph(_get_graph_index())
+    return _memory_store
+
+
+def _get_search_index():
+    """Get the memory retrieval index."""
+    global _search_index
+    if _search_index is None:
+        _search_index = _search_module.SearchIndex(
+            _get_indexed_mem_store(),
+            graph=_get_graph_index(),
+        )
+    return _search_index
+
+
+def _get_graph_index():
+    """Get the associative memory graph."""
+    global _graph_index
+    if _graph_index is None:
+        _graph_index = _graph_module.GraphIndex(
+            _storage_module.plugin_data_dir() / "graph.db"
+        )
+    return _graph_index
+
+
+def _get_reflection_engine():
+    """Get the reflection engine."""
+    global _reflection_engine
+    if _reflection_engine is None:
+        _reflection_engine = _reflection_module.ReflectionEngine(
+            _get_indexed_mem_store(),
+            _get_search_index(),
+            _get_graph_index(),
+            log_path=_storage_module.plugin_data_dir() / "reflect-log.jsonl",
+        )
+    return _reflection_engine
+
+
+def _get_memory_context(query: str = "", max_tokens: int = 4000) -> str:
+    """Build context from memory, search, and skills."""
+    from .store import SkillStore
+    store = _get_indexed_mem_store()
+    search = _get_search_index()
+    skills = SkillStore(_storage_module.user_skills_dir(), _storage_module.project_skills_dir())
+    return _context_module.build_context(store, search, skills, query, max_tokens)
+
+
+def _get_indexed_skill_store():
+    """Get the skill store."""
+    return _storage_module.SkillStore(
+        _storage_module.user_skills_dir(),
+        _storage_module.project_skills_dir(),
+    )
+
+
+# Route package-level late-binding consumers to the indexed persistence layer.
+_get_mem_store = _get_indexed_mem_store
+_get_skill_store = _get_indexed_skill_store
