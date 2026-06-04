@@ -153,10 +153,14 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
     ctx = kwargs.get("ctx") or _plugin_ctx
 
     # Extract latest user query and assistant response for micro-reflection
+    # Skip assistant messages that contain tool_calls (these are tool invocations)
     user_msg = ""
     assistant_msg = ""
     for msg in reversed(messages):
         if msg.get("role") == "assistant" and not assistant_msg:
+            # Skip if this is a tool invocation message (contains tool_calls)
+            if "tool_calls" in msg:
+                continue
             content = msg.get("content", "")
             if isinstance(content, str):
                 assistant_msg = content

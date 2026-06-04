@@ -6,7 +6,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mem-reflection-hermes** is a self-evolving memory & reflection system plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It provides structured memory persistence, semantic search, reflection pipelines, skill auto-matching, graph memory (Hebbian co-activation), and a dashboard UI. Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes).
 
-Current version: **v1.0-beta** (plugin.yaml version field).
+Current version: **v1.0-beta2** (plugin.yaml version field).
+
+### Architecture (runtime modules + legacy)
+
+The active runtime uses a simplified module set alongside legacy modules scheduled for retirement:
+
+```
+store.py              # SQLite-backed MemoryStore, frontmatter I/O, config, paths (~1024 lines)
+search.py             # SearchIndex: BM25 + embedding + fusion + Hebbian boost (~562 lines)
+graph.py              # GraphIndex: SQLite Hebbian graph, PageRank, spreading activation (~324 lines)
+reflect.py            # ReflectionEngine: raw_chunk default, dependency injection (~403 lines)
+context.py            # Context assembly: Palace mode only (~145 lines)
+dashboard/plugin_api.py # FastAPI dashboard (14 endpoints) (~646 lines)
+```
+
+Full architecture documentation: `docs/research/beta2-architecture.md`
+Code review & fixes: `docs/research/beta2-code-review.md`
+Test coverage docs: `docs/testing/test-coverage.md`
+
+**Legacy modules (deprecated in beta3):**
+```
+core.py               # Will be removed in beta3 (replaced by store.py)
+late_binding.py       # Will be removed in beta3 (circular imports eliminated)
+search/embed.py       # Will be merged into search.py in beta3
+reflection/engine.py  # Will be replaced by reflect.py in beta3
+graph/ahe_graph.py    # Will be replaced by graph.py in beta3
+graph/cluqi.py        # Will be merged into graph.py in beta3
+graph/pagerank.py     # Will be merged into graph.py in beta3
+graph/cross_zone.py   # Will be merged into graph.py in beta3
+hooks/lifecycle.py    # Will be updated to use runtime modules in beta3
+tools/handlers.py     # Will be updated to use runtime modules in beta3
+query/cache.py        # Will be removed in beta3 (cachetools.TTLCache replaces it)
+```
+
+**Migration:**
+```bash
+# One-time memory index migration
+python scripts/migrate_memory_index.py
+```
 
 ## Commands
 
@@ -15,20 +53,26 @@ Current version: **v1.0-beta** (plugin.yaml version field).
 pytest tests/ -v
 
 # Run a single test file
-pytest tests/test_core_data.py -v
+pytest tests/test_store.py -v
+pytest tests/test_search.py -v
+pytest tests/test_graph.py -v
+pytest tests/test_reflect.py -v
+pytest tests/test_context.py -v
+pytest tests/test_dashboard.py -v
+pytest tests/test_e2e.py -v
 
 # Run a specific test class or test
-pytest tests/test_core_data.py::TestFrontmatter -v
-pytest tests/test_core_data.py::TestFrontmatter::test_roundtrip -v
+pytest tests/test_store.py::TestRebuildIndex -v
+pytest tests/test_store.py::TestRebuildIndex::test_rebuild_empty_store -v
 
 # Run with coverage
 pytest tests/ --cov=. --cov-report=term-missing
 
-# Run v0.9.2 feature verification script
-python scripts/check_v092.py
+# Run host-contract smoke script
+python scripts/smoke_host_contract.py
 
 # Run a specific test with warnings shown
-pytest tests/test_core_data.py -v -W default
+pytest tests/test_store.py -v -W default
 
 # Performance benchmark
 python bench_latency.py
@@ -36,27 +80,37 @@ python bench_latency.py
 
 ## Architecture
 
-### Module Layout (13 modules + dashboard, ~8,000 lines)
+> **Beta2 architecture docs**: `docs/research/beta2-architecture.md` (definitive)
+> **Original redesign**: `docs/research/1.0-beta2-redesign.md`
+> **Code review**: `docs/research/beta2-code-review.md`
+> **Test coverage**: `docs/testing/test-coverage.md`
+
+### Module Dependency DAG
 
 ```
-__init__.py           # Package registration, 5 graph/health tools, bootstrap (~1,870 lines)
-core.py               # MemoryStore, SkillStore, models, config, paths, BM25 (~1,078 lines)
-late_binding.py       # Shared late-binding symbol resolution with thread-safe cache (~38 lines)
-search/embed.py       # ONNX embedding engine, cosine similarity, intent classification, LRU cache (~504 lines)
-reflection/engine.py  # Micro/full/raw-chunk reflection, auto-rebalance, profile compilation (~1,692 lines)
-hooks/lifecycle.py    # Session hooks, slash commands, graph manager, micro-reflection cadence (~423 lines)
-tools/handlers.py     # 12 SRH tool handlers exposed to Hermes Agent (~966 lines)
-graph/ahe_graph.py    # SQLite-backed Hebbian graph memory, association engine, Ebbinghaus decay (~1,024 lines)
-graph/cluqi.py        # Cross-Layer Unified Query Interface (Memory + Graph + Supersedes) (~296 lines)
-graph/pagerank.py     # PageRank centrality for graph nodes (~116 lines)
-graph/cross_zone.py   # Cross-zone analysis (bridges, centrality, recommendations) (~133 lines)
-query/cache.py        # Query templates and TTL-based result cache with LRU eviction (~213 lines)
-dashboard/plugin_api.py # FastAPI dashboard (14 endpoints) (~646 lines)
+store.py              ← leaf module, no project imports
+  └── python-frontmatter, tiktoken, sqlite3
+
+search.py             ← imports store.py
+  └── numpy, bm25s, cachetools, functools.lru_cache
+
+graph.py              ← imports store.py (cross_zone only)
+  └── sqlite3 (independent graph.db)
+
+reflect.py            ← imports store.py + search.py + graph.py
+  └── json (reflect-log.jsonl)
+
+context.py            ← imports store.py + search.py
+  └── pure functions, no state
+
+__init__.py           ← imports all modules, registers 17 tools
 ```
 
-### Import Order Rules
+No circular imports. `late_binding.py` is only used in legacy code paths; runtime modules do not depend on it.
 
-This is the **most critical architectural constraint** — modules form a strict dependency chain:
+### Import Order Rules (Legacy)
+
+This constraint applies to **legacy modules only** — runtime modules have no circular import risk:
 
 1. `core.py` — no imports from other project modules (leaf module)
 2. `search/embed.py` — imports from core only
@@ -67,7 +121,7 @@ This is the **most critical architectural constraint** — modules form a strict
 
 Graph modules (`graph/ahe_graph.py`, `cluqi.py`, `pagerank.py`, `cross_zone.py`) import from `core` only. `query/cache.py` imports from `core` only. `late_binding.py` has no project imports.
 
-Avoid circular imports. Use `late_binding.py` for cross-module symbol resolution at runtime.
+Avoid circular imports. Use `late_binding.py` for cross-module symbol resolution at runtime in legacy code only.
 
 ### Thread Safety
 
@@ -112,6 +166,67 @@ Tests use `pytest` with shared fixtures:
 - `temp_store` — MemoryStore with temp root (auto-packages `__init__.py` into `sys.modules`)
 - `temp_graph` — GraphStore backed by temp SQLite (with Windows cleanup retry)
 - `seeded_store` — MemoryStore with 5 pre-loaded memories for ranking/retrieval tests
+
+### Test Loading Pattern (Runtime Modules)
+
+Tests for runtime modules (`store.py`, `search.py`, `graph.py`, `reflect.py`, `context.py`) use `importlib.util.spec_from_file_location` to avoid package-relative import issues when loading standalone files. Each test file has a block like:
+
+```python
+import importlib.util
+_REPO = Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location("_mod_name", str(_REPO / "store.py"))
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["_mod_name"] = _mod
+_spec.loader.exec_module(_mod)
+```
+
+Production code includes `try/except ImportError` fallback blocks for both package-relative and direct loading. `reflect.py` and `context.py` have this pattern; `search.py` and `graph.py` also have it. When editing these files, preserve the fallback.
+
+### Windows Cleanup
+
+Temp directory fixtures include retry loops with `shutil.rmtree` to handle SQLite file locking on Windows:
+
+```python
+for _attempt in range(5):
+    try:
+        shutil.rmtree(tmpdir)
+        break
+    except PermissionError:
+        time.sleep(0.1)
+shutil.rmtree(tmpdir, ignore_errors=True)
+```
+
+### Search Cache Invalidation
+
+`SearchIndex` has three layers of lazy caching that must all be cleared after mutations:
+- `_bm25_retriever` — bm25s index (set to `None` to rebuild)
+- `_embed_array` / `_embed_ids` — numpy embedding matrix (set to `None` to rebuild)
+- `_cache` — `cachetools.TTLCache` for search results (call `invalidate_cache()`)
+- `_embed_single` — `functools.lru_cache` for individual embeddings (call `cache_clear()`)
+
+E2E tests that mutate memories and then search must clear all four:
+
+```python
+search._bm25_retriever = None
+search._embed_array = None
+search.invalidate_cache()
+_embed_single.cache_clear()  # module-level lru_cache
+```
+
+### Dashboard Mock Isolation
+
+`test_dashboard.py` mocks `mem_reflection_hermes` via `sys.modules` before loading `plugin_api.py`. `plugin_api.py` checks `sys.modules` first to avoid overwriting the mock:
+
+```python
+# In plugin_api.py
+try:
+    from .. import __dict__ as _srh_dict
+except ImportError:
+    if "mem_reflection_hermes" in sys.modules:
+        srh = sys.modules["mem_reflection_hermes"]
+    else:
+        # ... load from file
+```
 
 ### Memory Format
 

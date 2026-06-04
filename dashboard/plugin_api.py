@@ -20,12 +20,15 @@ try:
 except ImportError:
     import importlib.util
     plugin_dir = Path(__file__).resolve().parent.parent
-    spec = importlib.util.spec_from_file_location(
-        "mem_reflection_hermes", plugin_dir / "__init__.py"
-    )
-    srh = importlib.util.module_from_spec(spec)  # type: ignore
-    sys.modules["mem_reflection_hermes"] = srh  # Register before exec so sub-imports resolve
-    spec.loader.exec_module(srh)  # type: ignore
+    if "mem_reflection_hermes" in sys.modules:
+        srh = sys.modules["mem_reflection_hermes"]
+    else:
+        spec = importlib.util.spec_from_file_location(
+            "mem_reflection_hermes", plugin_dir / "__init__.py"
+        )
+        srh = importlib.util.module_from_spec(spec)  # type: ignore
+        sys.modules["mem_reflection_hermes"] = srh  # Register before exec so sub-imports resolve
+        spec.loader.exec_module(srh)  # type: ignore
 else:
     class _ModuleProxy:
         def __getattr__(self, name: str) -> Any:
@@ -101,29 +104,27 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
     }
 
 
-def _get_graph_manager():
-    """Get the graph manager if available."""
+def _get_graph_interface():
+    """Get the available graph interface."""
     try:
-        import importlib
-        try:
-            mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-        except ImportError:
-            mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.ahe_graph")
-        return mod.get_graph_manager()
+        from ..graph import GraphIndex
+        from ..store import plugin_data_dir
+        return GraphIndex(plugin_data_dir() / "graph.db")
     except Exception:
-        return None
+        try:
+            import importlib
+            mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+            return mod.get_graph_manager()
+        except Exception:
+            return None
 
 
-def _get_cluqi():
-    """Get CLUQI instance if available."""
+def _get_cross_layer_query():
+    """Get cross-layer query support when available."""
     try:
         import importlib
-        try:
-            ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-            cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
-        except ImportError:
-            ahe = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.ahe_graph")
-            cluqi_mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.cluqi")
+        ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
+        cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
         gm = ahe.get_graph_manager()
         return cluqi_mod.CLUQI(srh._get_mem_store(), gm)
     except Exception:
@@ -183,7 +184,7 @@ async def create_memory(payload: MemoryCreate):
         pass  # Non-JSON result (e.g., success string), proceed
 
     # Auto-associate with related memories in graph
-    gm = _get_graph_manager()
+    gm = _get_graph_interface()
     if gm:
         try:
             # Reuse parsed result when available; do not parse non-JSON responses twice
@@ -215,7 +216,7 @@ async def update_memory(mem_id: str, payload: MemoryUpdate):
     )
     # Update graph meta if zone changed
     if payload.zone:
-        gm = _get_graph_manager()
+        gm = _get_graph_interface()
         if gm:
             try:
                 gm.store.ensure_meta(mem_id, zone=payload.zone)
@@ -233,7 +234,7 @@ async def delete_memory(mem_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
     # Clean up graph edges (beta3: wrap in transaction, fix context-manager misuse)
-    gm = _get_graph_manager()
+    gm = _get_graph_interface()
     if gm:
         conn = None
         try:
@@ -304,7 +305,7 @@ async def get_graph(
         })
 
     # Get graph edges from ahe_graph
-    gm = _get_graph_manager()
+    gm = _get_graph_interface()
     pagerank_scores: Dict[str, float] = {}
     if gm:
         try:
@@ -440,13 +441,13 @@ async def get_graph_neighbors(
     limit: int = Query(20, ge=1, le=200),
 ):
     """Get graph neighbors for a specific memory with metadata enrichment."""
-    cluqi = _get_cluqi()
+    cluqi = _get_cross_layer_query()
     if cluqi:
         neighbors = cluqi.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
         return {"memory_id": mem_id, "neighbors": neighbors}
 
     # Fallback to raw graph store
-    gm = _get_graph_manager()
+    gm = _get_graph_interface()
     if gm:
         neighbors = gm.store.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
         return {"memory_id": mem_id, "neighbors": neighbors}
@@ -463,7 +464,7 @@ async def get_zone_analysis():
             cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
         except ImportError:
             cz = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.cross_zone")
-        gm = _get_graph_manager()
+        gm = _get_graph_interface()
         if gm:
             result = cz.analyze_zone_connections(_get_store(), gm.store)
             return result
@@ -576,7 +577,7 @@ async def get_stats():
 
     # Graph stats
     graph_stats = {"available": False}
-    gm = _get_graph_manager()
+    gm = _get_graph_interface()
     if gm:
         try:
             graph_stats = {
@@ -620,7 +621,7 @@ async def cluqi_query(
     k: int = Query(10, ge=1, le=100),
 ):
     """Cross-layer unified query across MemoryStore, GraphStore, and Supersedes chains."""
-    cluqi = _get_cluqi()
+    cluqi = _get_cross_layer_query()
     if not cluqi:
         raise HTTPException(status_code=503, detail="CLUQI not available")
     try:

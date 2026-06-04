@@ -1,4 +1,4 @@
-"""test_beta2.py — Regression and smoke tests for v0.9.2-beta2.
+"""smoke_host_contract.py — Regression and host-contract smoke checks.
 
 Covers WS-1 (supersedes governance), WS-2 (lineage-aware recall),
 WS-3 (reflection quality audit), WS-6 (temporal/context hints),
@@ -12,6 +12,13 @@ from pathlib import Path
 repo_root = str(Path(__file__).resolve().parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
+
+# Set up temp home before importing plugin modules; several legacy modules bind
+# log/config paths at import time.
+TMPDIR = Path(tempfile.mkdtemp(prefix="hermes_contract_"))
+(TMPDIR / "memory" / "memories").mkdir(parents=True, exist_ok=True)
+(TMPDIR / "memory" / "skills").mkdir(parents=True, exist_ok=True)
+os.environ["HERMES_HOME"] = str(TMPDIR)
 
 # Register mem_reflection_hermes package so subpackage imports work
 if "mem_reflection_hermes" not in sys.modules:
@@ -34,12 +41,6 @@ from mem_reflection_hermes.reflection.engine import (
     _build_audit_entry, _append_reflect_log, _recent_reflect_outcomes,
 )
 from mem_reflection_hermes import MemoryStore
-
-# Set up temp home for isolation
-TMPDIR = Path(tempfile.mkdtemp(prefix="hermes_beta2_"))
-(TMPDIR / "memory" / "memories").mkdir(parents=True, exist_ok=True)
-(TMPDIR / "memory" / "skills").mkdir(parents=True, exist_ok=True)
-os.environ["HERMES_HOME"] = str(TMPDIR)
 
 PASS = 0
 FAIL = 0
@@ -115,27 +116,27 @@ def test_frontmatter_roundtrip():
 test_frontmatter_roundtrip()
 
 
-def test_store_write_update_reorder_preserve_beta2_fields():
+def test_store_write_update_reorder_preserve_contract_fields():
     store_rt = MemoryStore(TMPDIR / "memory" / "roundtrip")
     fm = MemoryFrontmatter.new(source="user", zone="work")
-    fm.id = "roundtrip-beta2"
+    fm.id = "roundtrip-contract"
     fm.supersedes_reason = "manual correction"
     fm.valid_from = "2026-06-01"
     fm.valid_until = "2026-12-31"
     fm.context_scope = "project-alpha"
 
-    path = store_rt.put("user", fm, "Beta2 field preservation.")
+    path = store_rt.put("user", fm, "Contract field preservation.")
     wait_for_file(path)
     store_rt._invalidate_cache()
 
-    updated = store_rt.update("roundtrip-beta2", body="Updated beta2 body.")
+    updated = store_rt.update("roundtrip-contract", body="Updated contract body.")
     parsed, body = parse_frontmatter(updated.source_path.read_text(encoding="utf-8"))
     checks = [
         (parsed.get("supersedes_reason") == "manual correction", "update preserves supersedes_reason"),
         (str(parsed.get("valid_from")) == "2026-06-01", "update preserves valid_from"),
         (str(parsed.get("valid_until")) == "2026-12-31", "update preserves valid_until"),
         (parsed.get("context_scope") == "project-alpha", "update preserves context_scope"),
-        (body == "Updated beta2 body.", "update preserves body"),
+        (body == "Updated contract body.", "update preserves body"),
     ]
     for cond, desc in checks:
         if cond:
@@ -143,17 +144,17 @@ def test_store_write_update_reorder_preserve_beta2_fields():
         else:
             fail(desc, str(parsed))
 
-    store_rt.reorder(["roundtrip-beta2"])
+    store_rt.reorder(["roundtrip-contract"])
     store_rt._invalidate_cache()
-    after = store_rt.get("roundtrip-beta2")
+    after = store_rt.get("roundtrip-contract")
     parsed_after, _ = parse_frontmatter(after.source_path.read_text(encoding="utf-8"))
     if parsed_after.get("supersedes_reason") == "manual correction" and parsed_after.get("context_scope") == "project-alpha":
-        ok("reorder preserves beta2 fields")
+        ok("reorder preserves contract fields")
     else:
-        fail("reorder preserves beta2 fields", str(parsed_after))
+        fail("reorder preserves contract fields", str(parsed_after))
 
 
-test_store_write_update_reorder_preserve_beta2_fields()
+test_store_write_update_reorder_preserve_contract_fields()
 
 # ---------------------------------------------------------------------------
 # WS-1: Lineage helpers
@@ -368,11 +369,11 @@ def test_register_contract():
     else:
         fail("handlers.register: 12 tools", f"got {len(fake.tools)}")
 
-    # 3 hooks from handlers
-    if len(fake.hooks) == 3:
-        ok("handlers.register: 3 hooks")
+    # 4 unique hooks from handlers
+    if set(fake.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
+        ok("handlers.register: 4 unique hooks")
     else:
-        fail("handlers.register: 3 hooks", f"got {len(fake.hooks)}")
+        fail("handlers.register: 4 unique hooks", f"hooks={fake.hooks}")
 
     # Verify pre_llm_call exists and accepts **kwargs
     try:
@@ -401,11 +402,12 @@ def test_register_contract():
             ok("register(ctx): 17 tools total")
         else:
             fail("register(ctx): 17 tools total", f"got {len(fake2.tools)}")
-        # Full plugin: 4 hooks
-        if len(fake2.hooks) == 4:
-            ok("register(ctx): 4 hooks total")
+        # Full plugin: 4 unique hook names. The graph integration may add a
+        # second post_tool_call handler, but it is still the same hook surface.
+        if set(fake2.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
+            ok("register(ctx): 4 unique hooks")
         else:
-            fail("register(ctx): 4 hooks total", f"got {len(fake2.hooks)}")
+            fail("register(ctx): 4 unique hooks", f"hooks={fake2.hooks}")
     except Exception as e:
         fail("register(ctx) full", str(e))
 
