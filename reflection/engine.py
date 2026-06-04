@@ -30,6 +30,8 @@ from ..search.embed import (
     _classify_intent,
 )
 
+from ..late_binding import late_bind
+
 logger = logging.getLogger(__name__)
 
 # Thread-safe locks for file-based operations
@@ -57,6 +59,7 @@ __all__ = [
     "_generate_skill_name",
     "_get_mem_store",
     "_get_skill_store",
+    "_is_noise_text",
     "_load_pending_skill_candidates",
     "_parse_reflect_output",
     "_recent_reflect_outcomes",
@@ -78,29 +81,23 @@ __all__ = [
 
 def _get_mem_store():
     """Late-binding accessor for __init__.py MemoryStore singleton."""
-    from mem_reflection_hermes import _get_mem_store as _f
-    return _f()
+    return late_bind("_get_mem_store")()
 
 def _get_skill_store():
-    from mem_reflection_hermes import _get_skill_store as _f
-    return _f()
+    return late_bind("_get_skill_store")()
 
 def _estimate_tokens(text):
-    from mem_reflection_hermes import _estimate_tokens as _f
-    return _f(text)
+    return late_bind("_estimate_tokens")(text)
 
 def _auto_rebalance_zones():
-    from mem_reflection_hermes import _auto_rebalance_zones as _f
-    return _f()
+    return late_bind("_auto_rebalance_zones")()
 
 def _build_context_block(query=""):
-    from mem_reflection_hermes import _build_context_block as _f
-    return _f(query)
+    return late_bind("_build_context_block")(query)
 
 def _reflection_mode() -> str:
     """Reflection mode from config."""
-    from mem_reflection_hermes import _reflection_mode as _f
-    return _f()
+    return late_bind("_reflection_mode")()
 
 
 def _build_audit_entry(
@@ -446,7 +443,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
 
 def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
     """Max BM25 similarity between text and existing memories (0-1 normalized)."""
-    from mem_reflection_hermes import _bm25_search_scored
+    _bm25_search_scored = late_bind("_bm25_search_scored")
     scored = _bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
     if scored:
         # Normalize BM25 score to 0-1 using sigmoid approximation
@@ -1134,6 +1131,9 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     deduped = []
     seen_texts = []
     for f in facts:
+        # Filter out system notes and tool call artifacts
+        if _is_noise_text(f["text"]):
+            continue
         is_dup = False
         for st in seen_texts:
             if _text_similarity(f["text"], st) > 0.8:
@@ -1144,6 +1144,36 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
             deduped.append(f)
 
     return deduped
+
+
+def _is_noise_text(text: str) -> bool:
+    """Check if extracted text is a system note or tool artifact, not genuine user content.
+
+    These texts should never be saved as memories.
+    """
+    stripped = text.strip()
+
+    # System-level bookkeeping notes
+    if stripped.startswith("[System note:") or stripped.startswith("[System]"):
+        return True
+
+    # Tool placeholder markers
+    if stripped.startswith("[tool]") or stripped.startswith("{"):
+        return True
+
+    # "Review the conversation above and update the skill library" — auto-injected task
+    if "Review the conversation above and update the skill library" in stripped:
+        return True
+
+    # Gateway shutdown / restart notes
+    if "gateway shutdown" in stripped.lower() or "interrupted by a gateway" in stripped.lower():
+        return True
+
+    # Pure JSON / data dumps (tool outputs leaked into message text)
+    if stripped.startswith('{"') or stripped.startswith('['):
+        return True
+
+    return False
 
 
 def _text_similarity(a: str, b: str) -> float:

@@ -1,0 +1,7 @@
+plugins:
+  mem_reflection_hermes:
+    micro_reflection: true
+    reflection_mode: embedding
+    embeddings: true
+    palace_mode: true
+    profile_mode: false

@@ -18,9 +18,12 @@ def late_bind(name: str) -> Any:
         fn = _late_bindings.get(name)
         if fn is not None:
             return fn
-        mod = sys.modules.get("mem_reflection_hermes")
+        mod = (sys.modules.get("hermes_plugins.mem_reflection_hermes")
+               or sys.modules.get("mem_reflection_hermes"))
         if mod is None:
-            raise KeyError("Plugin module not loaded for late binding: mem_reflection_hermes")
+            raise KeyError("Plugin module not loaded for late binding: "
+                           "tried hermes_plugins.mem_reflection_hermes "
+                           "and mem_reflection_hermes")
         fn = getattr(mod, name, None)
         if fn is None:
             raise KeyError(f"Root plugin module has no attribute: {name}")
