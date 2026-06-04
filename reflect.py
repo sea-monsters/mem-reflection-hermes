@@ -152,14 +152,32 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
             if len(t) > 10 and _is_memorable_content(t):
                 facts.append({"text": t, "confidence": "medium", "rationale": "Preference", "source": src})
 
-    # Deduplicate
+    # Deduplicate + filter noise
     deduped = []
     seen = []
     for f in facts:
+        if _is_noise_text(f["text"]):
+            continue
         if all(len(set(_tokenise(f["text"])) & set(_tokenise(s))) / max(len(_tokenise(f["text"])), len(_tokenise(s)), 1) < 0.8 for s in seen):
             seen.append(f["text"])
             deduped.append(f)
     return deduped
+
+
+def _is_noise_text(text: str) -> bool:
+    """Reject system notes and tool artifacts, not genuine user content."""
+    stripped = text.strip()
+    if stripped.startswith("[System note:") or stripped.startswith("[System]"):
+        return True
+    if stripped.startswith("[tool]") or stripped.startswith("{"):
+        return True
+    if "Review the conversation above and update the skill library" in stripped:
+        return True
+    if "gateway shutdown" in stripped.lower() or "interrupted by a gateway" in stripped.lower():
+        return True
+    if stripped.startswith('{"') or stripped.startswith('['):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
