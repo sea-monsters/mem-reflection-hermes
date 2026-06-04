@@ -22,7 +22,7 @@
 | core.py (legacy) | test_core_data.py | 10 | frontmatter roundtrip, effectiveness, lineage, safe write |
 | graph/ (legacy) | test_graph_operations.py | 11 | edge CRUD, supersedes, spreading activation, PageRank |
 | search/ (legacy) | test_bm25.py | 7 | tokenisation, BM25 scoring, CJK handling |
-| retrieval (legacy) | test_fusion_rerank.py | 13 | recency, effectiveness, Hebbian boost, hub bonus |
+| retrieval | test_fusion_rerank.py | 17 | recency, effectiveness, Hebbian additive boost, zone filter |
 | query/cache.py | test_query_cache.py | 12 | query templates, TTL cache, invalidation |
 | reflection/ (legacy) | test_reflection.py | 8 | JSON parsing, repair, audit, cadence, supersedes |
 | tools/handlers.py | test_tool_handlers.py | 8 | lineage cycle check, write/read cycle |

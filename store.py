@@ -252,21 +252,26 @@ _TOKEN_RE = re.compile(
     r"[^a-z0-9一-鿿㐀-䶿぀-ゟ゠-ヿ가-힯]+"
 )
 
-_STOPWORDS: Set[str] = {
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-    "should", "may", "might", "can", "could", "must", "ought", "need",
-    "dare", "used", "here", "there", "now", "then", "today", "tomorrow",
-    "yesterday", "just", "only", "also", "even", "back", "after", "again",
-    "further", "once", "about", "up", "out", "down", "off", "over",
-    "under", "again", "this", "that", "these", "those", "it", "its",
-    "and", "or", "but", "not", "no", "nor", "so", "yet", "for",
-    "with", "without", "to", "from", "in", "on", "at", "by",
-    "into", "through", "during", "before", "after", "above", "below",
-    "between", "of", "per", "via", "as", "than", "then", "if",
-    "while", "because", "since", "until", "i", "you", "he", "she",
-    "we", "they", "me", "him", "her", "us", "them",
-}
+_STOPWORDS: Set[str] = set()
+try:
+    from nltk.corpus import stopwords
+    _STOPWORDS = set(stopwords.words('english'))
+except Exception:
+    _STOPWORDS = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+        "should", "may", "might", "can", "could", "must", "ought", "need",
+        "dare", "used", "here", "there", "now", "then", "today", "tomorrow",
+        "yesterday", "just", "only", "also", "even", "back", "after", "again",
+        "further", "once", "about", "up", "out", "down", "off", "over",
+        "under", "again", "this", "that", "these", "those", "it", "its",
+        "and", "or", "but", "not", "no", "nor", "so", "yet", "for",
+        "with", "without", "to", "from", "in", "on", "at", "by",
+        "into", "through", "during", "before", "after", "above", "below",
+        "between", "of", "per", "via", "as", "than", "then", "if",
+        "while", "because", "since", "until", "i", "you", "he", "she",
+        "we", "they", "me", "him", "her", "us", "them",
+    }
 
 _CJK_STOPWORDS: Set[str] = {
     # Chinese
@@ -591,7 +596,8 @@ CREATE TABLE IF NOT EXISTS memories (
     version INTEGER NOT NULL DEFAULT 1,
     supersedes_reason TEXT,
     body_hash TEXT NOT NULL,
-    path TEXT NOT NULL
+    path TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_mem_zone ON memories(zone);
 CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(pinned) WHERE pinned = 1;
@@ -671,6 +677,15 @@ class MemoryStore:
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
         conn.commit()
+        self._ensure_body_column(conn)
+
+    @staticmethod
+    def _ensure_body_column(conn: sqlite3.Connection) -> None:
+        """Add body column to memories table for existing databases (migration)."""
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "body" not in columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+            conn.commit()
 
     # -- disk sync -----------------------------------------------------------
 
@@ -708,12 +723,12 @@ class MemoryStore:
             """INSERT OR REPLACE INTO memories
                (id, scope, zone, confidence, pinned, rank, created, source,
                 valid_from, valid_until, context_scope, version,
-                supersedes_reason, body_hash, path)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                supersedes_reason, body_hash, path, body)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (fm.id, m.scope, fm.zone, fm.confidence, int(fm.pinned), fm.rank,
              fm.created, fm.source, fm.valid_from, fm.valid_until,
              fm.context_scope, fm.version, fm.supersedes_reason, body_hash,
-             str(m.source_path)),
+             str(m.source_path), m.body),
         )
         conn.execute("DELETE FROM tags WHERE memory_id = ?", (fm.id,))
         for tag in (fm.tags or []):
@@ -742,7 +757,46 @@ class MemoryStore:
             raise ValueError(f"Cannot supersede missing memory id(s): {joined}")
 
     def _row_to_loaded(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
-        """Convert a SQLite row to LoadedMemory by reading the .md file."""
+        """Convert a SQLite row to LoadedMemory (reads body from DB, not disk)."""
+        body = row["body"] or ""
+        if not body:
+            return self._row_to_loaded_from_disk(row)
+        try:
+            tags = [
+                r["tag"] for r in self._get_conn().execute(
+                    "SELECT tag FROM tags WHERE memory_id = ?", (row["id"],)
+                ).fetchall()
+            ]
+            supers = [
+                r["old_id"] for r in self._get_conn().execute(
+                    "SELECT old_id FROM supersedes WHERE new_id = ?", (row["id"],)
+                ).fetchall()
+            ]
+            fm = MemoryFrontmatter(
+                id=row["id"],
+                created=row["created"],
+                source=row["source"],
+                confidence=row["confidence"],
+                pinned=bool(row["pinned"]),
+                tags=tags,
+                supersedes=supers,
+                zone=row["zone"],
+                rank=row["rank"],
+                version=row["version"],
+                supersedes_reason=row["supersedes_reason"],
+                valid_from=row["valid_from"],
+                valid_until=row["valid_until"],
+                context_scope=row["context_scope"],
+            )
+            return LoadedMemory(
+                frontmatter=fm, body=body,
+                source_path=Path(row["path"]), scope=row["scope"],
+            )
+        except Exception:
+            return self._row_to_loaded_from_disk(row)
+
+    def _row_to_loaded_from_disk(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
+        """Fallback: read memory from .md file (used when body cache is empty)."""
         path = Path(row["path"])
         if not path.exists():
             return None
