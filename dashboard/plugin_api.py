@@ -107,9 +107,9 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
 def _get_graph_interface():
     """Get the available graph interface."""
     try:
-        from ..graph import GraphIndex
+        from ..graph.compat import GraphManagerCompat
         from ..store import plugin_data_dir
-        return GraphIndex(plugin_data_dir() / "graph.db")
+        return GraphManagerCompat(plugin_data_dir() / "graph.db")
     except Exception:
         try:
             import importlib
@@ -240,8 +240,8 @@ async def delete_memory(mem_id: str):
         try:
             conn = gm.store._connect()
             conn.execute("BEGIN")
-            conn.execute("DELETE FROM graph_edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
-            conn.execute("DELETE FROM graph_memory_meta WHERE id=?", (mem_id,))
+            conn.execute("DELETE FROM edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
+            conn.execute("DELETE FROM graph_meta WHERE memory_id=?", (mem_id,))
             conn.commit()
         except Exception as e:
             if conn is not None:

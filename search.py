@@ -535,6 +535,11 @@ class SearchIndex:
                 pool_ids = [mid for mid in fused_scores]
                 activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
                 scale = max_rerank_score if max_rerank_score > 0 else 1.0
+                # Merge graph-only neighbors into the rerank pool so strongly
+                # associated but semantically distant memories are recoverable.
+                for nid, act in activation.items():
+                    if nid in active_map and nid not in fused_scores:
+                        reranked.append((hebbian_beta * min(act, 1.0) * scale, active_map[nid]))
                 for i, (score, mem) in enumerate(reranked):
                     act = activation.get(mem.id(), 0.0)
                     if act > 0:

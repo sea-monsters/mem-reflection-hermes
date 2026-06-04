@@ -202,8 +202,9 @@ def migrate_graph() -> int:
                     """INSERT OR REPLACE INTO edges
                        (source_id, target_id, relation, weight, co_occurrence, last_activated)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (r["source_id"], r["target_id"], r.get("relation", "co_occurs"),
-                     r["weight"], r.get("co_occurrence", 1), r.get("last_activated")),
+                    (r["source_id"], r["target_id"], r["relation"] if len(r) > 2 else "co_occurs",
+                     r["weight"], r["co_occurrence"] if len(r) > 4 else 1,
+                     r["last_activated"] if len(r) > 5 else None),
                 )
             count = len(rows)
         except Exception as e:

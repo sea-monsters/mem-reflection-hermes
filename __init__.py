@@ -519,8 +519,14 @@ def _register_slash_commands(ctx):
 
     # ── ahe_graph integration (v0.6.1+) ───────────────────────
     try:
+        # Beta2: prefer new GraphIndex via graph.compat shim; fall back to legacy ahe_graph.
         try:
-            from .ahe_graph import get_graph_manager as _get_gm
+            try:
+                from .graph.compat import get_graph_manager_compat as _get_gm
+                logger.info("Using new GraphIndex compatibility layer for graph features")
+            except ImportError:
+                logger.debug("New graph.compat not available, trying legacy ahe_graph")
+                from .ahe_graph import get_graph_manager as _get_gm
         except ImportError:
             logger.debug("Relative import of ahe_graph failed (expected for standalone plugin load), trying importlib fallback")
             # Standalone plugin load: __package__ may be empty, so relative
