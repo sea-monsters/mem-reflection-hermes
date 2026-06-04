@@ -947,7 +947,25 @@ _gm_getter_path = None
 from .reflection.engine import *  # noqa: F401, F403
 from .tools.handlers import *  # noqa: F401, F403
 from .hooks.lifecycle import *  # noqa: F401, F403
-from .search.embed import _embed_single, _cosine_sim  # noqa: F401
+
+# NOTE: Due to the coexistence of new runtime search.py and legacy search/
+# directory, standard `from .search.embed import ...` fails because Python
+# imports search.py instead of the search/ package.  Load embed directly
+# via importlib to bypass the name shadowing.
+_embed_single = None  # noqa: F811
+_cosine_sim = None    # noqa: F811
+try:
+    from .search.embed import _embed_single, _cosine_sim  # noqa: F401, F402
+except ImportError:
+    import importlib.util as _i_util
+    _embed_path = Path(__file__).parent / 'search' / 'embed.py'
+    _spec = _i_util.spec_from_file_location(
+        'mem_reflection_hermes.search.embed_legacy', str(_embed_path))
+    _embed_mod = _i_util.module_from_spec(_spec)
+    sys.modules.setdefault('mem_reflection_hermes.search.embed_legacy', _embed_mod)
+    _spec.loader.exec_module(_embed_mod)
+    _embed_single = _embed_mod._embed_single
+    _cosine_sim = _embed_mod._cosine_sim
 
 # engine.py's __all__ exports _get_mem_store/_get_skill_store, so import *
 # overwrites the root-native versions. Restore them here to prevent recursive
