@@ -14,7 +14,9 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from core import LoadedMemory, MemoryEffectiveness, MemoryFrontmatter
+# Use store.py dataclasses directly (leaf module, no relative imports).
+# core.py's MemoryFrontmatter lacks to_dict() needed by store.py's write_memory_atomic.
+from store import LoadedMemory, MemoryFrontmatter, MemoryEffectiveness
 
 
 def make_memory(

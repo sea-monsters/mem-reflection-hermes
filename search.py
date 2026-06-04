@@ -130,21 +130,22 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
     """Cosine similarity between two dense vectors."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+    try:
+        from scipy.spatial.distance import cosine as _cd
+        return 1.0 - float(_cd(a, b))
+    except Exception:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
 
 # ---------------------------------------------------------------------------
 # BM25 search
 # ---------------------------------------------------------------------------
 
-def _memory_tokens(memory: LoadedMemory) -> Counter:
-    """Tokenize a memory's body + tags for BM25 indexing."""
-    return Counter(_tokenise(memory.body + " " + " ".join(memory.frontmatter.tags or [])))
 
 
 def _bm25_search_scored(
@@ -174,7 +175,7 @@ def _bm25_search_scored(
     if doc_tokens is not None:
         raw_doc_tokens = doc_tokens
     else:
-        raw_doc_tokens = [_memory_tokens(m) for m in memories]
+        raw_doc_tokens = [Counter(_tokenise(m.body + " " + " ".join(m.frontmatter.tags or []))) for m in memories]
 
     for tokens in raw_doc_tokens:
         doc_lens.append(sum(tokens.values()))
@@ -216,17 +217,6 @@ def _bm25_search_scored(
     return [(m, s) for s, m in scored[:k]]
 
 
-def _bm25_search(
-    memories: List[LoadedMemory],
-    query: str,
-    k: int = 5,
-    effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
-    doc_tokens: Optional[List[Counter]] = None,
-) -> List[LoadedMemory]:
-    """BM25 search returning memories only (no scores)."""
-    scored = _bm25_search_scored(memories, query, k, effectiveness, doc_tokens)
-    return [m for m, _ in scored]
-
 
 # ---------------------------------------------------------------------------
 # Keyword extraction
@@ -245,27 +235,6 @@ def _extract_keywords(text: str, top_k: int = 5) -> List[str]:
 # ---------------------------------------------------------------------------
 # Intent classification
 # ---------------------------------------------------------------------------
-
-def _is_explicit_memory_intent(text: str) -> bool:
-    """Check if text contains explicit memory intent markers."""
-    markers = [
-        "记住", "记下来", "记住这个", "请记住",
-        "remember this", "save this", "note this",
-        "记下来", "记一下", "记好了",
-    ]
-    lower = text.lower()
-    return any(m in lower for m in markers)
-
-
-def _is_correction(text: str) -> bool:
-    """Check if text is a correction statement."""
-    markers = [
-        "纠正一下", "更正", "修正", "说错了", "不对",
-        "correct me", "actually", "i was wrong", "correction",
-    ]
-    lower = text.lower()
-    return any(m in lower for m in markers)
-
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +275,9 @@ class SearchIndex:
         with self._bm25_lock:
             self._bm25_retriever = None
             self._bm25_ids = []
+        # Module-level lru_cache for single embeddings must also be cleared
+        # after mutations to avoid stale vector comparisons in conflict detection.
+        _embed_single.cache_clear()
 
     def _ensure_embed_index(self) -> bool:
         """Build numpy embedding array lazily."""
@@ -446,7 +418,6 @@ class SearchIndex:
         gamma: float = 0.1,
         delta: float = 0.1,
         hebbian_beta: float = 0.0,
-        use_reranker: bool = False,
         include_history: bool = False,
         fusion_mode: str = "rrf",
     ) -> List[LoadedMemory]:
@@ -518,6 +489,7 @@ class SearchIndex:
 
         # Layer 3: Rerank — recency, effectiveness, Hebbian, supersedes
         reranked: List[Tuple[float, LoadedMemory]] = []
+        max_rerank_score = 0.0
         for mid, base_score in fused_scores.items():
             mem = active_map[mid]
 
@@ -539,7 +511,7 @@ class SearchIndex:
             sup_factor = (1.0 + sup_depth) / (2.0 + sup_depth)
 
             if fusion_mode == "rrf":
-                # RRF base score × bonuses (recency, eff, Hebbian, supersedes)
+                # RRF base score × bonuses (recency, eff, supersedes)
                 score = base_score
                 if gamma > 0:
                     score *= (1.0 + gamma * recency)
@@ -550,17 +522,24 @@ class SearchIndex:
                 # Weighted: recency and eff are additive terms in the weighted sum
                 score = base_score * sup_factor
 
+            if score > max_rerank_score:
+                max_rerank_score = score
             reranked.append((score, mem))
 
-        # Hebbian boost — spreading activation (applied post-rerank for both modes)
+        # Hebbian boost — spreading activation (HeLa-Mem §3.4 additive fusion)
+        # Formula: S(v_j) = S_base(v_j) + β · Σ_{i∈N(j)} S_base(v_i) · w_ij
+        # We approximate the sum term via graph.spread() and scale it to the
+        # same magnitude as the max rerank score so the two signals are comparable.
         if hebbian_beta > 0 and self._graph is not None:
             try:
                 pool_ids = [mid for mid in fused_scores]
                 activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
+                scale = max_rerank_score if max_rerank_score > 0 else 1.0
                 for i, (score, mem) in enumerate(reranked):
                     act = activation.get(mem.id(), 0.0)
                     if act > 0:
-                        reranked[i] = (score * (1.0 + hebbian_beta * min(act, 1.0)), mem)
+                        hebbian_score = hebbian_beta * min(act, 1.0) * scale
+                        reranked[i] = (score + hebbian_score, mem)
             except Exception as e:
                 logger.debug("Hebbian boost skipped: %s", e)
 
@@ -712,20 +691,8 @@ class SearchIndex:
         return scores
 
     def _calc_supersedes_depth(self, mem_id: str) -> int:
-        """Walk forward through supersedes chain to compute depth."""
-        depth = 0
-        current = mem_id
-        visited: Set[str] = set()
-        while current not in visited:
-            visited.add(current)
-            next_id = self.store.latest_for(current)
-            if next_id is None or next_id.id() == current:
-                break
-            current = next_id.id()
-            depth += 1
-            if depth > 20:
-                break
-        return depth
+        """Proxy to MemoryStore's canonical implementation."""
+        return self.store._calc_supersedes_depth(mem_id)
 
     # -----------------------------------------------------------------------
     # Conflict detection — dual-path

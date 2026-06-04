@@ -167,9 +167,12 @@ Layer 2: Fusion (默认 RRF, 可选 weighted)
   └── Weighted: per-channel min-max normalize → α·cosine + β·bm25
 
 Layer 3: Rerank
-  ├── RRF 模式: base_score × (1+γ·recency) × (1+δ·eff) × sup_factor × (1+η·hebbian)
-  ├── Weighted 模式: (α·cosine + β·bm25 + γ·recency + δ·eff) × sup_factor × (1+η·hebbian)
+  ├── RRF 模式: base_score × (1+γ·recency) × (1+δ·eff) × sup_factor  +  η·hebbian_scaled
+  ├── Weighted 模式: (α·cosine + β·bm25 + γ·recency + δ·eff) × sup_factor  +  η·hebbian_scaled
   └── zone filter → top-k
+
+hebbian_scaled = hebbian_beta × activation × max_rerank_score
+(HeLa-Mem §3.4 additive fusion, scaled to base-score magnitude)
 ```
 
 ### 3.3 公开 API
@@ -181,7 +184,7 @@ class SearchIndex:
 
     def search(query, k=5, *, zone, fusion_mode="rrf",
                alpha=0.5, beta=0.3, gamma=0.1, delta=0.1,
-               hebbian_beta=0.0, use_reranker=False, include_history=False)
+               hebbian_beta=0.0, include_history=False)
         -> list[LoadedMemory]
         # fusion_mode="rrf": 无参数 Reciprocal Rank Fusion (默认)
         # fusion_mode="weighted": alpha/beta/gamma/delta 超参融合
@@ -220,17 +223,22 @@ Path 2: BM25 sigmoid
       阈值: 同上
 ```
 
-### 3.6 Hebbian Boost (代码审查修复 #4)
+### 3.6 Hebbian Boost (HeLa-Mem §3.4 加法融合)
 
 ```python
+# HeLa-Mem formula (4): S(v_j) = S_base(v_j) + β · Σ_{i∈N(j)} S_base(v_i) · w_ij
+# Approximated via graph.spread() and scaled to max_rerank_score magnitude.
 if hebbian_beta > 0 and self._graph is not None:
     activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
-    for mid, act in activation.items():
-        if mid in pool:
-            pool[mid]["hebbian"] = min(act, 1.0)
+    scale = max_rerank_score if max_rerank_score > 0 else 1.0
+    for i, (score, mem) in enumerate(reranked):
+        act = activation.get(mem.id(), 0.0)
+        if act > 0:
+            hebbian_score = hebbian_beta * min(act, 1.0) * scale
+            reranked[i] = (score + hebbian_score, mem)
 
 # 融合公式:
-score = (α·cosine + β·bm25 + γ·recency + δ·eff + η·hebbian) × sup_factor
+score = base_rerank_score + hebbian_beta * activation * max_rerank_score
 ```
 
 ### 3.7 关键设计决策
@@ -536,8 +544,8 @@ context.build_context(store, search, skills, query)
         │   ├── [store] effectiveness()     → eff factor
         │   ├── [store] latest_for()        → supersedes depth
         │   ├── [graph] spread(pool_ids)    → Hebbian activation
-        │   └── score = α·cos + β·bm25 + γ·recency + δ·eff + η·hebbian
-        │              × sup_factor
+        │   └── score = base_rerank + η·hebbian_scaled
+        │              (base_rerank already includes recency, eff, sup_factor)
         │
         └── zone filter → top-k
 ```
@@ -610,7 +618,7 @@ k = 60 (Cormack et al., 2009 学术共识常数)
 | 归一化需求 | 无 (rank 自带归一化) | per-channel min-max |
 | 学术验证 | IR 领域广泛验证 | 项目特定调参 |
 | CJK 公平性 | rank 比较无语言偏差 | 需手动调 α/β |
-| Hebbian 集成 | 乘法 bonus post-rerank | 加法项 in fusion sum |
+| Hebbian 集成 | 乘法 bonus post-rerank | 加法项 post-rerank (HeLa-Mem §3.4) |
 
 ### 12.3 代码路径
 
@@ -618,13 +626,13 @@ k = 60 (Cormack et al., 2009 学术共识常数)
 search(query, fusion_mode="rrf")        ← 默认, 零配置
   ├── Recall (同 weighted)
   ├── _rrf_fusion(embed, bm25)          ← 仅用 rank 信息
-  ├── Rerank: score × recency × eff × hebbian × sup_factor
+  ├── Rerank: base_score × (1+γ·recency) × (1+δ·eff) × sup_factor + η·hebbian_scaled
   └── zone filter → top-k
 
 search(query, fusion_mode="weighted")   ← 向后兼容
   ├── Recall (同上)
   ├── _weighted_fusion(embed, bm25)     ← min-max norm + α·cos + β·bm25
-  ├── Rerank: (base + γ·recency + δ·eff) × hebbian × sup_factor
+  ├── Rerank: (base + γ·recency + δ·eff) × sup_factor + η·hebbian_scaled
   └── zone filter → top-k
 ```
 

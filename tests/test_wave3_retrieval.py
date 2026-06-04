@@ -21,9 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from core import (
-    LoadedMemory, MemoryFrontmatter, _tokenise,
+    LoadedMemory, _tokenise,
     _CJK_STOPWORDS, _STOPWORDS,
 )
+from store import MemoryFrontmatter
 from graph.ahe_graph import GraphStore
 from graph.pagerank import compute_pagerank
 
@@ -162,34 +163,18 @@ class TestHubDetection:
 class TestTimeSorting:
     def test_list_active_sort_by_created_desc(self, sample_memories, temp_store):
         store = temp_store
-        store._cache.setdefault("active", [])
-        store._cache.setdefault("pinned", [])
-        store._cache.setdefault("all", [])
-        store._cache.setdefault("superseded", set())
         for m in sample_memories:
-            store._cache["active"].append(m)
-            store._id_to_mem[m.id()] = m
-        store._cache_valid = True
+            store.put("user", m.frontmatter, m.body)
 
-        sorted_desc = store.list_active(sort_by="created", order="desc")
-        sorted_asc = store.list_active(sort_by="created", order="asc")
-
-        assert len(sorted_desc) == 5
-        dates_desc = [datetime.fromisoformat(m.frontmatter.created.replace("Z", "+00:00")) for m in sorted_desc]
-        assert dates_desc == sorted(dates_desc, reverse=True)
-        dates_asc = [datetime.fromisoformat(m.frontmatter.created.replace("Z", "+00:00")) for m in sorted_asc]
-        assert dates_asc == sorted(dates_asc)
+        results = store.list(zone=None, active_only=False, sort="created")
+        assert len(results) == 5
+        dates = [datetime.fromisoformat(m.frontmatter.created.replace("Z", "+00:00")) for m in results]
+        assert dates == sorted(dates, reverse=True)
 
     def test_list_active_no_sort(self, sample_memories, temp_store):
         store = temp_store
-        store._cache.setdefault("active", [])
-        store._cache.setdefault("pinned", [])
-        store._cache.setdefault("all", [])
-        store._cache.setdefault("superseded", set())
         for m in sample_memories:
-            store._cache["active"].append(m)
-            store._id_to_mem[m.id()] = m
-        store._cache_valid = True
+            store.put("user", m.frontmatter, m.body)
 
         unsorted = store.list_active()
         assert len(unsorted) == 5
@@ -225,26 +210,14 @@ class TestFusionSearchMinimal:
     def test_fusion_search_finds_relevant(self, temp_store):
         """Integration: with mock memories, fusion_search should find relevant results."""
         store = temp_store
-        store._cache.setdefault("active", [])
-        store._cache.setdefault("pinned", [])
-        store._cache.setdefault("all", [])
-        store._cache.setdefault("superseded", set())
-        for i, body in enumerate([
+        for body in [
             "User prefers dark mode in all applications",
             "User likes golang for backend development",
             "Meeting notes from Tuesday standup",
-        ]):
+        ]:
             fm = MemoryFrontmatter.new(source="test", tags=["pref", "dev"])
-            fm.created = datetime(2026, 1, 1 + i, 12, 0, 0, tzinfo=timezone.utc).isoformat()
-            m = LoadedMemory(
-                frontmatter=fm,
-                body=body,
-                scope="user",
-                source_path=Path(f"/tmp/mem_{i}.md"),
-            )
-            store._cache["active"].append(m)
-            store._id_to_mem[m.id()] = m
-        store._cache_valid = True
+            fm.created = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat()
+            store.put("user", fm, body)
 
         results = store.fusion_search("dark mode preference", k=2)
         assert len(results) > 0
@@ -252,24 +225,12 @@ class TestFusionSearchMinimal:
 
     def test_fusion_search_zone_filter(self, temp_store):
         store = temp_store
-        store._cache.setdefault("active", [])
-        store._cache.setdefault("pinned", [])
-        store._cache.setdefault("all", [])
-        store._cache.setdefault("superseded", set())
-        for i, (body, zone) in enumerate([
-            ("Work project deadline tomorrow", "work"),
-            ("Personal hobby photography", "general"),
-        ]):
-            fm = MemoryFrontmatter.new(source="test", zone=zone)
-            m = LoadedMemory(
-                frontmatter=fm,
-                body=body,
-                scope="user",
-                source_path=Path(f"/tmp/mem_{i}.md"),
-            )
-            store._cache["active"].append(m)
-            store._id_to_mem[m.id()] = m
-        store._cache_valid = True
+        fm1 = MemoryFrontmatter.new(source="test", zone="work")
+        fm1.created = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat()
+        store.put("user", fm1, "Work project deadline tomorrow")
+        fm2 = MemoryFrontmatter.new(source="test", zone="general")
+        fm2.created = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc).isoformat()
+        store.put("user", fm2, "Personal hobby photography")
 
         results = store.fusion_search("project", k=5, zone="work")
         assert all(r.frontmatter.zone == "work" for r in results)
