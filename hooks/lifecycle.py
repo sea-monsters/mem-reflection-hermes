@@ -24,7 +24,20 @@ from ..reflection.engine import (
     _format_pending_skills_for_display,
     _reset_current_session_memory_ids,
 )
-from ..search.embed import _is_explicit_memory_intent
+# NOTE: search.py shadows search/ directory — fallback to direct importlib load
+try:
+    from ..search.embed import _is_explicit_memory_intent
+except ImportError:
+    import importlib.util as _i_util
+    from pathlib import Path as _Path
+    _embed_path = _Path(__file__).resolve().parent.parent / 'search' / 'embed.py'
+    _spec = _i_util.spec_from_file_location(
+        'mem_reflection_hermes.search.embed_legacy', str(_embed_path))
+    _embed_mod = _i_util.module_from_spec(_spec)
+    import sys as _sys
+    _sys.modules['mem_reflection_hermes.search.embed_legacy'] = _embed_mod
+    _spec.loader.exec_module(_embed_mod)
+    _is_explicit_memory_intent = _embed_mod._is_explicit_memory_intent
 
 logger = logging.getLogger(__name__)
 

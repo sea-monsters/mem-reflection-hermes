@@ -24,11 +24,39 @@ from ..core import (
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
 )
-from ..search.embed import (
-    _embed_single, _cosine_sim, _extract_keywords,
-    _is_explicit_memory_intent, _is_correction, _is_procedure,
-    _classify_intent,
-)
+
+# NOTE: Due to the coexistence of new runtime search.py and legacy search/
+# directory, the standard sub-package import `from ..search.embed` may fail
+# when search.py shadows the search/ package.  We use a fallback chain:
+# direct sub-package first, then importlib direct load from search/embed.py.
+_embed_single = None
+_cosine_sim = None
+_extract_keywords = None
+_is_explicit_memory_intent = None
+_is_correction = None
+_is_procedure = None
+_classify_intent = None
+try:
+    from ..search.embed import (
+        _embed_single, _cosine_sim, _extract_keywords,
+        _is_explicit_memory_intent, _is_correction, _is_procedure,
+        _classify_intent,
+    )
+except ImportError:
+    import importlib.util as _i_util
+    from pathlib import Path as _Path
+    _embed_path = _Path(__file__).resolve().parent.parent / 'search' / 'embed.py'
+    _spec = _i_util.spec_from_file_location(
+        'mem_reflection_hermes.search.embed_legacy', str(_embed_path))
+    _embed_mod = _i_util.module_from_spec(_spec)
+    _spec.loader.exec_module(_embed_mod)
+    _embed_single = _embed_mod._embed_single
+    _cosine_sim = _embed_mod._cosine_sim
+    _extract_keywords = _embed_mod._extract_keywords
+    _is_explicit_memory_intent = _embed_mod._is_explicit_memory_intent
+    _is_correction = _embed_mod._is_correction
+    _is_procedure = _embed_mod._is_procedure
+    _classify_intent = _embed_mod._classify_intent
 
 from ..late_binding import late_bind
 
