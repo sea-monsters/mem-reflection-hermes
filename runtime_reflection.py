@@ -1853,11 +1853,10 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
     # Get all episode entries
     all_episode = mem_store.list_by_zone("episode")
 
-    # Filter: only non-compacted, non-superseded entries
+    # Filter: only non-compacted entries
     raw_mems = [
         m for m in all_episode
         if "compacted" not in (m.frontmatter.tags or [])
-        and not m.frontmatter.supersedes
     ]
 
     if len(raw_mems) < threshold:
