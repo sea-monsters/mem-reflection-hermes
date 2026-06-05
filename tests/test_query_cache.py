@@ -9,17 +9,25 @@ Run: pytest tests/test_query_cache.py -v
 """
 from __future__ import annotations
 
+import importlib.util
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
-from query.cache import (
-    QueryTemplate,
-    ResultCache,
-    QUERY_TEMPLATES,
-    build_query,
-    get_cache,
-)
+_REPO = Path(__file__).resolve().parent.parent
+_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "search.py"))
+_search = importlib.util.module_from_spec(_spec_search)
+sys.modules["_search"] = _search
+assert _spec_search is not None and _spec_search.loader is not None
+_spec_search.loader.exec_module(_search)
+
+QueryTemplate = _search.QueryTemplate
+ResultCache = _search.ResultCache
+QUERY_TEMPLATES = _search.QUERY_TEMPLATES
+build_query = _search.build_query
+get_cache = _search.get_cache
 
 
 class TestQueryTemplates:

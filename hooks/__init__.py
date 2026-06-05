@@ -1,3 +1,6 @@
-"""Hooks module for mem-reflection-hermes."""
+"""Hook package exports for the beta3 runtime surface."""
 
-from .lifecycle import *  # noqa: F401, F403
+try:
+    from ..runtime_hooks import *  # noqa: F401, F403
+except ImportError:
+    from runtime_hooks import *  # type: ignore # noqa: F401, F403

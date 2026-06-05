@@ -18,7 +18,11 @@ import sqlite3
 import sys
 import threading
 import uuid
-from collections import Counter
+import math
+import queue
+import tempfile
+import time
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +39,13 @@ CONFIG_SECTION = "mem_reflection_hermes"
 CONFIG_KEY_EMBEDDINGS = "embeddings"
 CONFIG_KEY_MICRO_REFLECTION = "micro_reflection"
 CONFIG_KEY_PALACE_MODE = "palace_mode"
+CONFIG_KEY_PROFILE_MODE = "profile_mode"
+CONFIG_KEY_PALACE_INSTRUCTIONS = "palace_instructions"
+CONFIG_KEY_ACTIVE_MEMORY_CAP = "active_memory_index_cap"
+CONFIG_KEY_SKILL_INDEX_CAP = "skill_index_cap"
+CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
+CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
+CONFIG_KEY_INTENT_PROTOTYPES = "intent_prototypes"
 
 # ---------------------------------------------------------------------------
 # Config & paths (with mtime-aware caching)
@@ -113,6 +124,11 @@ def project_skills_dir() -> Optional[Path]:
     return p if p.exists() else None
 
 
+def _plugin_data_dir_legacy() -> Path:
+    """Legacy plugin data directory kept for compatibility."""
+    return hermes_home() / "plugins" / "mem-reflection-hermes"
+
+
 def embeddings_enabled() -> bool:
     """Check if embedding-based search is enabled in config."""
     return plugin_config().get(CONFIG_KEY_EMBEDDINGS, True)
@@ -127,6 +143,11 @@ def palace_mode_enabled() -> bool:
     """Check if palace mode is enabled in config."""
     return bool(plugin_config().get(CONFIG_KEY_PALACE_MODE, True))
 
+
+def profile_mode_enabled() -> bool:
+    """Check if profile mode is enabled in config."""
+    return bool(plugin_config().get(CONFIG_KEY_PROFILE_MODE, False))
+
 # ---------------------------------------------------------------------------
 # Zone constants
 # ---------------------------------------------------------------------------
@@ -137,6 +158,8 @@ _ZONE_GENERAL = "general"
 _ZONE_SEMANTIC = "semantic"
 _VALID_ZONES = {_ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL, _ZONE_SEMANTIC}
 _PROJECT_ZONE_PREFIX = "project:"
+_ZONE_SPLIT_THRESHOLD = 20
+_ZONE_MERGE_THRESHOLD = 3
 
 
 def normalize_zone(zone: Optional[str]) -> str:
@@ -162,6 +185,18 @@ def sanitize_zone_filename(zone: str) -> str:
 def fast_hash(text: str) -> str:
     """Fast non-crypto hash for write-on-change comparison."""
     return hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
+
+
+def palace_index_path() -> Path:
+    """Path to palace-index.md cache file."""
+    return _plugin_data_dir_legacy() / "palace-index.md"
+
+
+def zone_cache_dir() -> Path:
+    """Path to zone-cache directory for per-zone summaries."""
+    d = _plugin_data_dir_legacy() / "zone-cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +269,11 @@ def adaptive_conflict_threshold(body: str) -> float:
     """Return conflict threshold based on CJK ratio.
 
     CJK-dominant (>40%) -> 0.75  |  Mixed (10-40%) -> 0.80  |  Latin -> 0.85
+
+    Note: These thresholds are intentionally higher (more permissive) than
+    early beta values (0.55/0.65) to reduce false-positive conflict matches
+    in diverse content types. The 0.75/0.80/0.85 triage has been validated
+    across CJK mixed, Latin-heavy, and code-dominant corpora.
     """
     ratio = cjk_ratio(body)
     if ratio > 0.40:
@@ -411,6 +451,13 @@ class LoadedMemory:
 
 
 @dataclass
+class MemoryStatEntry:
+    memory_id: str
+    event: str
+    at: str
+
+
+@dataclass
 class MemoryEffectiveness:
     """Per-memory effectiveness tracking (loaded / referenced / accessed)."""
     loaded: int = 0
@@ -453,6 +500,143 @@ class LoadedSkill:
     body: str
     source_path: Path
     scope: str
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter I/O
+# ---------------------------------------------------------------------------
+
+def _load_frontmatter_yaml(yaml_part: str) -> Dict[str, Any]:
+    """Load YAML frontmatter into a dict, preserving nested structures."""
+    try:
+        import msgspec
+        decoded = msgspec.yaml.decode(yaml_part)
+        if isinstance(decoded, dict):
+            return dict(decoded)
+    except Exception:
+        pass
+    try:
+        import yaml
+        data = yaml.safe_load(yaml_part) or {}
+        if isinstance(data, dict):
+            return dict(data)
+    except Exception:
+        pass
+    data: Dict[str, Any] = {}
+    current_list_key: Optional[str] = None
+    for line in yaml_part.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- ") and current_list_key is not None:
+            item = stripped[2:].strip()
+            lst = data.setdefault(current_list_key, [])
+            if isinstance(lst, list):
+                lst.append(item)
+            continue
+        if ":" in stripped:
+            key, _, raw_val = stripped.partition(":")
+            key = key.strip()
+            val = raw_val.strip()
+            current_list_key = None
+            if val == "":
+                current_list_key = key
+                continue
+            if val.lower() == "true":
+                data[key] = True
+            elif val.lower() == "false":
+                data[key] = False
+            elif val.lower() in ("null", "~"):
+                data[key] = None
+            else:
+                try:
+                    if "." in val:
+                        data[key] = float(val)
+                    else:
+                        data[key] = int(val)
+                except (ValueError, TypeError):
+                    data[key] = val
+    return data
+
+
+def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
+    """Parse YAML frontmatter from a memory file."""
+    s = text.strip()
+    if s.startswith("\ufeff"):
+        s = s[1:]
+    if not s.startswith("---"):
+        return {}, text
+    lines = s.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    yaml_lines: List[str] = []
+    body_start = None
+    for idx, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            body_start = idx + 1
+            break
+        yaml_lines.append(line)
+
+    if body_start is None:
+        return {}, text
+
+    yaml_part = "".join(yaml_lines)
+    body_part = "".join(lines[body_start:])
+    data = _load_frontmatter_yaml(yaml_part)
+    if not isinstance(data, dict):
+        return {}, text
+    data = dict(data)
+    data.setdefault("id", "")
+    data.setdefault("created", "")
+    data.setdefault("source", "conversation")
+    data.setdefault("confidence", "medium")
+    data.setdefault("pinned", False)
+    data.setdefault("tags", [])
+    data.setdefault("supersedes", [])
+    data.setdefault("supersedes_reason", None)
+    data.setdefault("valid_from", None)
+    data.setdefault("valid_until", None)
+    data.setdefault("context_scope", None)
+    data.setdefault("zone", "general")
+    data.setdefault("always_active", False)
+    data.setdefault("rank", 0)
+    return data, body_part.strip()
+
+
+def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
+    """Serialize a dict + body into YAML frontmatter format."""
+    buf = ["---"]
+    for key in ("id", "created", "source", "confidence", "zone"):
+        val = data.get(key, "")
+        if val:
+            buf.append(f"{key}: {val}")
+    if data.get("pinned"):
+        buf.append("pinned: true")
+    tags = data.get("tags", [])
+    if tags:
+        buf.append("tags:")
+        for t in tags:
+            buf.append(f"  - {t}")
+    supersedes = data.get("supersedes", [])
+    if supersedes:
+        buf.append("supersedes:")
+        for s in supersedes:
+            buf.append(f"  - {s}")
+    for key in ("supersedes_reason", "valid_from", "valid_until", "context_scope"):
+        val = data.get(key)
+        if val is not None:
+            buf.append(f"{key}: {val}")
+    if data.get("always_active"):
+        buf.append("always_active: true")
+    rank = data.get("rank")
+    if rank is not None and rank != 0:
+        buf.append(f"rank: {rank}")
+    buf.append("---")
+    if body:
+        buf.append("")
+        buf.append(body)
+    return "\n".join(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -566,15 +750,403 @@ def write_memory_atomic(path: Path, fm: MemoryFrontmatter, body: str) -> None:
                           allow_unicode=True, sort_keys=False)
     nl = chr(10)
     content = chr(45)*3 + nl + yaml_part + chr(45)*3 + nl + body + nl
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    _safe_write(path, content)
+
+
+_stat_write_lock = threading.Lock()
+
+
+def _stats_path() -> Path:
+    return plugin_data_dir() / "memory-stats.jsonl"
+
+
+def _append_stat_entries(entries: List[Tuple[str, str]]) -> None:
+    """Append memory stat entries synchronously so cache refresh is immediate."""
+    now = datetime.now(timezone.utc).isoformat()
+    sp = _stats_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    with _stat_write_lock:
+        with open(sp, "a", encoding="utf-8") as f:
+            for memory_id, event in entries:
+                f.write(json.dumps({
+                    "memory_id": memory_id,
+                    "event": event,
+                    "at": now,
+                }, ensure_ascii=False) + "\n")
+
+
+def record_memory_stat(memory_id: str, event: str) -> None:
+    """Append a memory stat entry to stats.jsonl synchronously."""
     try:
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(str(tmp), str(path))
+        _append_stat_entries([(memory_id, event)])
     except Exception:
-        if tmp.exists():
-            tmp.unlink()
-        raise
+        logger.warning("Failed to record memory stat for %s", memory_id)
+
+
+def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
+    """Append multiple stat entries synchronously."""
+    try:
+        _append_stat_entries(entries)
+    except Exception:
+        logger.warning("Stat sync write failed")
+
+
+# P2-2: Async file writer
+_write_queue: "queue.Queue[Tuple[Path, str, int]]" = queue.Queue(maxsize=500)
+_pending_writes: Set[Path] = set()
+_write_guard_lock = threading.Lock()
+_write_path_locks: Dict[str, threading.RLock] = {}
+_write_generations: Dict[str, int] = {}
+
+
+def _write_path_key(path: Path) -> str:
+    return str(path.resolve(strict=False))
+
+
+def _write_path_lock(path: Path) -> threading.RLock:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        lock = _write_path_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _write_path_locks[key] = lock
+        return lock
+
+
+def _reserve_write_generation(path: Path) -> int:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        token = _write_generations.get(key, 0) + 1
+        _write_generations[key] = token
+        return token
+
+
+def _is_current_write_generation(path: Path, token: int) -> bool:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        return _write_generations.get(key, 0) == token
+
+
+def _cleanup_write_generations(path: Path) -> None:
+    with _write_guard_lock:
+        if path not in _pending_writes:
+            key = _write_path_key(path)
+            _write_generations.pop(key, None)
+            _write_path_locks.pop(key, None)
+
+
+def _cancel_pending_write(path: Path) -> None:
+    key = _write_path_key(path)
+    with _write_guard_lock:
+        _write_generations[key] = _write_generations.get(key, 0) + 1
+        _pending_writes.discard(path)
+        _cleanup_write_generations(path)
+
+
+def _safe_write(path: Path, content: str) -> None:
+    """Atomically write content to path via unique-temp-file + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8",
+        dir=path.parent, suffix=".tmp", delete=False,
+    )
+    try:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    finally:
+        f.close()
+    for _ in range(5):
+        try:
+            os.replace(f.name, path)
+            return
+        except PermissionError:
+            time.sleep(0.01)
+    os.replace(f.name, path)
+
+
+def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
+    return {
+        "id": fm.id,
+        "created": fm.created,
+        "source": fm.source,
+        "confidence": fm.confidence,
+        "pinned": fm.pinned,
+        "tags": fm.tags,
+        "supersedes": fm.supersedes,
+        "supersedes_reason": fm.supersedes_reason,
+        "valid_from": fm.valid_from,
+        "valid_until": fm.valid_until,
+        "context_scope": fm.context_scope,
+        "zone": fm.zone,
+        "rank": fm.rank,
+    }
+
+
+def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
+    content = serialize_frontmatter(_frontmatter_to_data(fm), body)
+    _safe_write(path, content)
+
+
+def _file_flush_worker() -> None:
+    while True:
+        try:
+            item = _write_queue.get(timeout=1)
+        except Exception:
+            continue
+        if item is None:
+            break
+        path, content, token = item
+        try:
+            with _write_path_lock(path):
+                if not _is_current_write_generation(path, token):
+                    continue
+                _safe_write(path, content)
+        except Exception:
+            logger.warning("Async write failed for %s", path)
+        finally:
+            _pending_writes.discard(path)
+            _cleanup_write_generations(path)
+
+
+_write_thread = threading.Thread(target=_file_flush_worker, daemon=True)
+_write_thread.start()
+
+
+def async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
+    """Submit memory file write to background thread."""
+    content = serialize_frontmatter(_frontmatter_to_data(fm), body)
+    token = _reserve_write_generation(path)
+    _pending_writes.add(path)
+    try:
+        _write_queue.put_nowait((path, content, token))
+    except queue.Full:
+        _pending_writes.discard(path)
+        try:
+            with _write_path_lock(path):
+                if _is_current_write_generation(path, token):
+                    _safe_write(path, content)
+        except Exception as e:
+            logger.warning("Sync write fallback failed for %s: %s", path, e)
+
+
+def _shutdown_file_writer() -> None:
+    _write_queue.put(None)
+    _write_thread.join(timeout=5)
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_file_writer)
+
+
+def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
+    sp = _stats_path()
+    if not sp.exists():
+        return {}
+    eff: Dict[str, MemoryEffectiveness] = {}
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mid = entry.get("memory_id", "")
+                if not mid:
+                    continue
+                e = eff.setdefault(mid, MemoryEffectiveness())
+                ev = entry.get("event", "")
+                if ev == "loaded":
+                    e.loaded += 1
+                elif ev == "referenced":
+                    e.referenced += 1
+                elif ev == "accessed":
+                    e.accessed += 1
+                at = entry.get("at")
+                if at and (e.last_event_at is None or at > e.last_event_at):
+                    e.last_event_at = at
+    except Exception as e:
+        logger.warning("Failed to load effectiveness stats from %s: %s", sp, e)
+    return eff
+
+
+def _bm25_search_scored(
+    memories: List[LoadedMemory],
+    query: str,
+    k: int = 5,
+    effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+    doc_tokens: Optional[List[Tuple[str, Counter]]] = None,
+    query_tokens: Optional[List[str]] = None,
+) -> List[Tuple[LoadedMemory, float]]:
+    k1, b = 1.5, 0.75
+    if k == 0 or not memories:
+        return []
+    q_tokens = query_tokens if query_tokens is not None else _tokenise(query)
+    if not q_tokens:
+        return []
+    n = len(memories)
+
+    df: Dict[str, int] = Counter()
+    doc_lens: List[int] = []
+    if doc_tokens is not None:
+        raw_doc_tokens = [tokens for _, tokens in doc_tokens]
+    else:
+        raw_doc_tokens = [_memory_tokens(m) for m in memories]
+    for tokens in raw_doc_tokens:
+        doc_lens.append(len(tokens))
+        for t in set(tokens):
+            df[t] += 1
+
+    avgdl = sum(doc_lens) / max(n, 1)
+
+    q_tf = Counter(q_tokens)
+    idf_cache: Dict[str, float] = {}
+    for t in q_tf:
+        df_t = df.get(t, 0)
+        if df_t == 0:
+            continue
+        idf_cache[t] = math.log((n - df_t + 0.5) / (df_t + 0.5) + 1.0)
+
+    if not idf_cache:
+        return []
+
+    scored: List[Tuple[float, LoadedMemory]] = []
+    for i, (tokens, m) in enumerate(zip(raw_doc_tokens, memories)):
+        doc_len = doc_lens[i]
+        m_tf = Counter(tokens)
+        score = 0.0
+        for t, q_count in q_tf.items():
+            idf = idf_cache.get(t)
+            if idf is None:
+                continue
+            tf = m_tf.get(t, 0)
+            norm = k1 * (1 - b + b * doc_len / max(avgdl, 1))
+            score += idf * (tf * (k1 + 1)) / (tf + norm) * q_count
+        if score > 0:
+            if effectiveness:
+                eff = effectiveness.get(m.id())
+                if eff:
+                    score *= eff.factor() * eff.decay_factor()
+            scored.append((score, m))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(m, s) for s, m in scored[:k]]
+
+
+def _bm25_search(
+    memories: List[LoadedMemory],
+    query: str,
+    k: int,
+    effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+    doc_tokens: Optional[List[Tuple[str, List[str]]]] = None,
+) -> List[LoadedMemory]:
+    scored = _bm25_search_scored(memories, query, k, effectiveness, doc_tokens)
+    return [m for m, _ in scored]
+
+
+def _cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if not a or not b:
+        return 0.0
+    intersection = set(a) & set(b)
+    if not intersection:
+        return 0.0
+    dot = sum(a[k] * b[k] for k in intersection)
+    norm_a = sum(v * v for v in a.values()) ** 0.5
+    norm_b = sum(v * v for v in b.values()) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _lineage_latest(store, mem_id: str) -> Optional[str]:
+    current = mem_id
+    visited: Set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        successor = None
+        for m in store.list():
+            if current in (m.frontmatter.supersedes or []):
+                successor = m.id()
+                break
+        if successor is None:
+            break
+        current = successor
+    return current if current != mem_id else None
+
+
+def _lineage_root(store, mem_id: str) -> str:
+    current = mem_id
+    visited: Set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        m = store.get(current)
+        if m is None or not m.frontmatter.supersedes:
+            break
+        current = m.frontmatter.supersedes[0]
+    return current
+
+
+def _lineage_depth(store, mem_id: str, visited: Optional[Set[str]] = None) -> int:
+    if visited is None:
+        visited = set()
+    if mem_id in visited:
+        return 0
+    visited.add(mem_id)
+    m = store.get(mem_id)
+    if m is None or not m.frontmatter.supersedes:
+        return 0
+    parent = m.frontmatter.supersedes[0]
+    return 1 + _lineage_depth(store, parent, visited)
+
+
+def _lineage_cycle_check(store, mem_id: str) -> Optional[List[str]]:
+    path: List[str] = []
+    current = mem_id
+    while current is not None:
+        if current in path:
+            cycle_start = path.index(current)
+            return path[cycle_start:] + [current]
+        path.append(current)
+        m = store.get(current)
+        if m is None or not m.frontmatter.supersedes:
+            break
+        current = m.frontmatter.supersedes[0]
+    return None
+
+
+def _classify_update_intent(old_body: str, new_body: str) -> str:
+    old_lower = old_body.lower()
+    new_lower = new_body.lower()
+    correction_markers = ["actually", "wrong", "incorrect", "not anymore", "no longer", "changed", "updated"]
+    if any(m in new_lower for m in correction_markers):
+        return "correction"
+    if "except" in new_lower or "unless" in new_lower or "but for" in new_lower:
+        return "scoped_exception"
+    if any(m in new_lower for m in ["on monday", "on tuesday", "yesterday", "last week", "then"]):
+        if any(m in old_lower for m in ["on monday", "on tuesday", "yesterday", "last week", "then"]):
+            return "historical_episode"
+    if len(new_body) > len(old_body) * 1.3 and old_lower in new_lower:
+        return "elaboration"
+    return "replacement"
+
+
+def _is_expired(fm: MemoryFrontmatter, now: Optional[datetime] = None) -> bool:
+    if fm.valid_until is None:
+        return False
+    try:
+        until_dt = datetime.fromisoformat(fm.valid_until)
+        now_dt = now or datetime.now(timezone.utc)
+        return now_dt > until_dt
+    except Exception:
+        return False
+
+
+def _is_context_mismatch(fm: MemoryFrontmatter, current_scope: Optional[str] = None) -> bool:
+    if fm.context_scope is None or current_scope is None:
+        return False
+    return fm.context_scope != current_scope
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +1219,18 @@ class MemoryStore:
         self._db_path = db_path if db_path is not None else plugin_data_dir() / "memories.db"
         self._search_index = None
         self._graph = None
+        self._index_dirty = True
+        self._cached_index = ""
+        self._last_index_hash = ""
         self._init_db()
         self._sync_from_disk()
+
+    def _mark_changed(self) -> None:
+        """Invalidate derived runtime views after a mutation."""
+        self._index_dirty = True
+        self._cached_index = ""
+        if self._search_index is not None:
+            self._search_index.invalidate_cache()
 
     # -- SQLite connection (thread-local) ------------------------------------
 
@@ -708,11 +1290,10 @@ class MemoryStore:
                 disk_ids.add(m.id())
                 self._upsert_memory_row(conn, m)
         # Remove rows whose files no longer exist on disk
-        if disk_ids:
-            existing = {r["id"] for r in conn.execute("SELECT id FROM memories").fetchall()}
-            stale = existing - disk_ids
-            for sid in stale:
-                conn.execute("DELETE FROM memories WHERE id = ?", (sid,))
+        existing = {r["id"] for r in conn.execute("SELECT id FROM memories").fetchall()}
+        stale = existing - disk_ids
+        for sid in stale:
+            conn.execute("DELETE FROM memories WHERE id = ?", (sid,))
         conn.commit()
 
     def _upsert_memory_row(self, conn: sqlite3.Connection, m: LoadedMemory) -> None:
@@ -825,14 +1406,16 @@ class MemoryStore:
                 raise ValueError(f"Duplicate memory id: {fm.id}")
             self._validate_supersedes_targets(conn, fm)
             root = self._root_for(scope)
-            date_prefix = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            short = fm.id[:16]
+            raw_date = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date_prefix = re.sub(r'[\\/]', '_', raw_date)
+            short = re.sub(r'[^a-zA-Z0-9_-]', '_', fm.id[:16])
             path = root / f"{date_prefix}-{short}.md"
             write_memory_atomic(path, fm, body)
             m = LoadedMemory(frontmatter=fm, body=body.strip(),
                              source_path=path, scope=scope)
             self._upsert_memory_row(conn, m)
             conn.commit()
+            self._mark_changed()
             return path
 
     def get(self, mem_id: str) -> Optional[LoadedMemory]:
@@ -858,7 +1441,11 @@ class MemoryStore:
             ).fetchone()
             if row is None:
                 return False
-            path = Path(row["path"])
+            path = Path(row["path"]).resolve()
+            expected_root = self._root_for(scope).resolve()
+            if not str(path).startswith(str(expected_root)):
+                logger.warning("Rejecting delete of out-of-bounds path: %s", path)
+                return False
             if path.exists():
                 try:
                     path.unlink()
@@ -867,6 +1454,7 @@ class MemoryStore:
                     return False
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
             conn.commit()
+            self._mark_changed()
             return True
 
     def update(self, mem_id: str, body: Optional[str] = None,
@@ -913,9 +1501,18 @@ class MemoryStore:
             )
             self._upsert_memory_row(conn, updated)
             conn.commit()
+            self._mark_changed()
             return updated
 
     # -- listing & queries ---------------------------------------------------
+
+    # Allowlisted sort orders to prevent SQL injection via sort parameter
+    _LIST_SORT_ORDERS: Dict[str, str] = {
+        "rank": "rank DESC, created DESC",
+        "created": "created DESC",
+        "created_asc": "created ASC",
+        "zone": "zone ASC, rank DESC",
+    }
 
     def list(self, *, zone: Optional[str] = None,
              active_only: bool = False, sort: str = "rank",
@@ -930,10 +1527,11 @@ class MemoryStore:
         if active_only:
             clauses.append("id NOT IN (SELECT old_id FROM supersedes)")
         where = " AND ".join(clauses) if clauses else "1=1"
-        order = "rank DESC, created DESC" if sort == "rank" else "created DESC"
+        order = self._LIST_SORT_ORDERS.get(sort, self._LIST_SORT_ORDERS["rank"])
         sql = f"SELECT * FROM memories WHERE {where} ORDER BY {order}"
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
         rows = conn.execute(sql, params).fetchall()
         results: List[LoadedMemory] = []
         for row in rows:
@@ -1374,4 +1972,5 @@ class MemoryStore:
                 )
                 reordered.append(mid)
             conn.commit()
+            self._mark_changed()
             return reordered

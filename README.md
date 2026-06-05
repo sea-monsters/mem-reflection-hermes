@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.0-beta2** — SQLite-indexed memory store, retrieval/graph/reflection runtime services, and host-contract test coverage.
+**Current version: v1.0-beta3** — beta3-cleaned runtime services, retired pre-beta2 implementations, and host-contract test coverage.
 
 ## Features
 
@@ -17,12 +17,12 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Full Reflection**: Session-end structured summary with human approval for skills
 - **Skill Auto-Matching**: Token overlap + optional embedding hybrid
 - **Profile Compilation**: LLM-driven compilation into structured profile documents
-- **Graph Memory (ahe_graph)**: Hebbian co-occurrence learning, Ebbinghaus decay, adaptive retrieval
-- **CLUQI**: Cross-Layer Unified Query across MemoryStore, GraphStore, and supersedes chains
+- **Runtime Graph Memory**: GraphIndex-backed Hebbian co-occurrence learning, decay, PageRank, and adaptive retrieval
+- **Runtime Query APIs**: Dashboard/search query paths combine MemoryStore, search templates/cache, graph neighbors, and supersedes-aware recall
 - **PageRank**: Centrality scores for hub memory identification
 - **Query Templates & Cache**: 8 predefined patterns with TTL-based result caching
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
-- **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + CLUQI search + zone analysis
+- **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + runtime search + zone analysis
 - **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
 - **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
 - **Thread Safety**: RLock on MemoryStore, locks on session state and embedding cache
@@ -35,15 +35,16 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | Document | Description |
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v1.0-beta |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v1.0-beta3 |
 | [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
 | [docs/review/DESIGN_EVALUATION.md](docs/review/DESIGN_EVALUATION.md) | Design-level evaluation of supersedes chains, graph memory, refinement, and recall |
-| [docs/design/PLAN_0_9_2_BETA2.md](docs/design/PLAN_0_9_2_BETA2.md) | v0.9.2-beta2 development plan based on design-review gaps |
+| [docs/design/PLAN_0_9_2_BETA2.md](docs/design/PLAN_0_9_2_BETA2.md) | Historical v0.9.2-beta2 development plan based on design-review gaps |
 | [docs/research/beta2-architecture.md](docs/research/beta2-architecture.md) | Current runtime module architecture and service wiring |
 | [docs/research/beta2-code-review.md](docs/research/beta2-code-review.md) | Current code review, fixes, and naming cleanup record |
 | [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Current test coverage map and host-contract smoke status |
+| [docs/review/CODE_REVIEW_v1.0-beta3_R1.md](docs/review/CODE_REVIEW_v1.0-beta3_R1.md) | v1.0-beta3 Round 1 cleanup/runtime code review |
 | [docs/review/CODE_REVIEW_v1.0-beta_R1.md](docs/review/CODE_REVIEW_v1.0-beta_R1.md) | v1.0-beta Round 1 code review with 19 CRITICAL and 52 HIGH fixes |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
 | [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |

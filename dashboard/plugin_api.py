@@ -3,8 +3,8 @@
 Exposes endpoints for memory graph visualization, skill inventory,
 reflection history, and memory management (CRUD + reorder).
 
-v0.9.2: Full ahe_graph integration — Hebbian edges, SUPERSEDES edges,
-PageRank scores, cross-zone analysis, CLUQI queries.
+v0.9.2: GraphIndex-backed graph API — Hebbian edges, SUPERSEDES edges,
+PageRank scores, cross-zone analysis, CLUQI-style queries.
 """
 
 import json
@@ -107,28 +107,115 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
 def _get_graph_interface():
     """Get the available graph interface."""
     try:
-        from ..graph.compat import GraphManagerCompat
+        from ..runtime_graph import GraphManagerCompat
         from ..store import plugin_data_dir
         return GraphManagerCompat(plugin_data_dir() / "graph.db")
     except Exception:
-        try:
-            import importlib
-            mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-            return mod.get_graph_manager()
-        except Exception:
-            return None
+        return None
 
 
 def _get_cross_layer_query():
     """Get cross-layer query support when available."""
-    try:
-        import importlib
-        ahe = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-        cluqi_mod = importlib.import_module("mem_reflection_hermes.graph.cluqi")
-        gm = ahe.get_graph_manager()
-        return cluqi_mod.CLUQI(srh._get_mem_store(), gm)
-    except Exception:
+    store = _get_store()
+    gm = _get_graph_interface()
+    if store is None:
         return None
+    return _CrossLayerQueryCompat(store, gm)
+
+
+class _CrossLayerResult:
+    def __init__(self, memory_id: str, layer_scores: Dict[str, float], metadata: Dict[str, Any], sources: List[str]):
+        self.memory_id = memory_id
+        self.layer_scores = layer_scores
+        self.metadata = metadata
+        self.sources = sources
+
+    def total_score(self, weights: Optional[Dict[str, float]] = None) -> float:
+        if weights is None:
+            weights = {"memory": 0.4, "graph": 0.35, "supersedes": 0.25}
+        return sum(self.layer_scores.get(k, 0.0) * weights.get(k, 0.0) for k in weights)
+
+
+class _CrossLayerQueryCompat:
+    """Small query bridge built from the beta2 runtime services."""
+
+    def __init__(self, memory_store, graph_manager):
+        self.store = memory_store
+        self.gm = graph_manager
+
+    def query(
+        self,
+        query: str,
+        *,
+        zone: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        min_confidence: Optional[str] = None,
+        include_superseded: bool = False,
+        k: int = 10,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> List[_CrossLayerResult]:
+        mems = self.store.search(query, k=max(k * 3, k), zone=zone, include_history=include_superseded)
+        conf_order = {"low": 0, "medium": 1, "high": 2}
+        if tags or min_confidence:
+            min_level = conf_order.get(min_confidence, 0) if min_confidence else 0
+            filtered = []
+            for m in mems:
+                if tags and not any(t in (m.frontmatter.tags or []) for t in tags):
+                    continue
+                if min_confidence and conf_order.get(m.frontmatter.confidence, 0) < min_level:
+                    continue
+                filtered.append(m)
+            mems = filtered
+
+        pagerank_scores: Dict[str, float] = {}
+        if self.gm is not None:
+            try:
+                pagerank_scores = self.gm.pagerank()
+            except Exception:
+                pagerank_scores = {}
+
+        results: List[_CrossLayerResult] = []
+        for idx, mem in enumerate(mems[:k]):
+            mem_score = 1.0 / (idx + 1)
+            lineage_status = "current"
+            if hasattr(self.store, "is_superseded") and self.store.is_superseded(mem.id()):
+                lineage_status = "superseded"
+            elif hasattr(self.store, "latest_for"):
+                latest = self.store.latest_for(mem.id())
+                if latest is None or latest.id() == mem.id():
+                    lineage_status = "current" if mem.frontmatter.supersedes else "root"
+            layer_scores = {
+                "memory": mem_score,
+                "graph": pagerank_scores.get(mem.id(), 0.0),
+                "supersedes": 0.35 if lineage_status == "current" else (0.15 if lineage_status == "root" else 0.05),
+            }
+            sources = ["memory"]
+            if layer_scores["graph"] > 0:
+                sources.append("graph")
+            if layer_scores["supersedes"] > 0:
+                sources.append("supersedes")
+            results.append(_CrossLayerResult(
+                memory_id=mem.id(),
+                layer_scores=layer_scores,
+                metadata={
+                    "body": mem.body[:200],
+                    "zone": mem.frontmatter.zone,
+                    "tags": mem.frontmatter.tags,
+                    "confidence": mem.frontmatter.confidence,
+                    "pinned": mem.frontmatter.pinned,
+                    "supersedes": mem.frontmatter.supersedes,
+                    "lineage_status": lineage_status,
+                },
+                sources=sources,
+            ))
+
+        results.sort(key=lambda r: r.total_score(weights), reverse=True)
+        return results[:k]
+
+    def get_neighbors(self, mem_id: str, min_weight: float = 0.1, limit: int = 20):
+        if self.gm is None:
+            return []
+        return self.gm.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +338,6 @@ async def delete_memory(mem_id: str):
                     pass
             import logging
             logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
-        finally:
-            if conn is not None:
-                conn.close()
     return {"status": "deleted", "id": mem_id}
 
 
@@ -265,7 +349,7 @@ async def reorder_memories(payload: MemoryReorder):
 
 
 # ---------------------------------------------------------------------------
-# Graph (v0.9.2: real ahe_graph integration)
+# Graph (v0.9.2: GraphIndex-backed integration)
 # ---------------------------------------------------------------------------
 
 @router.get("/graph")
@@ -274,7 +358,7 @@ async def get_graph(
     min_weight: float = 0.1,
     include_supersedes: bool = True,
 ):
-    """Return the memory graph with real Hebbian edges from ahe_graph.
+    """Return the memory graph with real Hebbian edges from GraphIndex.
 
     v0.9.2: Now includes:
     - Hebbian co_occurs edges from SQLite graph_store
@@ -304,16 +388,14 @@ async def get_graph(
             "tags": mem.frontmatter.tags,
         })
 
-    # Get graph edges from ahe_graph
+    # Get graph edges from GraphIndex
     gm = _get_graph_interface()
     pagerank_scores: Dict[str, float] = {}
     if gm:
         try:
             # Get real Hebbian edges
             for mem in memories:
-                neighbors = gm.store.get_neighbors(
-                    mem.id(), min_weight=min_weight, limit=50
-                )
+                neighbors = gm.get_neighbors(mem.id(), min_weight=min_weight, limit=50)
                 for n in neighbors:
                     tgt = n.get("target_id")
                     if tgt and tgt in seen_nodes:
@@ -327,7 +409,7 @@ async def get_graph(
 
             # Get SUPERSEDES edges from lineage layer (frontmatter).
             # W2.5: SUPERSEDES belongs to lineage, not associative graph.
-            # ahe_graph stores only Hebbian edges (co_occurs, co_used_in_task).
+            # GraphIndex stores only Hebbian edges (co_occurs, co_used_in_task).
             if include_supersedes:
                 for mem in memories:
                     if mem.frontmatter.supersedes:
@@ -340,14 +422,9 @@ async def get_graph(
                                 "type": "supersedes",
                             })
 
-            # Compute PageRank
+            # Compute PageRank directly from the compat surface.
             try:
-                import importlib
-                try:
-                    pr_mod = importlib.import_module("mem_reflection_hermes.graph.pagerank")
-                except ImportError:
-                    pr_mod = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.pagerank")
-                pagerank_scores = pr_mod.compute_pagerank(gm.store)
+                pagerank_scores = gm.pagerank()
                 for node in nodes:
                     node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
             except Exception as e:
@@ -449,7 +526,7 @@ async def get_graph_neighbors(
     # Fallback to raw graph store
     gm = _get_graph_interface()
     if gm:
-        neighbors = gm.store.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
+        neighbors = gm.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
         return {"memory_id": mem_id, "neighbors": neighbors}
 
     raise HTTPException(status_code=503, detail="Graph system not available")
@@ -459,15 +536,9 @@ async def get_graph_neighbors(
 async def get_zone_analysis():
     """Get cross-zone graph analysis."""
     try:
-        import importlib
-        try:
-            cz = importlib.import_module("mem_reflection_hermes.graph.cross_zone")
-        except ImportError:
-            cz = importlib.import_module("hermes_plugins.mem_reflection_hermes.graph.cross_zone")
         gm = _get_graph_interface()
         if gm:
-            result = cz.analyze_zone_connections(_get_store(), gm.store)
-            return result
+            return gm.cross_zone(_get_store())
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("Zone analysis failed: %s", e)
@@ -590,7 +661,7 @@ async def get_stats():
     # Cache stats
     cache_stats = {"available": False}
     try:
-        from ..query.cache import get_cache
+        from ..search import get_cache
         cache_stats = {
             "available": True,
             **get_cache().stats(),
@@ -642,10 +713,10 @@ async def cluqi_query(
     except Exception as e:
         import logging, uuid
         trace_id = str(uuid.uuid4())[:8]
-        logging.getLogger(__name__).exception("CLUQI query failed (trace=%s)", trace_id)
+        logging.getLogger(__name__).exception("Query failed (trace=%s)", trace_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Query failed. Trace ID: {trace_id}. Error: {type(e).__name__}",
+            detail="Internal server error",
         )
 
 

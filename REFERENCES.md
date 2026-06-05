@@ -12,7 +12,7 @@ Generated: 2026-05-31
 | Storage | Flat .md files + YAML frontmatter (user ~/.hermes/memories/, project ./.hermes/memories/) |
 | Search Index | Pure Python TF-IDF (Counter + BOW, 0 external deps, ~0.8ms for 50 memories) |
 | Embedding | ONNX Runtime + all-MiniLM-L6-v2 (lazy-loaded, optional) |
-| Graph | Hebbian co-occurrence graph in SQLite with decay (ahe_graph) |
+| Graph | GraphIndex-backed Hebbian co-occurrence graph in SQLite with decay |
 | Context Layering | Pinned -> Active Index (TF-IDF/embedding search) -> Triggered Skills -> Always-Active Skills |
 | Memory Zones | Memory Palace: core/work/episode/general/project:* |
 | Reflection | Micro-reflection (per-turn background) + Full reflection (session-end, LLM-powered) |
@@ -27,7 +27,7 @@ Generated: 2026-05-31
 3. Active index -> top-k memories via TF-IDF (+ optional embedding rerank)
 4. Triggered skills (matched by token overlap + optional embedding)
 5. Always-active skills
-6. Graph neighbors (enriched via ahe_graph SQLite)
+6. Graph neighbors (enriched via runtime GraphIndex SQLite)
 
 ---
 

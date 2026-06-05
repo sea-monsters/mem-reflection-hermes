@@ -115,24 +115,19 @@ valid and readable.
 │   └── memory-stats.jsonl           # Effectiveness tracking
 ├── plugins/
 │   └── mem-reflection-hermes/
-│       ├── __init__.py              # Registration, exports, graph tools, bootstrap (~1,870 lines)
-│       ├── core.py                  # MemoryStore, SkillStore, models, BM25 (~1,078 lines)
-│       ├── late_binding.py          # Shared late-binding symbol resolution (~38 lines)
-│       ├── search/
-│       │   └── embed.py             # ONNX embedding engine, LRU cache (~504 lines)
-│       ├── reflection/
-│       │   └── engine.py            # Micro/full/raw-chunk reflection (~1,692 lines)
-│       ├── hooks/
-│       │   └── lifecycle.py         # Session hooks, slash commands (~423 lines)
-│       ├── tools/
-│       │   └── handlers.py          # 12 core SRH tool handlers (~966 lines)
-│       ├── graph/
-│       │   ├── ahe_graph.py         # SQLite-backed graph memory (~1,024 lines)
-│       │   ├── cluqi.py             # Cross-layer query orchestration (~296 lines)
-│       │   ├── pagerank.py          # PageRank centrality (~116 lines)
-│       │   └── cross_zone.py        # Cross-zone analysis (~133 lines)
-│       ├── query/
-│       │   └── cache.py             # TTL query cache, LRU eviction (~213 lines)
+│       ├── __init__.py              # Plugin registration and runtime singletons
+│       ├── store.py                 # MemoryStore, SkillStore, frontmatter, lineage
+│       ├── search.py                # SearchIndex, embeddings, query templates/cache
+│       ├── graph.py                 # GraphIndex, PageRank, cross-zone analysis
+│       ├── reflect.py               # ReflectionEngine public facade
+│       ├── runtime_tools.py         # 12 base SRH tool handlers
+│       ├── runtime_hooks.py         # Hooks and slash commands
+│       ├── runtime_graph.py         # Graph/health tools and graph compat surface
+│       ├── runtime_reflection.py    # Reflection runtime helpers
+│       ├── reflection/engine.py     # Deprecated explicit old-path compatibility entry
+│       ├── hooks/lifecycle.py       # Deprecated explicit old-path compatibility entry
+│       ├── tools/handlers.py        # Deprecated explicit old-path compatibility entry
+│       ├── graph/compat.py          # Deprecated explicit old-path compatibility entry
 │       ├── plugin.yaml              # Plugin manifest
 │       ├── README.md                # Index document
 │       ├── scripts/

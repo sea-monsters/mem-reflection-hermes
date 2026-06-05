@@ -1,7 +1,6 @@
 """conftest.py — Shared test fixtures for mem-reflection-hermes test suite."""
 from __future__ import annotations
 
-import importlib.util
 import sys
 import tempfile
 from pathlib import Path
@@ -13,9 +12,8 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from core import LoadedMemory, MemoryEffectiveness, MemoryFrontmatter
-from graph.ahe_graph import GraphStore
-from store import MemoryStore
+from graph.compat import GraphStore
+from store import LoadedMemory, MemoryEffectiveness, MemoryFrontmatter, MemoryStore
 
 # Import helpers (exposed for fixtures)
 from tests._helpers import make_memory, make_memory_with_id, effectiveness_for

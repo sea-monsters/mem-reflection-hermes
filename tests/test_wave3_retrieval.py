@@ -20,13 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from core import (
+from store import (
     LoadedMemory, _tokenise,
     _CJK_STOPWORDS, _STOPWORDS,
 )
+from graph.compat import GraphStore
 from store import MemoryFrontmatter
-from graph.ahe_graph import GraphStore
-from graph.pagerank import compute_pagerank
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +135,7 @@ class TestHubDetection:
         for i in range(4):
             store.upsert_edge("hub", f"leaf_{i}", weight_delta=0.5)
             store.ensure_meta(f"leaf_{i}")
-        scores = compute_pagerank(store)
+        scores = store.pagerank()
         assert "hub" in scores, f"Hub missing from scores: {scores}"
         assert scores["hub"] == max(scores.values())
         assert scores["hub"] > 0.15
@@ -150,7 +149,7 @@ class TestHubDetection:
         store.ensure_meta("c")
         store.upsert_edge("a", "b", weight_delta=0.5)
         store.upsert_edge("b", "c", weight_delta=0.5)
-        scores = compute_pagerank(store)
+        scores = store.pagerank()
         # With multiple nodes, isolated should have lower score
         assert "isolated" in scores
         assert scores["isolated"] < scores["b"]

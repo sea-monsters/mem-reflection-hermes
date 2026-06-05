@@ -62,6 +62,17 @@ class GraphIndex:
 
     def _get_conn(self) -> sqlite3.Connection:
         """Thread-local SQLite connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._local.conn = None
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -179,7 +190,7 @@ class GraphIndex:
     # -- spreading activation (HeLa-Mem §3.4) --------------------------------
 
     def spread(
-        self, seed_ids: List[str], decay: float = 0.7, max_iter: int = 50
+        self, seed_ids: List[str], decay: float = 0.7, max_iter: int = 50, max_nodes: int = 1000
     ) -> Dict[str, float]:
         """Fixed-point activation spreading from seed nodes.
 
@@ -188,6 +199,8 @@ class GraphIndex:
         """
         activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
         for _ in range(max_iter):
+            if len(activation) > max_nodes:
+                break
             new_act: Dict[str, float] = {}
             for nid, act in activation.items():
                 if act < 0.01:
@@ -196,8 +209,11 @@ class GraphIndex:
                     propagated = act * decay * neighbor["weight"]
                     tid = neighbor["target_id"]
                     new_act[tid] = max(new_act.get(tid, 0.0), propagated)
-            delta = sum(new_act.values())
             activation.update(new_act)
+            delta = sum(
+                abs(new_act.get(nid, 0.0) - activation.get(nid, 0.0))
+                for nid in set(new_act) | set(activation)
+            )
             if delta < 1e-4:
                 break
         self._step_counter += 1
@@ -236,7 +252,11 @@ class GraphIndex:
                             "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ? AND relation = ?",
                             (new_weight, r["source_id"], r["target_id"], r["relation"]),
                         )
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "Edge decay failed for %s->%s: %s",
+                        r["source_id"], r["target_id"], e,
+                    )
                     continue
             conn.commit()
 
@@ -340,9 +360,8 @@ class GraphIndex:
             "SELECT COUNT(*) FROM (SELECT DISTINCT source_id FROM edges UNION SELECT DISTINCT target_id FROM edges)"
         ).fetchone()[0]
         avg_weight = conn.execute("SELECT AVG(weight) FROM edges").fetchone()[0] or 0.0
-        meta_count = conn.execute("SELECT COUNT(*) FROM graph_meta").fetchone()[0]
         return {
-            "nodes": meta_count,
+            "nodes": node_count,
             "edges": edge_count,
             "avg_weight": round(avg_weight, 4),
         }

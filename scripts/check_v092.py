@@ -1,4 +1,4 @@
-"""check_v092.py — Verification script for v0.9.2-beta features.
+"""check_v092.py — Runtime verification for beta3 surfaces.
 
 Run after each batch of fixes to ensure correctness.
 """
@@ -23,46 +23,101 @@ if "mem_reflection_hermes" not in sys.modules:
     sys.modules["mem_reflection_hermes"] = mod
     spec.loader.exec_module(mod)
 
+from mem_reflection_hermes.runtime_graph import GraphStore
+from store import MemoryStore, MemoryFrontmatter
 
-def test_cluqi():
-    """Test CLUQI module loads and has expected interface."""
-    from mem_reflection_hermes.graph.cluqi import CLUQI, CLUQIResult
-    assert hasattr(CLUQI, 'query')
-    assert hasattr(CLUQI, 'get_neighbors')
-    assert hasattr(CLUQI, 'cross_zone_bridge')
-    assert hasattr(CLUQIResult, 'total_score')
-    print("  PASS: CLUQI interface")
+
+def test_runtime_graph_surface():
+    """Test the runtime graph surface exposes the expected query helpers."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="hermes_check_graph_"))
+    gm = GraphStore(tmpdir / "graph.db")
+    try:
+        assert hasattr(gm, "get_neighbors")
+        assert hasattr(gm, "pagerank")
+        assert hasattr(gm, "cross_zone")
+        assert hasattr(gm, "associate_memories")
+        print("  PASS: Runtime graph interface")
+    finally:
+        gm.close()
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_pagerank():
-    """Test PageRank module loads and has expected interface."""
-    from mem_reflection_hermes.graph.pagerank import compute_pagerank, get_top_pagerank
-    print("  PASS: PageRank interface")
+    """Test PageRank via the runtime graph surface."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="hermes_check_graph_pr_"))
+    gm = GraphStore(tmpdir / "graph.db")
+    try:
+        gm.associate_memories(["hub", "leaf_a", "leaf_b"])
+        scores = gm.pagerank()
+        assert isinstance(scores, dict)
+        print("  PASS: PageRank interface")
+    finally:
+        gm.close()
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_query_cache():
     """Test query cache and templates."""
-    from mem_reflection_hermes.query.cache import ResultCache, get_cache, build_query, QUERY_TEMPLATES
+    import importlib.util
+    search_path = Path(repo_root) / "search.py"
+    search_spec = importlib.util.spec_from_file_location("_search", str(search_path))
+    search_mod = importlib.util.module_from_spec(search_spec)
+    assert search_spec is not None and search_spec.loader is not None
+    search_spec.loader.exec_module(search_mod)
+    ResultCache = search_mod.ResultCache
+    get_cache = search_mod.get_cache
+    build_query = search_mod.build_query
+    QUERY_TEMPLATES = search_mod.QUERY_TEMPLATES
     cache = ResultCache(default_ttl=1.0)
     cache.set("test", "key1")
     assert cache.get("key1") == "test"
     assert len(QUERY_TEMPLATES) >= 8
-    print("  PASS: Query cache and templates")
+    assert build_query("recent")["type"] == "recent"
+    assert get_cache().stats()["default_ttl"] > 0
+    print("  PASS: Search query templates and cache")
 
 
 def test_cross_zone():
-    """Test cross-zone analysis module."""
-    from mem_reflection_hermes.graph.cross_zone import analyze_zone_connections, get_zone_recommendations
-    print("  PASS: Cross-zone analysis interface")
+    """Test cross-zone analysis via the runtime graph surface."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="hermes_check_graph_zone_"))
+    graph_db = tmpdir / "graph.db"
+    mem_dir = tmpdir / "memory"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    mem_store = MemoryStore(mem_dir, db_path=tmpdir / "mem.db")
+    gm = GraphStore(graph_db)
+    try:
+        fm1 = MemoryFrontmatter.new(source="test", zone="work")
+        fm1.id = "zone-a"
+        fm2 = MemoryFrontmatter.new(source="test", zone="general")
+        fm2.id = "zone-b"
+        mem_store.put("user", fm1, "Zone A memory")
+        mem_store.put("user", fm2, "Zone B memory")
+        gm.associate_memories(["zone-a", "zone-b"])
+        result = gm.cross_zone(mem_store)
+        assert "zone_matrix" in result
+        print("  PASS: Cross-zone analysis interface")
+    finally:
+        gm.close()
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_ahe_graph_extensions():
-    """Test ahe_graph has new methods."""
-    from mem_reflection_hermes.graph.ahe_graph import GraphStore
-    assert hasattr(GraphStore, 'get_all_nodes')
-    assert hasattr(GraphStore, 'add_supersedes_edge')
-    assert hasattr(GraphStore, 'remove_supersedes_edge')
-    print("  PASS: ahe_graph extensions")
+def test_runtime_graph_extensions():
+    """Test runtime graph exposes the compatibility GraphStore surface."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="hermes_check_graph_surface_"))
+    gm = GraphStore(tmpdir / "graph.db")
+    try:
+        assert hasattr(gm, "get_all_nodes")
+        assert hasattr(gm, "upsert_edge")
+        assert hasattr(gm, "spread_activation")
+        assert hasattr(gm, "get_edges")
+        print("  PASS: runtime graph extensions")
+    finally:
+        gm.close()
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_dashboard_api():
@@ -84,21 +139,21 @@ def test_version():
     import yaml
     with open(Path(__file__).parent.parent / "plugin.yaml") as f:
         data = yaml.safe_load(f)
-    assert data['version'] == '1.0-beta', f"Expected 1.0-beta, got {data['version']}"
-    print("  PASS: Version is 1.0-beta")
+    assert data['version'] == '1.0-beta3', f"Expected 1.0-beta3, got {data['version']}"
+    print("  PASS: Version is 1.0-beta3")
 
 
 def main():
     print("=" * 60)
-    print("v1.0-beta Verification")
+    print("v1.0-beta3 Runtime Verification")
     print("=" * 60)
 
     tests = [
-        test_cluqi,
+        test_runtime_graph_surface,
         test_pagerank,
         test_query_cache,
         test_cross_zone,
-        test_ahe_graph_extensions,
+        test_runtime_graph_extensions,
         test_dashboard_api,
         test_version,
     ]

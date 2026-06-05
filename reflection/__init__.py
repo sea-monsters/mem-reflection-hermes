@@ -1,3 +1,6 @@
-"""Reflection module for mem-reflection-hermes."""
+"""Reflection package exports for the beta3 runtime surface."""
 
-from .engine import *  # noqa: F401, F403
+try:
+    from ..runtime_reflection import *  # noqa: F401, F403
+except ImportError:
+    from runtime_reflection import *  # type: ignore # noqa: F401, F403

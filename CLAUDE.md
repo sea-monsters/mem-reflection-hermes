@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mem-reflection-hermes** is a self-evolving memory & reflection system plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It provides structured memory persistence, semantic search, reflection pipelines, skill auto-matching, graph memory (Hebbian co-activation), and a dashboard UI. Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes).
 
-Current version: **v1.0-beta2** (plugin.yaml version field).
+Current version: **v1.0-beta3** (plugin.yaml version field).
 
-### Architecture (runtime modules + legacy)
+### Architecture (runtime modules + beta3 compatibility)
 
-The active runtime uses a simplified module set alongside legacy modules scheduled for retirement:
+The active runtime uses the beta2 module set plus beta3 runtime modules. Pre-beta2 implementation files have been retired; only a few explicit old import paths remain as deprecated compatibility entrypoints.
 
 ```
 store.py              # SQLite-backed MemoryStore, frontmatter I/O, config, paths (~1024 lines)
@@ -18,6 +18,10 @@ search.py             # SearchIndex: BM25 + embedding + fusion + Hebbian boost (
 graph.py              # GraphIndex: SQLite Hebbian graph, PageRank, spreading activation (~324 lines)
 reflect.py            # ReflectionEngine: raw_chunk default, dependency injection (~403 lines)
 context.py            # Context assembly: Palace mode only (~145 lines)
+runtime_tools.py      # Canonical 12 base SRH tool handlers
+runtime_hooks.py      # Canonical hooks and slash commands
+runtime_graph.py      # Canonical graph/health tool registration and graph compat surface
+runtime_reflection.py # Canonical reflection runtime helpers
 dashboard/plugin_api.py # FastAPI dashboard (14 endpoints) (~646 lines)
 ```
 
@@ -25,19 +29,25 @@ Full architecture documentation: `docs/research/beta2-architecture.md`
 Code review & fixes: `docs/research/beta2-code-review.md`
 Test coverage docs: `docs/testing/test-coverage.md`
 
-**Legacy modules (deprecated in beta3):**
+**Retired pre-beta2 implementation files:**
 ```
-core.py               # Will be removed in beta3 (replaced by store.py)
-late_binding.py       # Will be removed in beta3 (circular imports eliminated)
-search/embed.py       # Will be merged into search.py in beta3
-reflection/engine.py  # Will be replaced by reflect.py in beta3
-graph/ahe_graph.py    # Will be replaced by graph.py in beta3
-graph/cluqi.py        # Will be merged into graph.py in beta3
-graph/pagerank.py     # Will be merged into graph.py in beta3
-graph/cross_zone.py   # Will be merged into graph.py in beta3
-hooks/lifecycle.py    # Will be updated to use runtime modules in beta3
-tools/handlers.py     # Will be updated to use runtime modules in beta3
-query/cache.py        # Will be removed in beta3 (cachetools.TTLCache replaces it)
+core.py
+late_binding.py
+search/embed.py
+query/cache.py
+ahe_graph/__init__.py
+graph/ahe_graph.py
+graph/cluqi.py
+graph/pagerank.py
+graph/cross_zone.py
+```
+
+**Deprecated compatibility entrypoints kept for explicit old imports only:**
+```
+reflection/engine.py  # forwards to runtime_reflection.py
+hooks/lifecycle.py    # forwards to runtime_hooks.py
+tools/handlers.py     # forwards to runtime_tools.py
+graph/compat.py       # forwards to runtime_graph.py
 ```
 
 **Migration:**
@@ -103,25 +113,31 @@ reflect.py            ← imports store.py + search.py + graph.py
 context.py            ← imports store.py + search.py
   └── pure functions, no state
 
-__init__.py           ← imports all modules, registers 17 tools
+runtime_reflection.py ← imports store.py + search.py
+
+runtime_hooks.py      ← imports store.py + reflect.py + search.py
+
+runtime_tools.py      ← imports store.py + search.py + reflect.py + runtime_hooks.py
+
+runtime_graph.py      ← imports graph.py + store.py
+
+__init__.py           ← explicit runtime registration, registers 17 tools
 ```
 
-No circular imports. `late_binding.py` is only used in legacy code paths; runtime modules do not depend on it.
+No circular imports. `late_binding.py` has been retired; runtime modules use explicit package delegates where old consumers need late-bound package state.
 
-### Import Order Rules (Legacy)
+### Import Order Rules
 
-This constraint applies to **legacy modules only** — runtime modules have no circular import risk:
+Use the canonical runtime order:
 
-1. `core.py` — no imports from other project modules (leaf module)
-2. `search/embed.py` — imports from core only
-3. `reflection/engine.py` — imports from core + embed
-4. `hooks/lifecycle.py` — imports from core + embed + reflection
-5. `tools/handlers.py` — imports from all above
-6. `__init__.py` — imports from all modules, registers graph tools that need graph-manager init
+1. `store.py` — no imports from other project modules (leaf module)
+2. `search.py` — imports from store only
+3. `graph.py` — imports store only where memory metadata is needed
+4. `reflect.py` / `runtime_reflection.py` — imports store + search
+5. `runtime_hooks.py`, `runtime_tools.py`, `runtime_graph.py` — host-facing runtime features
+6. `__init__.py` — explicit runtime registration
 
-Graph modules (`graph/ahe_graph.py`, `cluqi.py`, `pagerank.py`, `cross_zone.py`) import from `core` only. `query/cache.py` imports from `core` only. `late_binding.py` has no project imports.
-
-Avoid circular imports. Use `late_binding.py` for cross-module symbol resolution at runtime in legacy code only.
+Deprecated compatibility entrypoints must remain thin forwarders and must not regain implementation logic.
 
 ### Thread Safety
 
@@ -134,7 +150,7 @@ Key concurrency protections:
 | `_turns_since_reflect` counter | `threading.Lock` (micro-reflection cadence) |
 | `_reflect_log_lock` | Covers both read and write paths |
 | Embedding cache | `threading.Lock` on all cache operations |
-| `_build_adjacency` | mtime + DB query + cache update inside `self._lock` |
+| GraphIndex / graph compat operations | SQLite WAL plus runtime graph locks where singletons are shared |
 | `get_cache()` singleton | Double-checked locking |
 
 ### Session Hook Lifecycle
@@ -154,8 +170,8 @@ Context injection priority (subject to `max_context_token_preference`):
 
 ### Tool Split
 
-- 12 core tools in `tools/handlers.py` (CRUD, palace navigation, reflection, skills, profile)
-- 5 graph/health tools in `__init__.py` (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) — registered in `__init__.py` because they require graph-manager initialization at plugin load time
+- 12 base tools in `runtime_tools.py` (CRUD, palace navigation, reflection, skills, profile)
+- 5 graph/health tools in `runtime_graph.py` (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) — registered through `__init__.py` because they require graph-manager initialization at plugin load time
 
 ## Key Patterns
 
@@ -237,7 +253,7 @@ Files stored in `~/.hermes/memories/` (user) or `./.hermes/memories/` (project).
 
 ### Graph Semantics
 
-The ahe_graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not typed factual relationships. The graph tracks co-occurrence strength with Ebbinghaus decay.
+The runtime graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not typed factual relationships. The graph tracks co-occurrence strength, PageRank, spreading activation, and cross-zone relationships through `GraphIndex`/`runtime_graph.py`.
 
 ### CJK Awareness
 
@@ -253,6 +269,6 @@ Newly created memory IDs during reflection are tracked in a session-local set (`
 - Hashing: SHA-256 only
 - SQLite concurrent writes: WAL mode + `INSERT OR REPLACE`
 - Supersedes chains for version lineage (not for mere related memories)
-- `@lru_cache` on file-backed config: avoid — use mtime-aware cache instead (see core.py `load_config`)
+- `@lru_cache` on file-backed config: avoid — use mtime-aware cache instead (see `store.py` `load_config`)
 - Config writes in `autotrigger_manage.py`: only on `start`/`bootstrap`, never on `status`/`stop`
 - Silent error swallowing: use `logger.warning` (not `logger.debug`) for all failure paths that could indicate data loss or degraded functionality

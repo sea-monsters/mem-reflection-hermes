@@ -29,3 +29,6 @@ palace-index.md
 RTK.md
 AGENTS.md
 .rtk/
+
+# Session memory (local AI assistant state)
+memory/

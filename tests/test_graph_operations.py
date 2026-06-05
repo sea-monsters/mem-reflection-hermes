@@ -15,8 +15,7 @@ import threading
 
 import pytest
 
-from graph.ahe_graph import GraphStore
-from graph.pagerank import compute_pagerank
+from graph.compat import GraphStore
 
 
 class TestEdgeCRUD:
@@ -132,7 +131,7 @@ class TestPageRank:
             store.upsert_edge("hub", f"leaf_{i}", weight_delta=0.5)
             store.ensure_meta(f"leaf_{i}")
 
-        scores = compute_pagerank(store)
+        scores = store.pagerank()
         assert "hub" in scores
         assert scores["hub"] == max(scores.values())
 
@@ -147,7 +146,7 @@ class TestPageRank:
         store.upsert_edge("a", "b", weight_delta=0.5)
         store.upsert_edge("b", "c", weight_delta=0.5)
 
-        scores = compute_pagerank(store)
+        scores = store.pagerank()
         # Isolated node should have lower score than connected hub (b)
         assert "isolated" in scores
         assert scores["isolated"] < scores["b"]

@@ -14,7 +14,7 @@ from collections import Counter
 import pytest
 
 from tests._helpers import make_memory, make_memory_with_id, effectiveness_for
-from core import (
+from store import (
     LoadedMemory,
     MemoryEffectiveness,
     MemoryFrontmatter,

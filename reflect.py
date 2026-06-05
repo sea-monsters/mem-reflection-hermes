@@ -78,10 +78,10 @@ def _is_memorable_content(text: str) -> bool:
     for ind in _TOOL_INDICATORS:
         if ind.lower() in lower:
             return False
-    # File paths
-    if re.search(r"[a-zA-Z]:\\[\w\\.-]+|/[\w/\-._]+", text):
-        if re.search(r"[\\/]([\w-]+\.[\w]{2,4}|[\w-]+[\\/])", text):
-            return False
+    # File paths — require a drive letter prefix (Windows) or leading slash (Unix)
+    # plus an extension or trailing separator to avoid false positives on normal text.
+    if re.search(r"(?:[a-zA-Z]:\\[\w\\.-]{3,}|(?:^|\s)/[\w/\-._]{3,})(?:\.[\w]{2,4}|[\\/])", text):
+        return False
     # Code patterns
     for pat in _CODE_PATTERNS:
         if re.match(pat, text, re.MULTILINE):
@@ -308,7 +308,7 @@ class ReflectionEngine:
     def _micro_raw_chunk(self, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
         """Store the turn as a raw episode memory."""
         combined = f"{user_msg.strip()}\n\n{assistant_msg.strip()}"
-        if len(combined) < 20 or not _is_memorable_content(combined):
+        if len(combined) < 20 or not _is_memorable_content(combined) or _is_noise_text(combined):
             return None
         fm = MemoryFrontmatter.new(
             source="raw_chunk", confidence="low",
@@ -354,7 +354,7 @@ class ReflectionEngine:
                 content = " ".join(texts)
             if not content or len(content.strip()) < 20:
                 continue
-            if not _is_memorable_content(content):
+            if not _is_memorable_content(content) or _is_noise_text(content):
                 continue
             fm = MemoryFrontmatter.new(
                 source="raw_chunk", confidence="low",
@@ -441,3 +441,117 @@ class ReflectionEngine:
 
     def recent(self, n: int = 10) -> List[Dict[str, Any]]:
         return _read_reflect_log(n, self._log_path)
+
+
+def _build_audit_entry(
+    candidate_id: str = "",
+    decision: str = "",
+    decision_reason: str = "",
+    novelty_score: float = 0.0,
+    conflict_id: str = "",
+    supersedes_ids: Optional[List[str]] = None,
+    supersedes_reason: str = "",
+    assigned_zone: str = "",
+    graph_migration: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Public audit helper kept on the new reflection surface."""
+    return {
+        "candidate_id": candidate_id,
+        "decision": decision,
+        "decision_reason": decision_reason,
+        "novelty_score": round(novelty_score, 4),
+        "conflict_id": conflict_id,
+        "supersedes_ids": supersedes_ids or [],
+        "supersedes_reason": supersedes_reason,
+        "assigned_zone": assigned_zone,
+        "graph_migration": graph_migration or {},
+    }
+
+
+def _recent_reflect_outcomes(n: int = 10) -> List[Dict[str, Any]]:
+    """Return the most recent reflection log entries."""
+    return _read_reflect_log(n)
+
+
+def _delegate_runtime_reflection(name: str):
+    from . import runtime_reflection
+
+    return getattr(runtime_reflection, name)
+
+
+def _get_mem_store():
+    from mem_reflection_hermes import _get_mem_store as _root_get_mem_store
+
+    return _root_get_mem_store()
+
+
+def _get_skill_store():
+    from mem_reflection_hermes import _get_skill_store as _root_get_skill_store
+
+    return _root_get_skill_store()
+
+
+def _reflection_mode() -> str:
+    from mem_reflection_hermes import _reflection_mode as _root_reflection_mode
+
+    return _root_reflection_mode()
+
+
+def _build_context_block(query: str = ""):
+    from mem_reflection_hermes import _build_context_block as _root_build_context_block
+
+    return _root_build_context_block(query)
+
+
+def _auto_rebalance_zones():
+    from mem_reflection_hermes import _auto_rebalance_zones as _root_auto_rebalance_zones
+
+    return _root_auto_rebalance_zones()
+
+
+def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_parse_reflect_output")(text)
+
+
+def _repair_truncated_json(s: str) -> Optional[str]:
+    return _delegate_runtime_reflection("_repair_truncated_json")(s)
+
+
+def _load_pending_skill_candidates():
+    return _delegate_runtime_reflection("_load_pending_skill_candidates")()
+
+
+def _save_pending_skill_candidates(candidates):
+    return _delegate_runtime_reflection("_save_pending_skill_candidates")(candidates)
+
+
+def _format_pending_skills_for_display():
+    return _delegate_runtime_reflection("_format_pending_skills_for_display")()
+
+
+def _approve_skill(pending_id: str):
+    return _delegate_runtime_reflection("_approve_skill")(pending_id)
+
+
+def _reject_skill(pending_id: str, reason: str = ""):
+    return _delegate_runtime_reflection("_reject_skill")(pending_id, reason)
+
+
+def _reset_current_session_memory_ids() -> None:
+    return _delegate_runtime_reflection("_reset_current_session_memory_ids")()
+
+
+def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_full_reflection")(ctx, messages)
+
+
+def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_micro_reflection")(ctx, user_msg, assistant_msg)
+
+
+def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_embedding_reflection")(messages)
+
+
+def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_embedding_micro_reflection")(user_msg, assistant_msg)
