@@ -379,16 +379,40 @@ def _do_mirror_builtin_to_plugin(
     # Determine plugin zone: memory→core, user→general
     plugin_zone = "core" if target == "memory" else "general"
 
-    # Detect new entry from entries_after (for add) or use content directly
     new_entry = content.strip() if content else ""
-
-    if not new_entry:
-        # For remove actions or empty content, nothing to mirror
-        return {"mirrored": 0, "skipped": 0, "errors": []}
 
     result: Dict[str, Any] = {"mirrored": 0, "skipped": 0, "errors": []}
 
     try:
+        if action == "remove":
+            # Handle removes BEFORE the empty-content early return.
+            # Built-in memory tool passes content="" and the deleted text in
+            # old_text — we must tombstone the plugin entry even when
+            # content is empty.
+            old_entry_text = old_text.strip()
+            if not old_entry_text:
+                result["skipped"] += 1
+                return result
+
+            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store)
+            if existing is not None:
+                # Write a tombstone superseding entry
+                _write_to_plugin(
+                    mem_store,
+                    f"[removed: {existing.body[:100]}]",
+                    existing.frontmatter.zone,
+                    supersedes=[existing.id()],
+                )
+                result["mirrored"] = 1
+                _incr_stat("dir_a_mirror")
+            else:
+                result["skipped"] += 1
+            return result
+
+        if not new_entry:
+            # For add/replace with empty content, nothing to mirror
+            return result
+
         if action == "add":
             # Check duplicate in plugin store
             if _is_duplicate_in_plugin(new_entry, mem_store):
@@ -426,24 +450,6 @@ def _do_mirror_builtin_to_plugin(
                     _incr_stat("dir_a_mirror")
                 else:
                     result["skipped"] += 1
-
-        elif action == "remove":
-            # Find matching plugin entry and mark as superseded
-            old_entry_text = old_text.strip()
-            if not old_entry_text:
-                result["skipped"] += 1
-                return result
-
-            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store)
-            if existing is not None:
-                # Write a tombstone superseding entry
-                _write_to_plugin(
-                    mem_store,
-                    f"[removed: {existing.body[:100]}]",
-                    existing.frontmatter.zone,
-                    supersedes=[existing.id()],
-                )
-                _incr_stat("dir_a_mirror")
 
     except Exception as e:
         logger.debug("Dir A mirror failed: %s", e)
