@@ -572,35 +572,6 @@ def register(ctx) -> None:
         _hooks_mod.register_hooks(ctx)
     _register_runtime_features(ctx)
 
-    # Register MemoryBridgeProvider as a MemoryManager callback listener,
-    # but ONLY when no external provider is configured (memory.provider).
-    # This avoids consuming the single external-provider slot that belongs
-    # to the user's configured provider (Honcho/Mem0/etc.).
-    # When an external provider IS configured, the Dir A bridge relies on
-    # the post_tool_call hook in runtime_hooks.py instead.
-    #
-    # Uses dynamic dispatch (getattr + concat) to avoid the literal
-    # method name, preventing hermes_cli/plugins.py line 1317-1326
-    # auto-coercion to kind='exclusive' which would route the whole
-    # plugin through the memory-provider discovery system instead of
-    # the general PluginManager.
-    _register_f = getattr(ctx, "".join(["register_", "memory_", "provider"]), None)
-    if _register_f is not None:
-        try:
-            from hermes_cli.config import load_config, cfg_get as _cfg_get
-            _cfg = load_config()
-            _ext_prov = _cfg_get(_cfg, "memory", "provider") or None
-        except Exception:
-            _ext_prov = None  # assume none configured
-
-        if _ext_prov is None:
-            try:
-                from .memory_bridge import MemoryBridgeProvider, bridge_enabled as _be
-                if _be():
-                    _register_f(MemoryBridgeProvider())
-            except ImportError:
-                pass
-
 
 # ---------------------------------------------------------------------------
 # Runtime services

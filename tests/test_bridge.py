@@ -24,7 +24,6 @@ from memory_bridge import (
     _is_duplicate_in_builtin,
     _is_duplicate_in_plugin,
     _read_builtin_entries,
-    _set_test_mem_store,
     bridge_enabled,
     get_bridge_stats,
     mirror_builtin_to_plugin,
@@ -420,98 +419,3 @@ class TestStats:
             assert v == 0
 
 
-# =====================================================================
-# MemoryBridgeProvider (Phase 5)
-# =====================================================================
-
-
-class TestMemoryBridgeProvider:
-    """Test the MemoryBridgeProvider adapter."""
-
-    def test_provider_name(self):
-        """Provider name should be 'mem-reflection-bridge'."""
-        from memory_bridge import MemoryBridgeProvider
-        provider = MemoryBridgeProvider()
-        assert provider.name == "mem-reflection-bridge"
-
-    def test_provider_is_available_by_default(self, monkeypatch):
-        """Provider should be available when bridge is enabled."""
-        from memory_bridge import MemoryBridgeProvider
-        import store
-        monkeypatch.setattr(store, "plugin_config", lambda: {})
-        provider = MemoryBridgeProvider()
-        assert provider.is_available() is True
-
-    def test_provider_no_tools(self):
-        """Provider should register zero tools."""
-        from memory_bridge import MemoryBridgeProvider
-        provider = MemoryBridgeProvider()
-        assert provider.get_tool_schemas() == []
-
-    def test_provider_initialize_noop(self):
-        """Initialize should not raise."""
-        from memory_bridge import MemoryBridgeProvider
-        provider = MemoryBridgeProvider()
-        provider.initialize("test-session")  # should not raise
-
-    def test_provider_shutdown_noop(self):
-        """Shutdown should not raise."""
-        from memory_bridge import MemoryBridgeProvider
-        provider = MemoryBridgeProvider()
-        provider.shutdown()  # should not raise
-
-    def test_provider_on_memory_write_mirrors_to_plugin(self, temp_store):
-        """on_memory_write should mirror built-in writes to plugin store."""
-        from memory_bridge import MemoryBridgeProvider, _set_test_mem_store
-        _set_test_mem_store(temp_store)
-        try:
-            provider = MemoryBridgeProvider()
-
-            content = "Provider test: user prefers Python 3.12"
-            provider.on_memory_write(
-                action="add",
-                target="memory",
-                content=content,
-            )
-
-            # Verify content made it to plugin store
-            hits = temp_store.search(content, k=5)
-            assert any(content in r.body for r in hits)
-        finally:
-            _set_test_mem_store(None)
-
-    def test_provider_on_memory_write_empty_skipped(self, temp_store):
-        """Empty content should not trigger a write."""
-        from memory_bridge import MemoryBridgeProvider, _set_test_mem_store
-        _set_test_mem_store(temp_store)
-        try:
-            provider = MemoryBridgeProvider()
-            provider.on_memory_write(
-                action="add", target="memory", content="",
-            )
-            # No crash = success
-        finally:
-            _set_test_mem_store(None)
-
-    def test_provider_on_memory_write_dedup(self, temp_store):
-        """Duplicate content should be skipped."""
-        from memory_bridge import MemoryBridgeProvider, _set_test_mem_store
-        _set_test_mem_store(temp_store)
-        try:
-            content = "Provider dedup test content"
-            provider = MemoryBridgeProvider()
-
-            # First write
-            provider.on_memory_write(
-                action="add", target="memory", content=content,
-            )
-            # Second write of same content
-            provider.on_memory_write(
-                action="add", target="memory", content=content,
-            )
-            # Should only be one entry in store
-            hits = temp_store.search(content, k=10)
-            exact = [r for r in hits if r.body.strip() == content]
-            assert len(exact) == 1, f"Expected 1 entry, got {len(exact)}"
-        finally:
-            _set_test_mem_store(None)
