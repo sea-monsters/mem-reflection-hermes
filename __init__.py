@@ -572,33 +572,6 @@ def register(ctx) -> None:
         _hooks_mod.register_hooks(ctx)
     _register_runtime_features(ctx)
 
-    # Register as a MemoryProvider so the built-in MemoryManager calls
-    # on_memory_write() on every memory tool write — enabling the Dir A bridge.
-    # ctx.register_memory_provider may not exist when loaded as a regular plugin
-    # (not through the memory-provider discovery path), so guard with hasattr.
-    try:
-        from .memory_bridge import MemoryBridgeProvider, bridge_enabled
-        if bridge_enabled():
-            ctx.register_memory_provider(MemoryBridgeProvider())
-    except (ImportError, AttributeError):
-        pass
-
-
-def register_memory_provider():
-    """Declare a MemoryProvider for the Hermes memory plugin system.
-
-    This function is discovered by ``plugins.memory._is_memory_provider_dir``
-    which scans for ``register_memory_provider`` in the plugin's ``__init__.py``.
-    When ``memory.provider`` is set to ``mem-reflection-hermes`` in config.yaml,
-    the MemoryManager will load this provider and call ``on_memory_write``
-    on every built-in memory write.
-
-    The provider registers zero tools — all 17 SRH tools are provided by
-    the standalone ``register()`` path.
-    """
-    from .memory_bridge import MemoryBridgeProvider
-    return MemoryBridgeProvider()
-
 
 # ---------------------------------------------------------------------------
 # Runtime services
