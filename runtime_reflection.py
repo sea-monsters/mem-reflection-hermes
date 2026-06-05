@@ -18,7 +18,7 @@ from .store import (
     LoadedMemory, MemoryFrontmatter,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
     user_skills_dir as _user_skills_dir,
-    micro_reflection_enabled, profile_mode_enabled,
+    micro_reflection_enabled, profile_mode_enabled, plugin_config,
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
 )
@@ -1813,3 +1813,135 @@ def _generate_skill_name(text: str) -> str:
     if words:
         return "-".join(words[:3])
     return "extracted-procedure"
+
+
+# ---------------------------------------------------------------------------
+# Episode zone compaction (Phase 3 — v1.1)
+# ---------------------------------------------------------------------------
+
+_COMPACT_THRESHOLD = 20
+
+
+def _compact_episode_zone(mem_store, ctx=None) -> dict:
+    """Compress raw episode entries into daily summaries.
+
+    Triggers when the count of non-compacted episode entries reaches
+    ``_COMPACT_THRESHOLD``.  Clusters entries by date, creates a
+    summary per cluster, and marks originals as superseded.
+
+    Parameters
+    ----------
+    mem_store : MemoryStore
+        Plugin memory store instance.
+    ctx : optional
+        Hermes plugin context (needed for LLM-based summarization).
+
+    Returns
+    -------
+    dict with keys ``compacted``, ``summaries``, ``skipped``.
+    """
+    try:
+        threshold = plugin_config().get("compaction", {}).get("threshold", _COMPACT_THRESHOLD)
+    except Exception:
+        threshold = _COMPACT_THRESHOLD
+
+    try:
+        llm_summary_enabled = plugin_config().get("compaction", {}).get("llm_summary", True)
+    except Exception:
+        llm_summary_enabled = True
+
+    # Get all episode entries
+    all_episode = mem_store.list_by_zone("episode")
+
+    # Filter: only non-compacted, non-superseded entries
+    raw_mems = [
+        m for m in all_episode
+        if "compacted" not in (m.frontmatter.tags or [])
+        and not m.frontmatter.supersedes
+    ]
+
+    if len(raw_mems) < threshold:
+        return {
+            "compacted": 0,
+            "skipped": f"below threshold ({len(raw_mems)} < {threshold})",
+            "summaries": [],
+        }
+
+    # Cluster by day
+    from collections import defaultdict
+    clusters: Dict[str, List[Any]] = defaultdict(list)
+    for m in raw_mems:
+        created = m.frontmatter.created
+        day = created[:10] if created else "unknown"
+        clusters[day].append(m)
+
+    summaries = []
+    total_raw_consumed = 0
+
+    for day, mems in sorted(clusters.items()):
+        if len(mems) < 2:
+            continue  # Skip single-entry days
+
+        bodies = [m.body.strip() for m in mems]
+
+        # Build summary: LLM if available, otherwise longest
+        if ctx is not None and llm_summary_enabled and hasattr(ctx, "llm"):
+            summary = _llm_summarize_cluster(day, bodies, ctx)
+        else:
+            summary = max(bodies, key=len)
+            if len(summary) > 300:
+                summary = summary[:297] + "..."
+
+        fm = MemoryFrontmatter.new(
+            source="system",
+            confidence="medium",
+            tags=["compacted", "auto-summary"],
+            zone="episode",
+        )
+        fm.supersedes = [m.id() for m in mems]
+        fm.supersedes_reason = f"Compacted {len(mems)} entries from {day}"
+
+        try:
+            mem_store.put("user", fm, summary)
+            summaries.append({
+                "day": day,
+                "compacted": len(mems),
+                "summary": summary,
+                "new_id": fm.id,
+            })
+            total_raw_consumed += len(mems)
+        except Exception as e:
+            logger.debug("Compaction put failed for %s: %s", day, e)
+
+    return {
+        "compacted": len(summaries),
+        "summaries": summaries,
+        "total_raw_consumed": total_raw_consumed,
+    }
+
+
+def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
+    """Generate a brief summary of a day's episode entries using the LLM.
+
+    Falls back to the longest body if LLM call fails.
+    """
+    prompt = (
+        f"Below are {len(bodies)} raw memory entries from {day}. "
+        "Summarize them into 1-2 concise sentences capturing the key information "
+        "in a neutral, factual tone:\n\n"
+        + "\n---\n".join(f"[{i+1}] {b[:300]}" for i, b in enumerate(bodies))
+    )
+    fallback = max(bodies, key=len)
+    if len(fallback) > 300:
+        fallback = fallback[:297] + "..."
+
+    try:
+        if hasattr(ctx, "llm") and callable(ctx.llm):
+            response = ctx.llm(prompt)
+            if response and isinstance(response, str) and response.strip():
+                text = response.strip()
+                return text[:500]
+    except Exception as e:
+        logger.debug("LLM summary failed for %s: %s", day, e)
+
+    return fallback

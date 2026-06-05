@@ -122,8 +122,6 @@ def _on_session_end(**kwargs) -> None:
         messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
 
     # ── Periodic graph decay ──────────────────────────────
-    # Run Ebbinghaus decay on graph edges every session end so weights
-    # naturally fade for connections that are no longer reinforced.
     try:
         gm = _get_graph_mgr()
         if gm is not None:
@@ -134,7 +132,6 @@ def _on_session_end(**kwargs) -> None:
     try:
         if not messages:
             return
-        # Attempt full reflection via LLM if available
         ctx = kwargs.get("ctx") or _plugin_ctx
         if ctx is not None:
             try:
@@ -145,6 +142,23 @@ def _on_session_end(**kwargs) -> None:
         else:
             logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
     finally:
+        # ── Episode compaction (v1.1) ──────────────────────
+        # Run after reflection to compact raw episode entries into summaries.
+        try:
+            from .runtime_reflection import _compact_episode_zone as _compact
+            from . import _config_compaction as _cc
+            if _cc():
+                result = _compact(_lb("_get_mem_store")(), ctx)
+                if result.get("compacted", 0) > 0:
+                    logger.info(
+                        "Episode compaction: %d clusters compressed "
+                        "(consumed %d raw entries)",
+                        result["compacted"],
+                        result.get("total_raw_consumed", 0),
+                    )
+        except Exception as _ce:
+            logger.debug("Episode compaction skipped: %s", _ce)
+
         _reset_current_session_memory_ids()
 
 
@@ -244,20 +258,52 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
 
 
 def _post_tool_call(**kwargs) -> None:
-    """Hook called after a tool invocation to enrich graph with co-accessed memories.
+    """Hook called after a tool invocation.
 
-    Extracts memory IDs from tool results (search, read, recall, write)
-    and creates Hebbian associations between memories used together.
+    Two responsibilities:
+    1. Enrich graph with co-accessed memories (existing).
+    2. Bridge Dir A: mirror built-in ``memory`` tool writes to plugin store.
     """
     tool_name = kwargs.get("tool_name", "")
     result = kwargs.get("result", "")
+    args = kwargs.get("args", {})
     mem_ids: List[str] = []
 
-    # Only process memory-related tools
+    # ── Dir A: Bridge built-in memory writes to plugin store ──────────────
+    if tool_name == "memory":
+        try:
+            if isinstance(result, str):
+                result_obj = json.loads(result)
+            else:
+                result_obj = result
+            if isinstance(result_obj, dict) and result_obj.get("success"):
+                action = args.get("action", "")
+                target = result_obj.get("target", "memory")
+                content = args.get("content", result_obj.get("message", ""))
+                old_text = args.get("old_text", "")
+                entries_after = result_obj.get("entries", None)
+
+                from .memory_bridge import bridge_enabled as _bridge_enabled
+                if _bridge_enabled():
+                    from .memory_bridge import mirror_builtin_to_plugin as _mirror
+                    try:
+                        _mirror(
+                            action=action,
+                            target=target,
+                            content=content,
+                            old_text=old_text,
+                            entries_after=entries_after,
+                            mem_store=_lb("_get_mem_store")(),
+                        )
+                    except Exception as _be:
+                        logger.debug("Bridge Dir A failed: %s", _be)
+        except Exception:
+            pass
+
+    # ── Graph enrichment (existing logic) ─────────────────────────────────
     if not any(t in tool_name for t in ("memory", "palace", "skill")):
         return
 
-    # Try to extract memory IDs from JSON result
     try:
         if isinstance(result, str):
             result_obj = json.loads(result)

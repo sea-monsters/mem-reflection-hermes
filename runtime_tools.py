@@ -224,6 +224,20 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
     fm.supersedes = supersedes
     fm.supersedes_reason = supersedes_reason
     path = mem_store.put(scope, fm, body)
+
+    # ── Dir B: Mirror qualifying plugin writes to built-in MEMORY.md ────
+    try:
+        from .memory_bridge import bridge_enabled as _b_enabled
+        if _b_enabled():
+            from .memory_bridge import mirror_plugin_to_builtin as _mirror_b
+            _mirror_b(
+                body=body,
+                zone=zone,
+                source="srh_memory_write",
+            )
+    except Exception as _dir_b_err:
+        logger.debug("Bridge Dir B failed: %s", _dir_b_err)
+
     return _jd({
         "success": True,
         "id": fm.id,
