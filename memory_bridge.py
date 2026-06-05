@@ -492,11 +492,17 @@ def mirror_plugin_to_builtin(
     body: str,
     zone: str,
     source: str = "srh_memory_write",
+    supersedes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Mirror a plugin memory write to MEMORY.md (built-in).
 
     Only syncs short (≤200 chars), high-signal writes from zone=core.
     USER.md content is not synced (user profile is curated manually).
+
+    When ``supersedes`` contains plugin store IDs of previous entries
+    that were already mirrored, their body texts are removed from
+    MEMORY.md before the new entry is appended — preventing
+    contradictory facts in the built-in memory snapshot.
 
     Parameters
     ----------
@@ -506,17 +512,20 @@ def mirror_plugin_to_builtin(
         Plugin memory zone.
     source : str
         Tool or hook name that triggered the sync (for logging).
+    supersedes : list[str] | None
+        Plugin store IDs of entries being replaced by this write.
 
     Returns
     -------
     dict with keys ``mirrored``, ``target``, ``entry``.
     """
     with _mirror_lock:
-        return _do_mirror_plugin_to_builtin(body, zone, source)
+        return _do_mirror_plugin_to_builtin(body, zone, source, supersedes)
 
 
 def _do_mirror_plugin_to_builtin(
     body: str, zone: str, source: str,
+    supersedes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Internal Dir B implementation (under lock)."""
     body = body.strip()
@@ -532,6 +541,12 @@ def _do_mirror_plugin_to_builtin(
         _incr_stat("dir_b_skip_long")
         result["reason"] = f"body too long ({len(body)} > {DIR_B_MAX_CHARS})"
         return result
+
+    # ── Supersedes: remove old entries from MEMORY.md ────────────────
+    if supersedes:
+        old_bodies = _lookup_superseded_bodies(supersedes)
+        if old_bodies:
+            _remove_bodies_from_builtin("memory", old_bodies)
 
     # ── Dedup ────────────────────────────────────────────────────────
     if _is_duplicate_in_builtin(body, target="memory"):
@@ -551,6 +566,58 @@ def _do_mirror_plugin_to_builtin(
         result["reason"] = "append failed (capacity or I/O)"
 
     return result
+
+
+def _lookup_superseded_bodies(supersedes: List[str]) -> List[str]:
+    """Look up body texts of superseded plugin entries by ID.
+
+    Uses late-binding to avoid circular import with __init__.py.
+    """
+    try:
+        from . import _get_mem_store as _gms
+        store = _gms()
+    except Exception:
+        return []
+    bodies: List[str] = []
+    for old_id in supersedes:
+        try:
+            entry = store.get(old_id)
+            if entry and entry.body.strip():
+                bodies.append(entry.body.strip())
+        except Exception:
+            pass
+    return bodies
+
+
+def _remove_bodies_from_builtin(target: str, bodies: List[str]) -> bool:
+    """Remove specific body texts from MEMORY.md/USER.md under lock.
+
+    Rewrites the file excluding any entries whose exact (stripped) text
+    matches one of the given bodies. Returns True if at least one entry
+    was removed.
+    """
+    if not bodies:
+        return False
+    path = _builtin_path_for(target)
+    if not path.exists():
+        return False
+
+    fd = _acquire_file_lock(path)
+    try:
+        entries = _read_builtin_entries(target)
+        if not entries:
+            return False
+        filtered = [e for e in entries if e.strip() not in bodies]
+        if len(filtered) == len(entries):
+            return False  # nothing removed
+        content = ENTRY_DELIMITER.join(filtered)
+        path.write_text(content, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+    finally:
+        if fd is not None:
+            _release_file_lock(fd)
 
 
 # ---------------------------------------------------------------------------

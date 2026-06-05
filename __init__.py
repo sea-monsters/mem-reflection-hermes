@@ -464,6 +464,28 @@ def _build_context_block_inner(query: str = "") -> str:
         for s in always_active:
             parts.append(f"### {s.frontmatter.name}\n{s.body.strip()}\n")
 
+    # (v1.1) Built-in memory snapshot
+    try:
+        from .context import _build_builtin_memory_block as _builtin_blk
+        _cfg = plugin_config()
+        if _cfg.get("context_builtin", True):
+            builtin_block = _builtin_blk()
+            if builtin_block:
+                parts.append(builtin_block)
+    except Exception:
+        pass
+
+    # (v1.1) Compacted episode summaries
+    try:
+        from .context import _build_compacted_episode_block as _episode_blk
+        _cfg2 = plugin_config()
+        if _cfg2.get("context_compacted_episode", True):
+            episode_block = _episode_blk(mem_store)
+            if episode_block:
+                parts.append(episode_block)
+    except Exception:
+        pass
+
     # Flush all stat entries in one file open
     if stat_entries:
         _batch_record_stats(stat_entries)
