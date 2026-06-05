@@ -760,13 +760,52 @@ def read_memory(path: Path, scope: str = "user") -> Optional[LoadedMemory]:
 
 def write_memory_atomic(path: Path, fm: MemoryFrontmatter, body: str) -> None:
     """Write a memory file atomically (write-to-tmp + os.replace)."""
-    import yaml
+    try:
+        import yaml
+        _has_yaml = True
+    except ImportError:
+        _has_yaml = False
     fm_dict = fm.to_dict()
-    yaml_part = yaml.dump(fm_dict, default_flow_style=False,
-                          allow_unicode=True, sort_keys=False)
+    if _has_yaml:
+        yaml_part = yaml.dump(fm_dict, default_flow_style=False,
+                              allow_unicode=True, sort_keys=False)
+    else:
+        # Fallback: simple YAML-like format using standard library
+        yaml_part = _simple_yaml_dump(fm_dict)
     nl = chr(10)
     content = chr(45)*3 + nl + yaml_part + chr(45)*3 + nl + body + nl
     _safe_write(path, content)
+
+
+def _simple_yaml_dump(d: dict) -> str:
+    """Minimal YAML-like dump for frontmatter serialization.
+
+    Handles flat key-value pairs and list values (tags, supersedes).
+    No deep nesting support — frontmatter dicts are always flat.
+    """
+    lines = []
+    for key, value in d.items():
+        if isinstance(value, list):
+            items = [f"  - {_yaml_str(v)}" for v in value]
+            lines.append(f"{key}:")
+            lines.extend(items)
+        elif isinstance(value, bool):
+            lines.append(f"{key}: {'true' if value else 'false'}")
+        elif value is None:
+            continue
+        else:
+            lines.append(f"{key}: {_yaml_str(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _yaml_str(v: Any) -> str:
+    """Format a value for YAML with proper quoting."""
+    s = str(v)
+    # Quote if contains special YAML characters
+    if any(c in s for c in (":", "#", "'", '"', "!", "&", "*", "?", "[", "]", "{", "}", ",")):
+        escaped = s.replace("'", "''")
+        return f"'{escaped}'"
+    return s
 
 
 _stat_write_lock = threading.Lock()
