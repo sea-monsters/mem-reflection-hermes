@@ -234,6 +234,7 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
                 body=body,
                 zone=zone,
                 source="srh_memory_write",
+                supersedes=fm.supersedes or None,
             )
     except Exception as _dir_b_err:
         logger.debug("Bridge Dir B failed: %s", _dir_b_err)
