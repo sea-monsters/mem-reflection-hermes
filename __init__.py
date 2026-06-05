@@ -525,6 +525,7 @@ _package_estimate_tokens = _estimate_tokens
 
 # Re-export runtime tool handlers for dashboard / external consumers
 from .runtime_tools import _tool_srh_memory_write, _tool_srh_palace_zones  # noqa: E402
+from .runtime_hooks import _get_graph_neighbors, _enrich_with_graph, _get_graph_mgr  # noqa: E402, F401
 
 # Runtime submodules are imported explicitly by register() and compatibility
 # entrypoints. Avoid package-root star imports so beta3 no longer exposes every

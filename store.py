@@ -28,7 +28,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import frontmatter  # python-frontmatter
+try:
+    import frontmatter as _frontmatter
+    _HAS_FRONTMATTER = True
+except ImportError:
+    _HAS_FRONTMATTER = False
 
 logger = logging.getLogger(__name__)
 
@@ -639,6 +643,19 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
     return "\n".join(buf)
 
 
+def _load_frontmatter_file(path: Path) -> Tuple[Dict[str, Any], str]:
+    """Read a file and parse its YAML frontmatter. Uses python-frontmatter
+    if available (preserves YAML types), falls back to stdlib parse_frontmatter."""
+    text = path.read_text(encoding="utf-8")
+    if _HAS_FRONTMATTER:
+        try:
+            post = _frontmatter.loads(text)
+            return dict(post.metadata), post.content.strip()
+        except Exception:
+            pass
+    return parse_frontmatter(text)
+
+
 # ---------------------------------------------------------------------------
 # Skill I/O
 # ---------------------------------------------------------------------------
@@ -646,17 +663,16 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
 def _read_skill_file(path: Path, scope: str) -> Optional[LoadedSkill]:
     """Read a SKILL.md file with YAML frontmatter."""
     try:
-        post = frontmatter.load(str(path))
-        data = dict(post.metadata)
+        metadata, body = _load_frontmatter_file(path)
         fm = SkillFrontmatter(
-            name=data.get("name", path.parent.name),
-            description=data.get("description", ""),
-            triggers=data.get("triggers", []),
-            version=data.get("version"),
-            license=data.get("license"),
-            always_active=bool(data.get("always_active", False)),
+            name=metadata.get("name", path.parent.name),
+            description=metadata.get("description", ""),
+            triggers=metadata.get("triggers", []),
+            version=metadata.get("version"),
+            license=metadata.get("license"),
+            always_active=bool(metadata.get("always_active", False)),
         )
-        return LoadedSkill(frontmatter=fm, body=post.content.strip(),
+        return LoadedSkill(frontmatter=fm, body=body,
                            source_path=path, scope=scope)
     except Exception as e:
         logger.warning("Failed to read skill %s: %s", path, e)
@@ -731,10 +747,10 @@ class SkillStore:
 def read_memory(path: Path, scope: str = "user") -> Optional[LoadedMemory]:
     """Read a Markdown memory file with YAML frontmatter."""
     try:
-        post = frontmatter.load(str(path))
-        fm = MemoryFrontmatter.from_dict(dict(post.metadata))
+        metadata, body = _load_frontmatter_file(path)
+        fm = MemoryFrontmatter.from_dict(metadata)
         return LoadedMemory(
-            frontmatter=fm, body=post.content,
+            frontmatter=fm, body=body,
             source_path=path, scope=scope,
         )
     except Exception as e:

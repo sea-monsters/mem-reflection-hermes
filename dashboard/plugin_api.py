@@ -110,6 +110,13 @@ def _get_graph_interface():
         from ..runtime_graph import GraphManagerCompat
         from ..store import plugin_data_dir
         return GraphManagerCompat(plugin_data_dir() / "graph.db")
+    except ImportError:
+        try:
+            from mem_reflection_hermes.runtime_graph import GraphManagerCompat
+            from mem_reflection_hermes.store import plugin_data_dir
+            return GraphManagerCompat(plugin_data_dir() / "graph.db")
+        except Exception:
+            return None
     except Exception:
         return None
 
@@ -662,12 +669,20 @@ async def get_stats():
     cache_stats = {"available": False}
     try:
         from ..search import get_cache
-        cache_stats = {
-            "available": True,
-            **get_cache().stats(),
-        }
-    except Exception:
-        pass
+        _get_cache = get_cache
+    except ImportError:
+        try:
+            from mem_reflection_hermes.search import get_cache as _get_cache
+        except Exception:
+            _get_cache = None
+    if _get_cache is not None:
+        try:
+            cache_stats = {
+                "available": True,
+                **_get_cache().stats(),
+            }
+        except Exception:
+            pass
 
     # Health metrics (WS-5)
     health = _get_store().health_metrics()

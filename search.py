@@ -30,7 +30,46 @@ try:
 except Exception:
     _HAS_NUMPY = False
 
-from cachetools import TTLCache
+try:
+    from cachetools import TTLCache as _TTLCache
+    _HAS_CACHETOOLS = True
+except ImportError:
+    _HAS_CACHETOOLS = False
+
+    class _TTLCache:
+        """Fallback dict-based cache with TTL expiry, compatible with cachetools.TTLCache
+        for the subset of methods used by search.py (clear, get, dict-like assignment)."""
+        def __init__(self, maxsize: int, ttl: float):
+            self._data: dict = {}
+            self._expires: dict = {}
+            self._ttl = ttl
+
+        def _prune(self):
+            now = time.time()
+            stale = [k for k, t in self._expires.items() if t < now]
+            for k in stale:
+                self._data.pop(k, None)
+                self._expires.pop(k, None)
+
+        def get(self, key, default=None):
+            self._prune()
+            if key in self._data and self._expires.get(key, 0) > time.time():
+                return self._data[key]
+            self._data.pop(key, None)
+            self._expires.pop(key, None)
+            return default
+
+        def clear(self):
+            self._data.clear()
+            self._expires.clear()
+
+        def __setitem__(self, key, value):
+            self._prune()
+            self._data[key] = value
+            self._expires[key] = time.time() + self._ttl
+
+        def __contains__(self, key):
+            return self.get(key) is not None or key in self._data
 
 try:
     from .store import (
@@ -558,7 +597,7 @@ class SearchIndex:
         self._bm25_ids: List[str] = []
         self._bm25_lock = threading.Lock()
         # Result cache: (query, k, zone) -> results
-        self._cache: TTLCache = TTLCache(maxsize=200, ttl=cache_ttl)
+        self._cache: _TTLCache = _TTLCache(maxsize=200, ttl=cache_ttl)
         self._cache_lock = threading.Lock()
 
     def invalidate_cache(self) -> None:
