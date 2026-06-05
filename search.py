@@ -14,6 +14,12 @@ import math
 import os
 import re
 import threading
+import sys
+import types
+import hashlib
+import json
+import time
+from dataclasses import dataclass
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -24,29 +30,79 @@ try:
 except Exception:
     _HAS_NUMPY = False
 
-from cachetools import TTLCache
+try:
+    from cachetools import TTLCache as _TTLCache
+    _HAS_CACHETOOLS = True
+except ImportError:
+    _HAS_CACHETOOLS = False
+
+    class _TTLCache:
+        """Fallback dict-based cache with TTL expiry, compatible with cachetools.TTLCache
+        for the subset of methods used by search.py (clear, get, dict-like assignment)."""
+        def __init__(self, maxsize: int, ttl: float):
+            self._data: dict = {}
+            self._expires: dict = {}
+            self._ttl = ttl
+
+        def _prune(self):
+            now = time.time()
+            stale = [k for k, t in self._expires.items() if t < now]
+            for k in stale:
+                self._data.pop(k, None)
+                self._expires.pop(k, None)
+
+        def get(self, key, default=None):
+            self._prune()
+            if key in self._data and self._expires.get(key, 0) > time.time():
+                return self._data[key]
+            self._data.pop(key, None)
+            self._expires.pop(key, None)
+            return default
+
+        def clear(self):
+            self._data.clear()
+            self._expires.clear()
+
+        def __setitem__(self, key, value):
+            self._prune()
+            self._data[key] = value
+            self._expires[key] = time.time() + self._ttl
+
+        def __contains__(self, key):
+            return self.get(key) is not None or key in self._data
 
 try:
     from .store import (
         LoadedMemory,
         MemoryEffectiveness,
         adaptive_conflict_threshold,
+        CONFIG_KEY_INTENT_PROTOTYPES,
         normalize_bm25,
+        plugin_config,
         _tokenise,
         embeddings_enabled,
         estimate_tokens,
+        _bm25_search_scored,
     )
 except ImportError:
     import store as _store_mod
     LoadedMemory = _store_mod.LoadedMemory
     MemoryEffectiveness = _store_mod.MemoryEffectiveness
     adaptive_conflict_threshold = _store_mod.adaptive_conflict_threshold
+    CONFIG_KEY_INTENT_PROTOTYPES = _store_mod.CONFIG_KEY_INTENT_PROTOTYPES
     normalize_bm25 = _store_mod.normalize_bm25
+    plugin_config = _store_mod.plugin_config
     _tokenise = _store_mod._tokenise
     embeddings_enabled = _store_mod.embeddings_enabled
     estimate_tokens = _store_mod.estimate_tokens
+    _bm25_search_scored = _store_mod._bm25_search_scored
 
 logger = logging.getLogger(__name__)
+
+# Register module early so dataclasses resolve correctly when the file is
+# loaded through importlib.util.module_from_spec without pre-inserting sys.modules.
+if __name__ not in sys.modules:
+    sys.modules[__name__] = sys.modules.get(__name__) or types.ModuleType(__name__)
 
 # ---------------------------------------------------------------------------
 # Embedding engine (ONNX Runtime — fast, lightweight)
@@ -89,6 +145,11 @@ def _get_st_model():
         return SentenceTransformer(model_name)
     except Exception:
         return None
+
+
+def _embed_texts(texts: List[str]) -> List[Optional[List[float]]]:
+    """Embed a list of text strings. Returns list of vectors (None if unavailable)."""
+    return [_embed_single(t) for t in texts]
 
 
 @functools.lru_cache(maxsize=500)
@@ -145,77 +206,9 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
 # ---------------------------------------------------------------------------
 # BM25 search
 # ---------------------------------------------------------------------------
-
-
-
-def _bm25_search_scored(
-    memories: List[LoadedMemory],
-    query: str,
-    k: int = 5,
-    effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
-    doc_tokens: Optional[List[Counter]] = None,
-    query_tokens: Optional[List[str]] = None,
-) -> List[Tuple[LoadedMemory, float]]:
-    """BM25 search with IDF-based scoring.
-
-    Formula: IDF(q) * (k1+1)*TF / (TF + k1*(1-b+b*|D|/avgdl))
-    k1=1.5, b=0.75 optimized for CJK mixed text.
-    """
-    k1, b = 1.5, 0.75
-    if k == 0 or not memories:
-        return []
-    q_tokens = query_tokens if query_tokens is not None else _tokenise(query)
-    if not q_tokens:
-        return []
-    n = len(memories)
-
-    df: Dict[str, int] = {}
-    doc_lens: List[int] = []
-    raw_doc_tokens: List[Counter]
-    if doc_tokens is not None:
-        raw_doc_tokens = doc_tokens
-    else:
-        raw_doc_tokens = [Counter(_tokenise(m.body + " " + " ".join(m.frontmatter.tags or []))) for m in memories]
-
-    for tokens in raw_doc_tokens:
-        doc_lens.append(sum(tokens.values()))
-        for t in set(tokens):
-            df[t] = df.get(t, 0) + 1
-
-    avgdl = sum(doc_lens) / max(n, 1)
-
-    q_tf = Counter(q_tokens)
-    idf_cache: Dict[str, float] = {}
-    for t in q_tf:
-        df_t = df.get(t, 0)
-        if df_t == 0:
-            continue
-        idf_cache[t] = math.log((n - df_t + 0.5) / (df_t + 0.5) + 1.0)
-
-    if not idf_cache:
-        return []
-
-    scored: List[Tuple[float, LoadedMemory]] = []
-    for i, (tokens, m) in enumerate(zip(raw_doc_tokens, memories)):
-        doc_len = doc_lens[i]
-        m_tf = tokens
-        score = 0.0
-        for t, q_count in q_tf.items():
-            idf = idf_cache.get(t)
-            if idf is None:
-                continue
-            tf = m_tf.get(t, 0)
-            norm = k1 * (1 - b + b * doc_len / max(avgdl, 1))
-            score += idf * (tf * (k1 + 1)) / (tf + norm) * q_count
-        if score > 0:
-            if effectiveness:
-                eff = effectiveness.get(m.id())
-                if eff:
-                    score *= eff.factor() * eff.decay_factor()
-            scored.append((score, m))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(m, s) for s, m in scored[:k]]
-
+# NOTE: _bm25_search_scored is imported from store.py (canonical impl).
+# store.py is the leaf module; search.py consumes it.  This avoids
+# duplicating the BM25 scoring logic in two places.
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +223,349 @@ def _extract_keywords(text: str, top_k: int = 5) -> List[str]:
     tf = Counter(tokens)
     scored = sorted(tf.items(), key=lambda x: x[1], reverse=True)
     return [t for t, _ in scored[:top_k]]
+
+
+# ---------------------------------------------------------------------------
+# Intent classification
+# ---------------------------------------------------------------------------
+
+
+def _intent_prototypes() -> Dict[str, List[str]]:
+    """Semantic intent prototypes for embedding-based zero-shot classification."""
+    defaults: Dict[str, List[str]] = {
+        "memory": [
+            "This is something important I want to remember about the user's preferences and habits.",
+            "这是我需要记住的重要信息，关于用户的偏好、习惯或长期事实。",
+        ],
+        "correction": [
+            "That was wrong, let me correct what I said previously.",
+            "刚才那句话不对，我来更正前面的说法。",
+        ],
+        "procedure": [
+            "Here is a step-by-step workflow or process I need to follow.",
+            "这里是需要遵循的步骤、流程或操作说明。",
+        ],
+    }
+
+    try:
+        cfg = plugin_config()
+        custom = cfg.get(CONFIG_KEY_INTENT_PROTOTYPES)
+        if isinstance(custom, dict) and custom:
+            merged: Dict[str, List[str]] = {}
+            for key, default_values in defaults.items():
+                value = custom.get(key, default_values)
+                if isinstance(value, str):
+                    values = [value.strip()] if value.strip() else list(default_values)
+                elif isinstance(value, (list, tuple)):
+                    values = [str(v).strip() for v in value if str(v).strip()]
+                    if not values:
+                        values = list(default_values)
+                else:
+                    values = list(default_values)
+                merged[key] = values
+            return merged
+    except Exception:
+        logger.warning("Invalid intent prototype configuration ignored", exc_info=True)
+
+    return defaults
+
+
+_INTENT_PROTOTYPE_EMBEDDINGS: Optional[Dict[str, List[Any]]] = None
+_INTENT_PROTOTYPE_SIGNATURE: Optional[Tuple[Tuple[str, Tuple[str, ...]], ...]] = None
+_INTENT_PROTOTYPE_LOCK = threading.Lock()
+
+
+def _ensure_intent_prototypes() -> Optional[Dict[str, List[Any]]]:
+    """Lazy-load intent prototype embeddings for zero-shot classification."""
+    global _INTENT_PROTOTYPE_EMBEDDINGS, _INTENT_PROTOTYPE_SIGNATURE
+    prototypes = _intent_prototypes()
+    signature = tuple((intent, tuple(texts)) for intent, texts in sorted(prototypes.items()))
+    if _INTENT_PROTOTYPE_EMBEDDINGS is not None and _INTENT_PROTOTYPE_SIGNATURE == signature:
+        return _INTENT_PROTOTYPE_EMBEDDINGS
+    with _INTENT_PROTOTYPE_LOCK:
+        if _INTENT_PROTOTYPE_EMBEDDINGS is not None and _INTENT_PROTOTYPE_SIGNATURE == signature:
+            return _INTENT_PROTOTYPE_EMBEDDINGS
+        try:
+            embs: Dict[str, List[Any]] = {}
+            for intent, texts in prototypes.items():
+                vecs = _embed_texts(texts)
+                if vecs is None:
+                    continue
+                valid_vecs = [vec for vec in vecs if vec is not None]
+                if valid_vecs:
+                    embs[intent] = valid_vecs
+            if embs:
+                _INTENT_PROTOTYPE_EMBEDDINGS = embs
+                _INTENT_PROTOTYPE_SIGNATURE = signature
+                return _INTENT_PROTOTYPE_EMBEDDINGS
+        except Exception:
+            pass
+        return None
+
+
+_classify_intent_stats = {"embedding": 0, "keyword": 0, "fallback_none": 0}
+_classify_intent_stats_lock = threading.Lock()
+
+
+def _bump_classify_intent_stat(name: str) -> None:
+    with _classify_intent_stats_lock:
+        _classify_intent_stats[name] += 1
+
+
+def _is_explicit_memory_intent_kw(text: str) -> bool:
+    lower = text.lower()
+    markers = [
+        "remember", "prefer", "always", "important", "note",
+        "remind", "keep in mind", "save this",
+        "我的", "我喜欢", "我讨厌",
+    ]
+    return any(m in lower for m in markers)
+
+
+def _is_correction_kw(text: str) -> bool:
+    lower = text.lower()
+    markers = [
+        "actually", "wrong", "correct", "instead",
+        "不对", "错了", "更正", "纠正",
+        "no,", "nope", "incorrect",
+    ]
+    return any(m in lower for m in markers)
+
+
+def _is_procedure_kw(text: str) -> bool:
+    lower = text.lower()
+    markers = [
+        "how to", "steps", "workflow", "process", "procedure",
+        "configure", "setup", "安装", "配置", "步骤", "流程",
+        "way to", "method of", "always use", "never use", "make sure",
+    ]
+    return any(m in lower for m in markers)
+
+
+_is_explicit_memory_intent = _is_explicit_memory_intent_kw
+_is_correction = _is_correction_kw
+_is_procedure = _is_procedure_kw
+
+
+def _classify_intent(text: str) -> str:
+    """Classify user turn intent using embedding zero-shot classification."""
+    if not text or len(text) < 5:
+        _bump_classify_intent_stat("fallback_none")
+        return "none"
+
+    try:
+        proto_embs = _ensure_intent_prototypes()
+        if proto_embs is not None:
+            import numpy as np
+            text_emb = _embed_single(text)
+            if text_emb is not None:
+                text_norm = text_emb / (np.linalg.norm(text_emb) + 1e-8)
+                best_intent = "none"
+                best_score = 0.30
+                for intent, proto_vecs in proto_embs.items():
+                    for proto_vec in proto_vecs:
+                        proto_norm = proto_vec / (np.linalg.norm(proto_vec) + 1e-8)
+                        sim = float(np.dot(text_norm, proto_norm))
+                        if sim > best_score:
+                            best_score = sim
+                            best_intent = intent
+                if best_intent != "none":
+                    _bump_classify_intent_stat("embedding")
+                    return best_intent
+    except Exception:
+        pass
+
+    if _is_explicit_memory_intent_kw(text):
+        _bump_classify_intent_stat("keyword")
+        return "memory"
+    if _is_correction_kw(text):
+        _bump_classify_intent_stat("keyword")
+        return "correction"
+    if _is_procedure_kw(text):
+        _bump_classify_intent_stat("keyword")
+        return "procedure"
+    _bump_classify_intent_stat("fallback_none")
+    return "none"
+
+
+# ---------------------------------------------------------------------------
+# Query templates and result cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QueryTemplate:
+    """Named query template with parameters."""
+
+    name: str
+    description: str
+    builder: Any
+
+
+QUERY_TEMPLATES: Dict[str, QueryTemplate] = {}
+
+
+def register_template(name: str, description: str):
+    """Register a query template by name."""
+
+    def decorator(fn):
+        QUERY_TEMPLATES[name] = QueryTemplate(name=name, description=description, builder=fn)
+        return fn
+
+    return decorator
+
+
+@register_template("recent", "Most recently created memories")
+def tpl_recent(zone: Optional[str] = None, k: int = 10) -> Dict[str, Any]:
+    return {"type": "recent", "zone": zone, "k": k, "sort": "created"}
+
+
+@register_template("by_zone", "Memories in a specific zone")
+def tpl_by_zone(zone: str, k: int = 50) -> Dict[str, Any]:
+    return {"type": "zone", "zone": zone, "k": k}
+
+
+@register_template("by_tag", "Memories matching any of the given tags")
+def tpl_by_tag(tags: List[str], k: int = 20) -> Dict[str, Any]:
+    return {"type": "tag", "tags": tags, "k": k}
+
+
+@register_template("by_effectiveness", "Highest effectiveness memories")
+def tpl_by_effectiveness(k: int = 10) -> Dict[str, Any]:
+    return {"type": "effectiveness", "k": k, "sort": "effectiveness"}
+
+
+@register_template("graph_neighbors", "Graph neighbors of a seed memory")
+def tpl_graph_neighbors(memory_id: str, min_weight: float = 0.1, k: int = 20) -> Dict[str, Any]:
+    return {
+        "type": "graph_neighbors",
+        "memory_id": memory_id,
+        "min_weight": min_weight,
+        "k": k,
+    }
+
+
+@register_template("cross_zone_bridge", "Memories bridging two zones")
+def tpl_cross_zone_bridge(zone_a: str, zone_b: str, min_weight: float = 0.2) -> Dict[str, Any]:
+    return {
+        "type": "cross_zone_bridge",
+        "zone_a": zone_a,
+        "zone_b": zone_b,
+        "min_weight": min_weight,
+    }
+
+
+@register_template("pagerank_hubs", "Top PageRank hub memories")
+def tpl_pagerank_hubs(k: int = 10, zone: Optional[str] = None) -> Dict[str, Any]:
+    return {"type": "pagerank", "k": k, "zone": zone}
+
+
+@register_template("supersedes_chain", "Version lineage of a memory")
+def tpl_supersedes_chain(memory_id: str) -> Dict[str, Any]:
+    return {"type": "supersedes_chain", "memory_id": memory_id}
+
+
+def build_query(template_name: str, **kwargs) -> Dict[str, Any]:
+    """Build a query dict from a registered template."""
+    tpl = QUERY_TEMPLATES.get(template_name)
+    if tpl is None:
+        raise ValueError(
+            f"Unknown template: {template_name}. Available: {list(QUERY_TEMPLATES.keys())}"
+        )
+    return tpl.builder(**kwargs)
+
+
+class _CacheEntry:
+    def __init__(self, result: Any, expires_at: float) -> None:
+        self.result = result
+        self.expires_at = expires_at
+        self.last_access = time.monotonic()
+        self.access_count = 0
+
+
+class ResultCache:
+    """TTL-based result cache kept for compatibility during migration."""
+
+    def __init__(self, default_ttl: float = 300.0, max_size: int = 1000):
+        self.default_ttl = default_ttl
+        self.max_size = max_size
+        self._store: Dict[str, _CacheEntry] = {}
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+
+    def _make_key(self, *args, **kwargs) -> str:
+        data = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str)
+        return hashlib.sha256(data.encode()).hexdigest()[:32]
+
+    def get(self, *args, **kwargs) -> Optional[Any]:
+        key = self._make_key(*args, **kwargs)
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+            if time.monotonic() > entry.expires_at:
+                del self._store[key]
+                self._misses += 1
+                return None
+            entry.access_count += 1
+            entry.last_access = time.monotonic()
+            self._hits += 1
+            return entry.result
+
+    def set(self, result: Any, *args, ttl: Optional[float] = None, **kwargs) -> str:
+        key = self._make_key(*args, **kwargs)
+        expires = time.monotonic() + (ttl or self.default_ttl)
+        with self._lock:
+            if len(self._store) >= self.max_size:
+                lru = min(self._store.items(), key=lambda item: item[1].last_access)
+                del self._store[lru[0]]
+            self._store[key] = _CacheEntry(result, expires)
+        return key
+
+    def invalidate(self, *args, **kwargs) -> bool:
+        key = self._make_key(*args, **kwargs)
+        with self._lock:
+            if key in self._store:
+                del self._store[key]
+                return True
+            return False
+
+    def invalidate_pattern(self, pattern: str) -> int:
+        logger.warning("ResultCache.invalidate_pattern ignored opaque hash pattern: %s", pattern)
+        return 0
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
+            return {
+                "size": len(self._store),
+                "max_size": self.max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": round(hit_rate, 4),
+                "default_ttl": self.default_ttl,
+            }
+
+
+_global_cache: Optional[ResultCache] = None
+_global_cache_lock = threading.Lock()
+
+
+def get_cache() -> ResultCache:
+    """Get the global result cache instance."""
+    global _global_cache
+    if _global_cache is None:
+        with _global_cache_lock:
+            if _global_cache is None:
+                _global_cache = ResultCache()
+    return _global_cache
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +597,7 @@ class SearchIndex:
         self._bm25_ids: List[str] = []
         self._bm25_lock = threading.Lock()
         # Result cache: (query, k, zone) -> results
-        self._cache: TTLCache = TTLCache(maxsize=200, ttl=cache_ttl)
+        self._cache: _TTLCache = _TTLCache(maxsize=200, ttl=cache_ttl)
         self._cache_lock = threading.Lock()
 
     def invalidate_cache(self) -> None:
@@ -429,10 +765,11 @@ class SearchIndex:
             alpha, beta, gamma, delta: weights for weighted fusion mode only
             hebbian_beta: Hebbian boost coefficient (default 0 = off)
         """
+        normalized_zone = zone.lower().strip() if zone else None
         cache_key = (
             query.lower().strip(),
             k,
-            zone,
+            normalized_zone,
             include_history,
             fusion_mode,
             alpha,
@@ -446,7 +783,10 @@ class SearchIndex:
             if cached is not None:
                 return cached
 
-        active = self.store.list() if include_history else self.store.list_active()
+        if include_history:
+            active = self.store.list(zone=normalized_zone) if normalized_zone else self.store.list()
+        else:
+            active = self.store.list(zone=normalized_zone, active_only=True) if normalized_zone else self.store.list_active()
         if not active:
             return []
 
@@ -456,6 +796,9 @@ class SearchIndex:
         active_map: Dict[str, LoadedMemory] = {m.id(): m for m in active}
 
         # Layer 1: Recall
+        # For history-inclusive queries we bypass the cached indexes (which only
+        # cover active memories) and fall through to the hand-rolled BM25 path
+        # that searches the full candidate list.
         embed_results: Dict[str, float] = {}
         if not include_history:
             try:
@@ -535,6 +878,11 @@ class SearchIndex:
                 pool_ids = [mid for mid in fused_scores]
                 activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
                 scale = max_rerank_score if max_rerank_score > 0 else 1.0
+                # Merge graph-only neighbors into the rerank pool so strongly
+                # associated but semantically distant memories are recoverable.
+                for nid, act in activation.items():
+                    if nid in active_map and nid not in fused_scores:
+                        reranked.append((hebbian_beta * min(act, 1.0) * scale, active_map[nid]))
                 for i, (score, mem) in enumerate(reranked):
                     act = activation.get(mem.id(), 0.0)
                     if act > 0:
@@ -549,10 +897,6 @@ class SearchIndex:
         # MMR diversity re-ranking (optional, λ=0.7 balances relevance vs diversity)
         if k > 1:
             results = self._mmr_rerank(query, results, lambda_param=0.7, top_n=k * 2)
-
-        if zone:
-            nz = zone.lower().strip()
-            results = [m for m in results if m.frontmatter.zone == nz]
 
         results = results[:k]
         with self._cache_lock:

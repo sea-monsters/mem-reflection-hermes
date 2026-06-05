@@ -9,7 +9,7 @@ v1.0-beta2 Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
 - __init__.py: Plugin registration, backward compat, runtime singletons
 - dashboard/: FastAPI CRUD + graph visualization endpoints
 
-Legacy modules (deprecated, scheduled for removal in beta3):
+Legacy modules retired in beta3:
 - core.py, late_binding.py, search/embed.py, reflection/engine.py, hooks/lifecycle.py,
   tools/handlers.py, graph/ahe_graph.py, graph/cluqi.py, graph/pagerank.py,
   graph/cross_zone.py, query/cache.py
@@ -18,14 +18,12 @@ Legacy modules (deprecated, scheduled for removal in beta3):
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 import os
 import queue
 import re
 import sys
-import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
@@ -34,8 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Import from submodules: models, constants, BM25, frontmatter, IO
-from .core import (  # noqa: F401
+# Import from store: models, constants, BM25, frontmatter, IO
+from .store import (  # noqa: F401
     hermes_home, load_config, plugin_config, plugin_data_dir,
     user_memories_dir, project_memories_dir, user_skills_dir, project_skills_dir,
     embeddings_enabled, micro_reflection_enabled, palace_mode_enabled, profile_mode_enabled,
@@ -163,7 +161,7 @@ def build_palace_index(memories: List[LoadedMemory]) -> str:
     """Generate a code-based palace index (no LLM needed).
 
     Groups memories by zone, shows counts and first-line previews.
-    If ahe_graph is active, appends intra-zone graph cluster density.
+    If graph data is available, appends intra-zone graph cluster density.
     Typically ~200-400 tokens.
     """
     groups: Dict[str, List[LoadedMemory]] = {}
@@ -179,7 +177,9 @@ def build_palace_index(memories: List[LoadedMemory]) -> str:
     # ── Scheme B: Query graph density per zone ────────────────
     intra_zone_edges: Dict[str, int] = {}
     try:
-        gm = _get_graph_mgr()
+        gm = globals().get("_get_graph_mgr")
+        if callable(gm):
+            gm = gm()
         if gm is not None:
             for zone, mems in groups.items():
                 mids = set(m.id() for m in mems)
@@ -468,441 +468,34 @@ def _build_context_block_inner(query: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Register slash commands
+# Runtime feature registration
 # ---------------------------------------------------------------------------
-def _register_slash_commands(ctx):
-    """Register all slash commands with the Hermes context."""
-    ctx.register_command(
-        name="reflect",
-        handler=lambda raw: _slash_reflect(raw),
-        description="Trigger a full reflection on the current session",
-        args_hint="",
-    )
-    ctx.register_command(
-        name="pending-skills",
-        handler=lambda raw: _slash_pending_skills(raw),
-        description="Show pending skill candidates awaiting approval",
-        args_hint="",
-    )
-    ctx.register_command(
-        name="approve-skill",
-        handler=lambda raw: _slash_approve_skill(raw),
-        description="Approve a pending skill candidate by ID",
-        args_hint="<pending_id>",
-    )
-    ctx.register_command(
-        name="reject-skill",
-        handler=lambda raw: _slash_reject_skill(raw),
-        description="Reject a pending skill candidate by ID",
-        args_hint="<pending_id> [reason]",
-    )
-    ctx.register_command(
-        name="memories",
-        handler=lambda raw: _slash_memories(raw),
-        description="List active memories",
-        args_hint="[query]",
-    )
-    ctx.register_command(
-        name="skills",
-        handler=lambda raw: _slash_skills(raw),
-        description="List or search skills",
-        args_hint="[query]",
-    )
-    ctx.register_command(
-        name="compile-profile",
-        handler=lambda raw: _slash_compile_profile(raw),
-        description="Compile all memories into a structured profile via LLM",
-        args_hint="[profile|palace_index|zone]",
-    )
+def _register_runtime_features(ctx):
+    """Register command and graph runtime features with the Hermes context."""
+    from .runtime_hooks import register_commands
+
+    register_commands(ctx)
 
     logger.info("mem-reflection-hermes plugin registered")
 
-    # ── ahe_graph integration (v0.6.1+) ───────────────────────
     try:
-        try:
-            from .ahe_graph import get_graph_manager as _get_gm
-        except ImportError:
-            logger.debug("Relative import of ahe_graph failed (expected for standalone plugin load), trying importlib fallback")
-            # Standalone plugin load: __package__ may be empty, so relative
-            # import fails. Fallback to importlib-based absolute load.
-            import importlib.util as _iutil
-            import sys as _sys
-            _ahe_path = str(Path(__file__).parent / "ahe_graph" / "__init__.py")
-            if not Path(_ahe_path).exists():
-                logger.warning("ahe_graph module not found at %s — graph features disabled", _ahe_path)
-                _get_gm = None  # type: ignore
-            else:
-                _ahe_spec = _iutil.spec_from_file_location(
-                    "mem_reflection_hermes.ahe_graph", _ahe_path
-                )
-                if _ahe_spec is None or _ahe_spec.loader is None:
-                    logger.warning("ahe_graph spec could not be loaded — graph features disabled")
-                    _get_gm = None  # type: ignore
-                else:
-                    try:
-                        _ahe_mod = _iutil.module_from_spec(_ahe_spec)
-                        _sys.modules["mem_reflection_hermes.ahe_graph"] = _ahe_mod
-                        _ahe_spec.loader.exec_module(_ahe_mod)  # type: ignore
-                        _get_gm = _ahe_mod.get_graph_manager
-                        logger.info("ahe_graph loaded successfully via importlib fallback")
-                    except Exception as _ahe_err:
-                        logger.warning(
-                            "ahe_graph loaded but raised %s: %s — graph features disabled",
-                            type(_ahe_err).__name__, _ahe_err,
-                        )
-                        _get_gm = None  # type: ignore
-
-        # ── Common graph setup (runs regardless of import path) ──
-        # Lazy-init on first use
-        _graph_db_dir = hermes_home() / "plugins" / "mem-reflection-hermes"
-        # Set module-level globals so _on_session_end and _get_graph_neighbors
-        # use the same singleton (P1-2, P2-1)
-        global _gm_getter_func, _gm_getter_path
-        _gm_getter_func = _get_gm
-        _gm_getter_path = _graph_db_dir
-        _gm_ref = {"instance": None}
-        _gm_lock = threading.Lock()
-
-        def _ensure_gm():
-            if _gm_ref["instance"] is None:
-                with _gm_lock:
-                    if _gm_ref["instance"] is None:
-                        _gm_ref["instance"] = _get_gm(_graph_db_dir)
-            return _gm_ref["instance"]
-
-        # --- tool: srh_associate ---
-        MAX_ASSOCIATION_IDS = 20
-
-        def _graph_associate_h(args: dict, **kwargs) -> str:
-            gm = _ensure_gm()
-            mids = args.get("memory_ids", [])[:MAX_ASSOCIATION_IDS]
-            # HIGH-10: validate memory IDs exist before creating graph edges
-            mem_store = _get_mem_store()
-            valid_mids = [mid for mid in mids if mem_store.get(mid) is not None]
-            if len(valid_mids) < 2:
-                return json.dumps({"error": "At least 2 valid memory IDs required", "valid_ids": valid_mids})
-            ctx_str = args.get("context", "")
-            rel = args.get("relation", "co_occurs")
-            result = gm.associate_memories(valid_mids, ctx_str, rel)
-            return json.dumps({**result, "validated_ids": valid_mids})
-
-        ctx.register_tool(
-            name="srh_associate",
-            toolset="mem_reflection_hermes",
-            schema={
-                "name": "srh_associate",
-                "description": "Create graph associations between memories. Records Hebbian co-occurrence edges so related memories activate each other during retrieval.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "memory_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of memory IDs to associate (max 20)",
-                            "minItems": 2,
-                            "maxItems": 20,
-                        },
-                        "relation": {
-                            "type": "string",
-                            "enum": ["co_occurs", "co_used_in_task"],
-                            "description": "Relation type: co_occurs (stronger) or co_used_in_task (weaker)",
-                            "default": "co_occurs",
-                        },
-                    },
-                    "required": ["memory_ids"],
-                },
-            },
-            handler=_graph_associate_h,
-            description="Associate memories via graph edges",
-            emoji="🔗",
+        from .runtime_graph import register_graph_features
+        register_graph_features(
+            ctx,
+            get_mem_store=_get_mem_store,
+            graph_db_path=plugin_data_dir() / "graph.db",
         )
-
-        # --- tool: srh_graph_retrieve ---
-        def _graph_retrieve_h(args: dict, **kwargs) -> str:
-            gm = _ensure_gm()
-            mids = args.get("memory_ids", [])[:20]
-            task_type = args.get("task_type", "reasoning")
-            max_res = min(args.get("max_results", 10), 100)
-            tier = args.get("tier", "list")
-            # Auto-detect strategy from seed memory zones when task_type is default
-            if task_type == "reasoning" and mids and gm.store:
-                try:
-                    zones = set()
-                    for mid in mids:
-                        meta = gm.store.get_meta(mid)
-                        if meta and meta.get("zone"):
-                            zones.add(meta.get("zone"))
-                    # Map seed zones to best strategy
-                    zone_strategy_map = {
-                        "core": "factual",
-                        "work": "reasoning",
-                        "episode": "recent",
-                        "general": "exploration",
-                    }
-                    for z in zones:
-                        inferred = zone_strategy_map.get(z)
-                        if inferred:
-                            task_type = inferred
-                            break
-                except Exception:
-                    pass  # fallback to "reasoning"
-            results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
-            return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier, "strategy": task_type})
-
-        ctx.register_tool(
-            name="srh_graph_retrieve",
-            toolset="mem_reflection_hermes",
-            schema={
-                "name": "srh_graph_retrieve",
-                "description": "Retrieve associative memories via co-activation propagation. Given seed memory IDs, finds related memories through associative (Hebbian co-occurrence) graph edges. Edges indicate 'used together', not factual entity relationships. Progressive tiers: tier='count' (minimal), 'list' (summary, default), 'detail' (full with depth).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "memory_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Seed memory IDs to start graph traversal from (max 20)",
-                            "minItems": 1,
-                            "maxItems": 20,
-                        },
-                        "task_type": {
-                            "type": "string",
-                            "enum": ["factual", "reasoning", "skill", "recent", "exploration", "personalized"],
-                            "description": "Retrieval strategy type",
-                            "default": "reasoning",
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Max results to return",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 100,
-                        },
-                        "tier": {
-                            "type": "string",
-                            "enum": ["count", "list", "detail"],
-                            "description": "Progressive disclosure tier: 'count' = minimal, 'list' = summary (default), 'detail' = full propagation info",
-                            "default": "list",
-                        },
-                    },
-                    "required": ["memory_ids"],
-                },
-            },
-            handler=_graph_retrieve_h,
-            description="Retrieve graph-related memories",
-            emoji="🕸️",
-        )
-
-        # --- tool: srh_graph_stats ---
-        def _graph_stats_h(args: dict, **kwargs) -> str:
-            gm = _ensure_gm()
-            stats = gm.get_stats()
-            stats["graph_semantics"] = "associative_coactivation"
-            return json.dumps(stats)
-
-        ctx.register_tool(
-            name="srh_graph_stats",
-            toolset="mem_reflection_hermes",
-            schema={
-                "name": "srh_graph_stats",
-                "description": "Get associative graph statistics: node count, co-activation edge count, average edge weight, database path. The graph represents Hebbian co-occurrence (memories used together), not factual entity relationships.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            handler=_graph_stats_h,
-            description="Get graph memory statistics",
-            emoji="📊",
-        )
-
-        # ── P2-3: srh_graph_viz — graph visualization data ──
-        def _graph_viz_h(args: dict, **kwargs) -> str:
-            """Return full graph data for dashboard visualization."""
-            gm = _ensure_gm()
-            tier = args.get("tier", "summary")
-            stats = gm.get_stats(tier="detail")
-            if stats.get("node_count", 0) == 0:
-                return json.dumps({"nodes": [], "edges": [], "stats": stats})
-            try:
-                with gm.store._connect() as conn:
-                    nodes = conn.execute(
-                        "SELECT id, zone, importance, strength, status, access_count FROM graph_memory_meta "
-                        "WHERE strength > 0 ORDER BY importance DESC LIMIT 200"
-                    ).fetchall()
-                    edges = conn.execute(
-                        "SELECT source_id, target_id, relation, weight FROM graph_edges "
-                        "WHERE weight >= 0.1 ORDER BY weight DESC LIMIT 500"
-                    ).fetchall()
-                    return json.dumps({
-                        "nodes": [dict(r) for r in nodes],
-                        "edges": [dict(r) for r in edges],
-                        "stats": {**stats, "graph_semantics": "associative_coactivation"},
-                    })
-            except Exception as e:
-                return json.dumps({"error": str(e), "stats": stats})
-
-        ctx.register_tool(
-            name="srh_graph_viz",
-            toolset="mem_reflection_hermes",
-            schema={
-                "name": "srh_graph_viz",
-                "description": "Get full associative graph visualization data (nodes + edges) for dashboard rendering. tier='summary' returns counts only; 'detail' returns full node/edge lists. Graph semantics: associative_coactivation (Hebbian co-occurrence edges, not factual entity relations).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "tier": {"type": "string", "enum": ["summary", "detail"], "default": "summary"},
-                    },
-                },
-            },
-            handler=_graph_viz_h,
-            description="Graph viz data for dashboard",
-            emoji="🕸️",
-        )
-
-        # --- tool: srh_memory_health (WS-5) ---
-        def _memory_health_h(args: dict, **kwargs) -> str:
-            store = _get_mem_store()
-            metrics = store.health_metrics()
-            return json.dumps({"health": metrics, "recommendations": _health_recommendations(metrics)})
-
-        def _health_recommendations(metrics: Dict[str, Any]) -> List[str]:
-            recs = []
-            if metrics.get("duplicate_clusters", 0) > 0:
-                recs.append(f"Review {metrics['duplicate_clusters']} duplicate memory cluster(s).")
-            if metrics.get("longest_supersedes_chain", 0) > 5:
-                recs.append(f"Longest supersedes chain ({metrics['longest_supersedes_chain']}) is deep; consider consolidation.")
-            if metrics.get("supersedes_cycle_count", 0) > 0:
-                recs.append(f"Found {metrics['supersedes_cycle_count']} cycle(s) in supersedes chains — fix immediately.")
-            if metrics.get("stale_high_rank_count", 0) > 0:
-                recs.append(f"{metrics['stale_high_rank_count']} superseded memories still have high rank; consider re-ranking.")
-            if metrics.get("expired_count", 0) > 0:
-                recs.append(f"{metrics['expired_count']} memories have passed their valid_until date.")
-            if not recs:
-                recs.append("Memory store looks healthy.")
-            return recs
-
-        ctx.register_tool(
-            name="srh_memory_health",
-            toolset="mem_reflection_hermes",
-            schema={
-                "name": "srh_memory_health",
-                "description": "Get memory health metrics: duplicate clusters, longest supersedes chain, cycle count, stale high-rank memories, expired memories, and reflection acceptance rate. Returns actionable recommendations.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            handler=_memory_health_h,
-            description="Get memory health metrics and recommendations",
-            emoji="🏥",
-        )
-
-        # --- hook: auto-associate on memory write ---
-        def _post_tool_associate(**kwargs) -> None:
-            try:
-                tool_name = kwargs.get("tool_name", "")
-                if tool_name not in ("srh_memory_write", "srh_memory_delete"):
-                    return None
-
-                gm = _ensure_gm()
-                args = kwargs.get("args", {})
-                result = kwargs.get("result", {})
-
-                if tool_name == "srh_memory_write":
-                    # result may be raw JSON string (srh_memory_write returns json.dumps)
-                    if isinstance(result, str):
-                        try:
-                            result = json.loads(result)
-                        except json.JSONDecodeError:
-                            result = {}
-                    # Guard: only create graph metadata for successful writes
-                    if not result.get("success") or not result.get("id"):
-                        return None
-                    memory_id = result.get("id")
-                    if not memory_id:
-                        return None
-                    zone = args.get("zone", "general")
-                    gm.store.ensure_meta(memory_id, zone=zone)
-                    gm.store.record_access(memory_id)
-
-                    # ── Scheme A-1: Supersedes-aware edge migration ──────────
-                    supersedes_ids = args.get("supersedes", [])
-                    if supersedes_ids and isinstance(supersedes_ids, list):
-                        for old_id in supersedes_ids:
-                            # Mark old memory as inactive in graph
-                            gm.store.update_importance(old_id, delta=-0.9)
-                            conn = gm.store._connect()
-                            conn.execute(
-                                "UPDATE graph_memory_meta SET strength=0, status='superseded' WHERE id=?",
-                                (old_id,)
-                            )
-                            # Migrate old edges to new memory (weight * 0.3)
-                            old_edges = gm.store.get_edges(old_id)
-                            for edge in old_edges:
-                                src, tgt = edge["source_id"], edge["target_id"]
-                                neigh = tgt if src == old_id else src
-                                rel = edge.get("relation", "co_occurs")
-                                old_w = edge.get("weight", 0.5)
-                                # Copy edge from new memory to neighbor with decayed weight
-                                gm.store.set_edge_weight(memory_id, neigh, relation=rel,
-                                                     weight=old_w * 0.3)
-                            conn.commit()
-                elif tool_name == "srh_memory_delete":
-                    # Clean up graph metadata and edges for this memory
-                    mem_id = args.get("id", "")
-                    if mem_id:
-                        # ── Scheme A-2: Soft-delete (mark inactive) instead of hard delete ──
-                        gm.store.update_importance(mem_id, delta=-0.9)
-                        conn = gm.store._connect()
-                        conn.execute(
-                            "UPDATE graph_memory_meta SET strength=0, status='deleted' WHERE id=?",
-                            (mem_id,)
-                        )
-                        conn.commit()
-                        # Decay connected edges heavily
-                        gm.store.decay_edges(decay_rate=0.9)
-            except Exception as e:
-                logger.debug("ahe_graph auto-associate: %s", e)
-            return None
-
-        ctx.register_hook("post_tool_call", _post_tool_associate)
-
-        # --- slash command ---
-        def _slash_graph(raw_args: str) -> str:
-            gm = _ensure_gm()
-            parts = raw_args.strip().split()
-            cmd = parts[0] if parts else "stats"
-
-            if cmd == "stats":
-                s = gm.get_stats(tier="detail")
-                return (
-                    f"📊 **Graph Memory Stats**\n"
-                    f"- Nodes: {s['node_count']}\n"
-                    f"- Edges: {s['edge_count']}\n"
-                    f"- Avg Weight: {s['avg_weight']}\n"
-                    f"- DB: {s['db_path']}"
-                )
-            elif cmd == "decay":
-                gm.run_decay()
-                return "🧹 Decay cycle completed on all graph edges and memory strengths."
-            elif cmd == "associate" and len(parts) >= 3:
-                mids = parts[1:]
-                r = gm.associate_memories(mids)
-                return f"🔗 Associated {len(mids)} memories ({r['edges_created']} edges created/updated)"
-            else:
-                return "Usage: /graph [stats|decay|associate <id1> <id2> ...]"
-
-        ctx.register_command(
-            name="graph",
-            handler=_slash_graph,
-            description="Graph memory operations: stats, decay, associate",
-            args_hint="[stats|decay|associate <id1> <id2> ...]",
-        )
-
-        logger.info("ahe_graph integration registered (v0.6.1+)")
+        logger.info("runtime graph integration registered")
+        return
     except ImportError as e:
-        logger.warning("ahe_graph not available (skip integration): %s", e)
-        # HIGH-7: ensure post_tool_call hook is always registered
+        logger.warning("runtime graph not available (skip integration): %s", e)
         ctx.register_hook("post_tool_call", lambda **kwargs: None)
+        return
     except Exception as e:
-        logger.warning("ahe_graph integration error: %s", e)
-        # HIGH-7: ensure post_tool_call hook is always registered
+        logger.warning("runtime graph integration error: %s", e)
         ctx.register_hook("post_tool_call", lambda **kwargs: None)
+        return
+
 
 
 def _get_mem_store() -> MemoryStore:
@@ -930,46 +523,34 @@ _package_normalize_zone = _normalize_zone
 _package_micro_reflection_enabled = _micro_reflection_enabled
 _package_estimate_tokens = _estimate_tokens
 
-# Initialize globals set by _register_slash_commands (H1)
-_gm_getter_func = None
-_gm_getter_path = None
+# Re-export runtime tool handlers for dashboard / external consumers
+from .runtime_tools import _tool_srh_memory_write, _tool_srh_palace_zones  # noqa: E402
+from .runtime_hooks import _get_graph_neighbors, _enrich_with_graph, _get_graph_mgr  # noqa: E402, F401
+from .reflect import _recent_reflect_outcomes, _save_pending_skill_candidates  # noqa: E402, F401
 
+# Runtime submodules are imported explicitly by register() and compatibility
+# entrypoints. Avoid package-root star imports so beta3 no longer exposes every
+# private tool/hook/reflection helper as a root-level symbol.
 
-# Tool handlers extracted to tools/handlers.py
-
-# Sub-module imports
-from .reflection.engine import *  # noqa: F401, F403
-from .tools.handlers import *  # noqa: F401, F403
-from .hooks.lifecycle import *  # noqa: F401, F403
-
-# NOTE: Due to the coexistence of new runtime search.py and legacy search/
-# directory, standard `from .search.embed import ...` fails because Python
-# imports search.py instead of the search/ package.  Load embed directly
-# via importlib to bypass the name shadowing.
+# NOTE: search.py now owns the embedding helpers used by the package root.
 _embed_single = None  # noqa: F811
 _cosine_sim = None    # noqa: F811
 try:
-    from .search.embed import _embed_single, _cosine_sim  # noqa: F401, F402
+    from .search import _embed_single, _cosine_sim  # noqa: F401, F402
 except ImportError:
     import importlib.util as _i_util
-    _embed_path = Path(__file__).parent / 'search' / 'embed.py'
-    _spec = _i_util.spec_from_file_location(
-        'mem_reflection_hermes.search.embed_legacy', str(_embed_path))
-    _embed_mod = _i_util.module_from_spec(_spec)
-    sys.modules.setdefault('mem_reflection_hermes.search.embed_legacy', _embed_mod)
-    _spec.loader.exec_module(_embed_mod)
-    _embed_single = _embed_mod._embed_single
-    _cosine_sim = _embed_mod._cosine_sim
+    _search_path = Path(__file__).parent / "search.py"
+    _spec = _i_util.spec_from_file_location("mem_reflection_hermes.search", str(_search_path))
+    _search_mod = _i_util.module_from_spec(_spec)
+    sys.modules.setdefault("mem_reflection_hermes.search", _search_mod)
+    _spec.loader.exec_module(_search_mod)
+    _embed_single = _search_mod._embed_single
+    _cosine_sim = _search_mod._cosine_sim
 
-# engine.py's __all__ exports _get_mem_store/_get_skill_store, so import *
-# overwrites the root-native versions. Restore them here to prevent recursive
-# late-binding (engine._get_mem_store → from mem_reflection_hermes import → engine._get_mem_store).
-_get_mem_store = _package_get_mem_store
-_get_skill_store = _package_get_skill_store
-_build_context_block = _package_build_context_block
-_normalize_zone = _package_normalize_zone
-_micro_reflection_enabled = _package_micro_reflection_enabled
-_estimate_tokens = _package_estimate_tokens
+def _auto_rebalance_zones(dry_run: bool = False) -> dict:
+    """Delegate zone rebalance to the canonical runtime tool implementation."""
+    from .runtime_tools import _auto_rebalance_zones as _runtime_auto_rebalance
+    return _runtime_auto_rebalance(dry_run=dry_run)
 
 def _reflection_mode() -> str:
     return plugin_config().get("reflection_mode", "raw_chunk")  # W2: default to raw_chunk
@@ -977,19 +558,15 @@ def _reflection_mode() -> str:
 
 def register(ctx) -> None:
     """Register all Hermes plugin tools, hooks, slash commands, and graph tools."""
-    from .hooks import lifecycle as _hooks_mod
-    from .tools import handlers as _tools_mod
+    from . import runtime_hooks as _hooks_mod
+    from . import runtime_tools as _tools_mod
 
-    if hasattr(_hooks_mod, "_set_plugin_context"):
-        _hooks_mod._set_plugin_context(ctx)
-    _tools_mod.register(ctx)
-    _register_slash_commands(ctx)
-
-    # Forward graph manager config from __init__ to lifecycle module
-    # so _get_graph_mgr sees the same singleton (P2)
-    if _gm_getter_func is not None:
-        _hooks_mod._gm_getter_func = _gm_getter_func
-        _hooks_mod._gm_getter_path = _gm_getter_path
+    if hasattr(_hooks_mod, "set_plugin_context"):
+        _hooks_mod.set_plugin_context(ctx)
+    _tools_mod.register_tools(ctx)
+    if hasattr(_hooks_mod, "register_hooks"):
+        _hooks_mod.register_hooks(ctx)
+    _register_runtime_features(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,3 +651,4 @@ def _get_indexed_skill_store():
 # Route package-level late-binding consumers to the indexed persistence layer.
 _get_mem_store = _get_indexed_mem_store
 _get_skill_store = _get_indexed_skill_store
+

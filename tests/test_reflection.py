@@ -24,11 +24,11 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-# Ensure core is importable (no relative imports)
+# Ensure store is importable (no relative imports)
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-import core as _core_mod
+import store as _store_mod
 
 # Set up minimal package namespace for reflection.engine's relative imports
 _PKG = "mem_reflection_hermes_reflection_test"
@@ -46,14 +46,12 @@ def _load_reflection_engine() -> tuple[object | None, Exception | None, Exceptio
     touched_modules = [
         _PKG,
         f"{_PKG}.core",
+        f"{_PKG}.store",
         f"{_PKG}.search",
-        f"{_PKG}.search.embed",
-        "search.embed",
         f"{_PKG}.reflection",
         f"{_PKG}.reflection.engine",
     ]
     previous_modules = {name: sys.modules.get(name) for name in touched_modules}
-    embed_load_error = None
     engine_load_error = None
     engine = None
 
@@ -61,24 +59,8 @@ def _load_reflection_engine() -> tuple[object | None, Exception | None, Exceptio
         pkg = types.ModuleType(_PKG)
         pkg.__path__ = [str(_REPO)]
         sys.modules[_PKG] = pkg
-        sys.modules[f"{_PKG}.core"] = _core_mod
-
-        embed_path = _REPO / "search" / "embed.py"
-        if embed_path.exists():
-            search_pkg = types.ModuleType(f"{_PKG}.search")
-            search_pkg.__path__ = [str(_REPO / "search")]
-            sys.modules[f"{_PKG}.search"] = search_pkg
-            spec = importlib.util.spec_from_file_location(
-                f"{_PKG}.search.embed", str(embed_path))
-            if spec and spec.loader:
-                embed_module = importlib.util.module_from_spec(spec)
-                embed_module.__package__ = f"{_PKG}.search"
-                sys.modules[f"{_PKG}.search.embed"] = embed_module
-                sys.modules["search.embed"] = embed_module
-                try:
-                    spec.loader.exec_module(embed_module)
-                except Exception as exc:
-                    embed_load_error = exc
+        sys.modules[f"{_PKG}.core"] = _store_mod
+        sys.modules[f"{_PKG}.store"] = _store_mod
 
         engine_path = _REPO / "reflection" / "engine.py"
         if engine_path.exists():
@@ -98,7 +80,7 @@ def _load_reflection_engine() -> tuple[object | None, Exception | None, Exceptio
                     engine = None
                     engine_load_error = exc
 
-        return engine, embed_load_error, engine_load_error
+        return engine, None, engine_load_error
     finally:
         _restore_modules(previous_modules)
 
@@ -107,13 +89,10 @@ def _load_module_from_repo(module_name: str, relative_path: str) -> object:
     touched_modules = [
         _PKG,
         f"{_PKG}.core",
+        f"{_PKG}.store",
         f"{_PKG}.search",
-        f"{_PKG}.search.embed",
-        "search.embed",
         f"{_PKG}.reflection",
         f"{_PKG}.reflection.engine",
-        f"{_PKG}.hooks",
-        f"{_PKG}.hooks.lifecycle",
     ]
     previous_modules = {name: sys.modules.get(name) for name in touched_modules}
 
@@ -121,19 +100,8 @@ def _load_module_from_repo(module_name: str, relative_path: str) -> object:
         pkg = types.ModuleType(_PKG)
         pkg.__path__ = [str(_REPO)]
         sys.modules[_PKG] = pkg
-        sys.modules[f"{_PKG}.core"] = _core_mod
-
-        search_pkg = types.ModuleType(f"{_PKG}.search")
-        search_pkg.__path__ = [str(_REPO / "search")]
-        sys.modules[f"{_PKG}.search"] = search_pkg
-        embed_spec = importlib.util.spec_from_file_location(
-            f"{_PKG}.search.embed", str(_REPO / "search" / "embed.py"))
-        if embed_spec and embed_spec.loader:
-            embed_module = importlib.util.module_from_spec(embed_spec)
-            embed_module.__package__ = f"{_PKG}.search"
-            sys.modules[f"{_PKG}.search.embed"] = embed_module
-            sys.modules["search.embed"] = embed_module
-            embed_spec.loader.exec_module(embed_module)
+        sys.modules[f"{_PKG}.core"] = _store_mod
+        sys.modules[f"{_PKG}.store"] = _store_mod
 
         reflection_pkg = types.ModuleType(f"{_PKG}.reflection")
         reflection_pkg.__path__ = [str(_REPO / "reflection")]
@@ -146,9 +114,6 @@ def _load_module_from_repo(module_name: str, relative_path: str) -> object:
             sys.modules[f"{_PKG}.reflection.engine"] = reflection_module
             reflection_spec.loader.exec_module(reflection_module)
 
-        hooks_pkg = types.ModuleType(f"{_PKG}.hooks")
-        hooks_pkg.__path__ = [str(_REPO / "hooks")]
-        sys.modules[f"{_PKG}.hooks"] = hooks_pkg
         module_spec = importlib.util.spec_from_file_location(
             module_name, str(_REPO / relative_path))
         if not module_spec or not module_spec.loader:
@@ -166,8 +131,6 @@ def _load_module_from_repo(module_name: str, relative_path: str) -> object:
 _engine, _embed_load_error, _engine_load_error = _load_reflection_engine()
 _lifecycle_mod = _load_module_from_repo(f"{_PKG}.hooks.lifecycle", "hooks/lifecycle.py")
 
-if _embed_load_error is not None:
-    raise RuntimeError("Could not load search.embed for reflection tests") from _embed_load_error
 if _engine_load_error is not None:
     raise RuntimeError("Could not load reflection.engine for reflection tests") from _engine_load_error
 if _engine is None:
@@ -510,8 +473,8 @@ class TestReflectionSupersedesRegression:
             "source": "explicit_intent",
         }])
         monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
-        monkeypatch.setattr(_engine, "_find_conflicting_memory", lambda *_args, **_kwargs: (_core_mod.LoadedMemory(
-            frontmatter=_core_mod.MemoryFrontmatter(
+        monkeypatch.setattr(_engine, "_find_conflicting_memory", lambda *_args, **_kwargs: (_store_mod.LoadedMemory(
+            frontmatter=_store_mod.MemoryFrontmatter(
                 id="mem-old",
                 created="2026-06-02T00:00:00+00:00",
                 source="reflection",

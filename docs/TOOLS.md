@@ -1,10 +1,10 @@
 # Tools Reference
 
-Current SRH tool surface: 17 registered tools (v1.0-beta).
+Current SRH tool surface: 17 registered tools (v1.0-beta3).
 
 Graph-related capabilities are exposed both as SRH tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`) and through the dashboard API.
 
-> **Graph semantics note**: The ahe_graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not "these entities have a typed factual relationship".
+> **Graph semantics note**: The runtime graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not "these entities have a typed factual relationship".
 
 ## Memory Operations
 
@@ -90,7 +90,7 @@ srh_graph_stats()
 srh_graph_viz(tier="summary")
 ```
 
-## Health Metrics (v0.9.2-beta2, hardened v1.0-beta)
+## Health Metrics (introduced in v0.9.2-beta2, hardened through v1.0-beta3)
 
 ```python
 # Get memory health metrics and recommendations
@@ -134,4 +134,4 @@ Returns:
 - `srh_graph_viz`
 
 ### Health & Governance (1)
-- `srh_memory_health` (v0.9.2-beta2, hardened v1.0-beta)
+- `srh_memory_health` (introduced in v0.9.2-beta2, hardened through v1.0-beta3)

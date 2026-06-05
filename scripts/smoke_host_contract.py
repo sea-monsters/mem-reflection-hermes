@@ -13,7 +13,7 @@ repo_root = str(Path(__file__).resolve().parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-# Set up temp home before importing plugin modules; several legacy modules bind
+# Set up temp home before importing plugin modules; runtime modules bind
 # log/config paths at import time.
 TMPDIR = Path(tempfile.mkdtemp(prefix="hermes_contract_"))
 (TMPDIR / "memory" / "memories").mkdir(parents=True, exist_ok=True)
@@ -35,12 +35,12 @@ if "mem_reflection_hermes" not in sys.modules:
 from store import (
     MemoryFrontmatter, LoadedMemory,
 )
-from mem_reflection_hermes.core import (
+from store import (
     parse_frontmatter, serialize_frontmatter,
     read_memory, _lineage_latest, _lineage_root, _lineage_depth,
     _lineage_cycle_check, _classify_update_intent, _is_expired,
 )
-from mem_reflection_hermes.reflection.engine import (
+from mem_reflection_hermes.reflect import (
     _build_audit_entry, _append_reflect_log, _recent_reflect_outcomes,
 )
 from store import MemoryStore
@@ -331,30 +331,47 @@ def test_register_contract():
         def register_command(self, **kw):
             self.slash.append(kw.get("name"))
 
+    def _read_manifest_list(key: str) -> set[str]:
+        values: list[str] = []
+        in_section = False
+        for line in (Path(repo_root) / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"{key}:"):
+                in_section = True
+                continue
+            if in_section:
+                if line and not line.startswith(" "):
+                    break
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    values.append(stripped[2:].strip())
+        return set(values)
+
     # Simulate minimal plugin bootstrap
     fake = FakeCtx()
     try:
-        from mem_reflection_hermes.tools.handlers import register as _handlers_register
-        _handlers_register(fake)
+        from mem_reflection_hermes.runtime_tools import register_tools as _register_tools
+        _register_tools(fake)
     except Exception as e:
-        fail("handlers.register", str(e))
+        fail("runtime_tools.register_tools", str(e))
         return
 
-    # 12 tools from handlers
+    # 12 base tools from runtime_tools
     if len(fake.tools) == 12:
-        ok("handlers.register: 12 tools")
+        ok("runtime_tools.register_tools: 12 tools")
     else:
-        fail("handlers.register: 12 tools", f"got {len(fake.tools)}")
+        fail("runtime_tools.register_tools: 12 tools", f"got {len(fake.tools)}")
 
-    # 4 unique hooks from handlers
+    # 4 unique hooks from runtime_hooks.register_hooks()
+    from mem_reflection_hermes.runtime_hooks import register_hooks as _rh_register_hooks
+    _rh_register_hooks(fake)
     if set(fake.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
-        ok("handlers.register: 4 unique hooks")
+        ok("runtime_hooks.register_hooks: 4 unique hooks")
     else:
-        fail("handlers.register: 4 unique hooks", f"hooks={fake.hooks}")
+        fail("runtime_hooks.register_hooks: 4 unique hooks", f"hooks={fake.hooks}")
 
     # Verify pre_llm_call exists and accepts **kwargs
     try:
-        from mem_reflection_hermes.hooks.lifecycle import _pre_llm_call
+        from mem_reflection_hermes.runtime_hooks import pre_llm_call as _pre_llm_call
         import inspect
         sig = inspect.signature(_pre_llm_call)
         params = list(sig.parameters.keys())
@@ -365,7 +382,7 @@ def test_register_contract():
     except Exception as e:
         fail("pre_llm_call import", str(e))
 
-    # Verify post_tool_call hook is registered (it lives in __init__.py, not hooks.py)
+    # Verify post_tool_call hook is registered on the full package surface.
     try:
         from mem_reflection_hermes import register
         fake2 = FakeCtx()
@@ -374,17 +391,50 @@ def test_register_contract():
             ok("post_tool_call hook registered")
         else:
             fail("post_tool_call hook registered", f"hooks={fake2.hooks}")
-        # Full plugin: 17 tools (12 from handlers + 4 graph tools + 1 health)
+        # Full plugin: 17 tools (12 base tools + 4 graph tools + 1 health)
         if len(fake2.tools) == 17:
             ok("register(ctx): 17 tools total")
         else:
             fail("register(ctx): 17 tools total", f"got {len(fake2.tools)}")
+        manifest_tools = _read_manifest_list("provides_tools")
+        if set(fake2.tools) == manifest_tools:
+            ok("plugin.yaml provides_tools matches register(ctx)")
+        else:
+            fail(
+                "plugin.yaml provides_tools matches register(ctx)",
+                f"missing={sorted(manifest_tools - set(fake2.tools))}, extra={sorted(set(fake2.tools) - manifest_tools)}",
+            )
         # Full plugin: 4 unique hook names. The graph integration may add a
         # second post_tool_call handler, but it is still the same hook surface.
         if set(fake2.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
             ok("register(ctx): 4 unique hooks")
         else:
             fail("register(ctx): 4 unique hooks", f"hooks={fake2.hooks}")
+        manifest_hooks = _read_manifest_list("provides_hooks")
+        if set(fake2.hooks) == manifest_hooks:
+            ok("plugin.yaml provides_hooks matches register(ctx)")
+        else:
+            fail(
+                "plugin.yaml provides_hooks matches register(ctx)",
+                f"missing={sorted(manifest_hooks - set(fake2.hooks))}, extra={sorted(set(fake2.hooks) - manifest_hooks)}",
+            )
+        expected_slash = {
+            "reflect",
+            "pending-skills",
+            "approve-skill",
+            "reject-skill",
+            "memories",
+            "skills",
+            "compile-profile",
+            "graph",
+        }
+        if set(fake2.slash) == expected_slash:
+            ok("register(ctx): 8 slash commands")
+        else:
+            fail(
+                "register(ctx): 8 slash commands",
+                f"missing={sorted(expected_slash - set(fake2.slash))}, extra={sorted(set(fake2.slash) - expected_slash)}",
+            )
     except Exception as e:
         fail("register(ctx) full", str(e))
 

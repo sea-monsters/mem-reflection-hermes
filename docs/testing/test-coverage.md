@@ -1,6 +1,6 @@
 # Test Coverage Documentation
 
-> Version: v1.0-beta2  
+> Version: v1.0-beta3  
 > Last updated: 2026-06-04  
 > Total tests: **215**  
 > All tests pass on Python 3.14 / Windows 11
@@ -19,13 +19,13 @@
 | dashboard/plugin_api.py | test_dashboard.py | 14 | CRUD, graph, stats, skills, reflections, zones |
 | E2E (all modules) | test_e2e.py | 6 | full lifecycle, update propagation, conflict, priority |
 | host contract smoke | test_host_contract_smoke.py | 1 | host contract, 17 tools, 4 hook names, smoke script |
-| core.py (legacy) | test_core_data.py | 10 | frontmatter roundtrip, effectiveness, lineage, safe write |
-| graph/ (legacy) | test_graph_operations.py | 11 | edge CRUD, supersedes, spreading activation, PageRank |
-| search/ (legacy) | test_bm25.py | 7 | tokenisation, BM25 scoring, CJK handling |
+| store compat contracts | test_core_data.py | 10 | frontmatter roundtrip, effectiveness, lineage, safe write |
+| runtime graph compat contracts | test_graph_operations.py | 11 | edge CRUD, supersedes, spreading activation, PageRank |
+| search compat contracts | test_bm25.py | 7 | tokenisation, BM25 scoring, CJK handling |
 | retrieval | test_fusion_rerank.py | 17 | recency, effectiveness, Hebbian additive boost, zone filter |
-| query/cache.py | test_query_cache.py | 12 | query templates, TTL cache, invalidation |
-| reflection/ (legacy) | test_reflection.py | 8 | JSON parsing, repair, audit, cadence, supersedes |
-| tools/handlers.py | test_tool_handlers.py | 8 | lineage cycle check, write/read cycle |
+| search query/cache surface | test_query_cache.py | 12 | query templates, TTL cache, invalidation |
+| runtime reflection compat contracts | test_reflection.py | 8 | JSON parsing, repair, audit, cadence, supersedes |
+| runtime tools compat contracts | test_tool_handlers.py | 8 | lineage cycle check, write/read cycle |
 | wave3 retrieval | test_wave3_retrieval.py | 10 | spreading activation, hub detection, BM25 CJK, fusion |
 
 ---

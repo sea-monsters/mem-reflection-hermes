@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.0-beta3 — Beta3 Cleanup + Runtime Contract Review
+
+Beta3 retires the remaining pre-beta2 implementation files while preserving the beta2 runtime feature surface: 17 tools, 4 hooks, 8 slash commands, dashboard routes, runtime graph, search, store, and reflection flows.
+
+### Cleanup
+- Removed retired pre-beta2 implementations: `core.py`, `late_binding.py`, `search/embed.py`, `query/cache.py`, `ahe_graph/`, `graph/ahe_graph.py`, `graph/cluqi.py`, `graph/pagerank.py`, and `graph/cross_zone.py`.
+- Promoted canonical runtime modules: `runtime_tools.py`, `runtime_hooks.py`, `runtime_graph.py`, and `runtime_reflection.py`.
+- Reduced package-root wildcard exports and routed host registration through explicit runtime modules.
+- Kept only four deprecated explicit old-path compatibility entrypoints: `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, and `reflection/engine.py`.
+
+### Review Fixes
+- Restored `MemoryStore` derived-view invalidation for palace index and search cache after `put`, `update`, `delete`, and `reorder`.
+- Hardened `GraphIndex._get_conn()` so a closed thread-local SQLite connection is detected and recreated.
+- Fixed dashboard graph cleanup to avoid closing the shared runtime graph connection after memory deletion.
+- Moved `SearchIndex.search(zone=...)` filtering into the candidate pool before retrieval/rerank so zone-scoped searches are not starved by global top-k results.
+
+### Validation
+- `scripts/smoke_host_contract.py`: 37 passed, 0 failed.
+- `scripts/check_v092.py`: 7 passed, 0 failed.
+- `scripts/check_issues.py`: 0 issues.
+- `python -m pytest tests -q`: 215 passed, 1 warning.
+
 ## v1.0-beta — R1 Code Review Fixes + Thread Safety + Robustness
 
 First release candidate. 63 review findings addressed (1 CRITICAL, 30 HIGH, 16 MEDIUM, 9 LOW).

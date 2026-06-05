@@ -15,7 +15,7 @@
 │  post_tool_call hook                                  │
 │    ├── Record tool effectiveness                      │
 │    ├── Update memory stats                            │
-│    └── Build ahe_graph associations                   │
+│    └── Build runtime graph associations               │
 ├──────────────────────────────────────────────────────┤
 │  on_session_end hook                                  │
 │    ├── Full reflection pipeline                       │
@@ -32,46 +32,42 @@
 For a design-level judgment of the supersedes chain + graph memory model,
 see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 
-For the follow-up implementation plan targeting the identified design gaps,
+For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.0-beta)
+## Module Layout (v1.0-beta3)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
-| `core.py` | ~1,078 | MemoryStore, SkillStore, LoadedMemory, LoadedSkill, config, paths, frontmatter fallback parser, BM25 search | — |
-| `search/embed.py` | ~504 | ONNX embedding engine, cosine similarity, intent classification, LRU embed cache | core |
-| `reflection/engine.py` | ~1,692 | Micro/full/embedding/raw-chunk reflection, auto-rebalance, profile compilation, audit logging, session exclusion | core, embed |
-| `hooks/lifecycle.py` | ~423 | Session hooks (start/end/pre_llm_call/post_tool_call), slash commands, graph manager, micro-reflection cadence | core, embed, reflection |
-| `tools/handlers.py` | ~966 | 12 core SRH tool handlers exposed to Hermes Agent | core, embed, reflection, hooks |
-| `graph/ahe_graph.py` | ~1,024 | SQLite-backed Hebbian graph memory, Ebbinghaus decay, spread activation, association engine | core |
-| `graph/cluqi.py` | ~296 | Cross-layer unified query orchestration (Memory + Graph + Supersedes) | core, ahe_graph |
-| `query/cache.py` | ~213 | Query templates and TTL-based result cache with LRU eviction | core |
-| `graph/cross_zone.py` | ~133 | Cross-zone graph analysis (bridges, centrality, recommendations) | core, ahe_graph |
-| `graph/pagerank.py` | ~116 | PageRank centrality for graph nodes | ahe_graph |
-| `dashboard/plugin_api.py` | ~646 | FastAPI dashboard (14 endpoints) | core, ahe_graph, cluqi, query_cache, cross_zone, pagerank |
-| `late_binding.py` | ~38 | Shared late-binding symbol resolution with thread-safe cache | — |
-| `__init__.py` | ~1,870 | Registration, 5 graph/health tools, exports, backward compat, standalone bootstrap | all above |
+| `store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers | — |
+| `search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers | store |
+| `graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
+| `reflect.py` / `runtime_reflection.py` | canonical | ReflectionEngine, micro/full/raw-chunk reflection, audit logging, skill approval helpers | store, search |
+| `runtime_hooks.py` | canonical | Session hooks and slash command registration | store, reflect, search |
+| `runtime_tools.py` | canonical | 12 base SRH tool handlers and hook registration | store, search, reflect, runtime_hooks |
+| `runtime_graph.py` | canonical | Graph compatibility surface plus 5 graph/health tool registrations | graph, store |
+| `dashboard/plugin_api.py` | canonical | FastAPI dashboard routes backed by store/search/runtime graph APIs | package runtime services |
+| `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, `reflection/engine.py` | deprecated compat | Explicit old import paths forwarding to runtime modules | runtime_* |
+| `__init__.py` | canonical entry | Plugin registration, runtime singletons, package bootstrap | store, search, graph, reflect, runtime_* |
 
-**Tool split**: 12 core tools live in `tools/handlers.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered in `__init__.py` because they require graph-manager initialization at plugin load time.
+**Tool split**: 12 base tools live in `runtime_tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime_graph.py` through the package `register(ctx)` path.
 
 ### Import Order Rules
 
 When adding new functionality, respect the module boundaries:
 
-1. **core.py**: Data models, store logic, config — no Hermes dependencies
-2. **search/embed.py**: Embedding engine — imports from core only
-3. **reflection/engine.py**: Reflection pipelines — imports from core + embed
-4. **hooks/lifecycle.py**: Session hooks — imports from core + embed + reflection
-5. **tools/handlers.py**: Tool handlers — imports from all above modules
-6. **__init__.py**: Registration, graph tools, and exports — imports from all modules
+1. **store.py**: Data models, store logic, config — no Hermes dependencies
+2. **search.py**: Search and embedding helpers — imports from store only
+3. **graph.py**: GraphIndex — imports store only where cross-zone analysis needs memory metadata
+4. **reflect.py / runtime_reflection.py**: Reflection pipelines — import store + search
+5. **runtime_hooks.py / runtime_tools.py / runtime_graph.py**: Host-facing runtime features — depend on canonical services
+6. **__init__.py**: Registration and runtime singletons — imports canonical modules explicitly
 
-Avoid circular dependencies. Use function-level late-binding if cross-module
-references are needed at import time.
+Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety (v1.0-beta)
+### Thread Safety (v1.0-beta3)
 
-Key concurrency protections added in v1.0-beta:
+Key concurrency protections present in v1.0-beta3:
 
 | Resource | Protection |
 |----------|-----------|
@@ -83,11 +79,11 @@ Key concurrency protections added in v1.0-beta:
 | `_classify_intent_stats` | `threading.Lock` via `_bump_classify_intent_stat` |
 | `_build_adjacency` | mtime check + DB query + cache update inside `self._lock` |
 | `get_cache()` singleton | Double-checked locking |
-| Late-binding cache | `threading.Lock` in `late_binding.py` |
+| Runtime late binding | Package-level explicit runtime delegates; legacy `late_binding.py` is retired |
 
 ## Slash Commands
 
-Registered in `hooks/lifecycle.py` via `_register_slash_commands`:
+Registered in `runtime_hooks.py` via `register_commands(ctx)`:
 
 | Command | Purpose |
 |---------|---------|

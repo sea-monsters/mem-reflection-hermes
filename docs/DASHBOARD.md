@@ -14,10 +14,16 @@ The dashboard provides a full-featured UI for managing memories directly:
 
 The dashboard communicates with MemoryStore through **atomic store methods** (`update()` and `reorder()`) that handle file I/O, cache invalidation, and index rebuilds in a single operation — preventing the cache inconsistency bugs common in earlier approaches.
 
+## Security Model
+
+Plugin routes are protected by the host's global auth middleware (`hermes_cli/web_server.py`).
+All `/api/plugins/mem-reflection-hermes/*` endpoints require the same session token as the core dashboard.
+Plugins do **not** implement their own auth layer — the host guarantees auth for all `/api/plugins/*` routes.
+
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 14 routes (v1.0-beta).
+Current surface: 14 routes (v1.0-beta3).
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -30,7 +36,7 @@ Current surface: 14 routes (v1.0-beta).
 | `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes |
 | `GET` | `/graph/neighbors/{id}` | Graph neighbors for a memory with metadata enrichment |
 | `GET` | `/graph/zones` | Cross-zone bridge analysis (includes `zone_degree`) |
-| `GET` | `/query` | CLUQI cross-layer unified search |
+| `GET` | `/query` | Runtime memory/search/graph query API |
 | `GET` | `/skills` | All skills with metadata |
 | `GET` | `/reflections` | Recent reflection outcomes (optional `mode` filter) |
 | `GET` | `/reflections/audit` | Flattened reflection audit entries (optional `decision` filter) |
