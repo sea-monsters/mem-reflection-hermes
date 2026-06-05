@@ -91,6 +91,10 @@ def _relevant_memory_cap() -> int:
 def _triggered_skill_cap() -> int:
     return int(plugin_config().get("triggered_skill_cap", 3))
 
+def _config_compaction() -> bool:
+    """Check if episode compaction is enabled in plugin config (default: True)."""
+    return bool(plugin_config().get("compaction", {}).get("enabled", True))
+
 logger = logging.getLogger(__name__)
 
 # Register module in sys.modules early to avoid dataclass resolution failure
@@ -567,6 +571,22 @@ def register(ctx) -> None:
     if hasattr(_hooks_mod, "register_hooks"):
         _hooks_mod.register_hooks(ctx)
     _register_runtime_features(ctx)
+
+
+def register_memory_provider():
+    """Declare a MemoryProvider for the Hermes memory plugin system.
+
+    This function is discovered by ``plugins.memory._is_memory_provider_dir``
+    which scans for ``register_memory_provider`` in the plugin's ``__init__.py``.
+    When ``memory.provider`` is set to ``mem-reflection-hermes`` in config.yaml,
+    the MemoryManager will load this provider and call ``on_memory_write``
+    on every built-in memory write.
+
+    The provider registers zero tools — all 17 SRH tools are provided by
+    the standalone ``register()`` path.
+    """
+    from .memory_bridge import MemoryBridgeProvider
+    return MemoryBridgeProvider()
 
 
 # ---------------------------------------------------------------------------
