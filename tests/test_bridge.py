@@ -126,6 +126,9 @@ class TestMirrorBuiltinToPlugin:
             action="add", target="memory", content=body,
             entries_after=[body], mem_store=temp_store,
         )
+        # Confirm it's there
+        hits_before = temp_store.search("Temporary note", k=10)
+        assert any(body in r.body for r in hits_before)
 
         result = mirror_builtin_to_plugin(
             action="remove", target="memory",
@@ -134,10 +137,14 @@ class TestMirrorBuiltinToPlugin:
             mem_store=temp_store,
         )
 
-        # Should have recorded the operation (may or may not mirror based on search)
-        # At minimum, no crash and valid result
-        assert isinstance(result, dict)
-        assert "mirrored" in result
+        # Should have created a tombstone
+        assert result["mirrored"] == 1, f"Expected tombstone, got {result}"
+        assert result["skipped"] == 0, f"Expected no skip, got {result}"
+        # Verify the tombstone is in the store
+        hits_after = temp_store.search("Temporary note", k=10, include_history=True)
+        tombstone = next((r for r in hits_after if r.body.startswith("[removed:")), None)
+        assert tombstone is not None, "No tombstone entry found"
+        assert "Temporary note" in tombstone.body
 
     def test_mirror_empty_content_noop(self, temp_store):
         """Empty content should result in 0 mirrored entries."""
