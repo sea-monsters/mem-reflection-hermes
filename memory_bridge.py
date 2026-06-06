@@ -277,19 +277,23 @@ def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
     return False
 
 def _find_plugin_entry_by_substring(
-    substring: str, mem_store,
+    substring: str, mem_store, zone: str = "",
 ) -> Optional[Any]:
-    """Find a plugin entry whose body *contains* the substring."""
+    """Find a plugin entry whose body *contains* the substring.
+
+    If ``zone`` is provided, restrict matches to that zone only.
+    """
     if not hasattr(mem_store, "search"):
         return None
     try:
         results = mem_store.search(substring, k=10, include_history=False)
         for r in results:
             if substring in r.body:
-                return r
-        # Fallback: scan core zone directly
-        if hasattr(mem_store, "list_by_zone"):
-            for r in mem_store.list_by_zone("core"):
+                if not zone or r.frontmatter.zone == zone:
+                    return r
+        # Fallback: scan target zone directly
+        if zone and hasattr(mem_store, "list_by_zone"):
+            for r in mem_store.list_by_zone(zone):
                 if substring in r.body:
                     return r
     except Exception:
@@ -402,11 +406,11 @@ def _do_mirror_builtin_to_plugin(
                 result["skipped"] += 1
                 return result
 
-            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store)
+            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store, zone=plugin_zone)
             if existing is not None:
-                # Supersede the old entry
+                # Supersede the old entry (always write into target zone)
                 _write_to_plugin(
-                    mem_store, new_entry, existing.frontmatter.zone,
+                    mem_store, new_entry, plugin_zone,
                     supersedes=[existing.id()],
                 )
                 result["mirrored"] = 1
@@ -518,29 +522,37 @@ def _do_mirror_plugin_to_builtin(
         result["reason"] = f"body too long ({len(body)} > {DIR_B_MAX_CHARS})"
         return result
 
-    # ── Supersedes: remove old entries from MEMORY.md ────────────────
+    # ── Atomic replace (remove old + append new in one lock) ────────
     if supersedes:
         old_bodies = _lookup_superseded_bodies(supersedes)
-        if old_bodies:
-            _remove_bodies_from_builtin("memory", old_bodies)
-
-    # ── Dedup ────────────────────────────────────────────────────────
-    if _is_duplicate_in_builtin(body, target="memory"):
-        _incr_stat("dir_b_skip_dup")
-        result["reason"] = "duplicate in MEMORY.md"
-        return result
-
-    # ── Write ────────────────────────────────────────────────────────
-    success = _append_to_builtin("memory", body)
-    if success:
-        _incr_stat("dir_b_mirror")
-        result["mirrored"] = True
-        result["target"] = "memory"
-        result["entry"] = body
+        # Atomically remove old entries and append the new body.
+        # If capacity would be exceeded, nothing is changed.
+        success = _replace_in_builtin("memory", old_bodies, body)
+        if not success:
+            # Check whether it failed because body was already present
+            if _is_duplicate_in_builtin(body, target="memory"):
+                _incr_stat("dir_b_skip_dup")
+                result["reason"] = "duplicate in MEMORY.md"
+            else:
+                _incr_stat("dir_b_skip_fallback")
+                result["reason"] = "replace failed (capacity or I/O)"
+            return result
     else:
-        _incr_stat("dir_b_skip_fallback")
-        result["reason"] = "append failed (capacity or I/O)"
+        # No old entries to remove — simple append
+        if _is_duplicate_in_builtin(body, target="memory"):
+            _incr_stat("dir_b_skip_dup")
+            result["reason"] = "duplicate in MEMORY.md"
+            return result
+        success = _append_to_builtin("memory", body)
+        if not success:
+            _incr_stat("dir_b_skip_fallback")
+            result["reason"] = "append failed (capacity or I/O)"
+            return result
 
+    _incr_stat("dir_b_mirror")
+    result["mirrored"] = True
+    result["target"] = "memory"
+    result["entry"] = body
     return result
 
 
@@ -565,27 +577,44 @@ def _lookup_superseded_bodies(supersedes: List[str]) -> List[str]:
     return bodies
 
 
-def _remove_bodies_from_builtin(target: str, bodies: List[str]) -> bool:
-    """Remove specific body texts from MEMORY.md/USER.md under lock.
+def _replace_in_builtin(target: str, remove_bodies: List[str], add_body: str) -> bool:
+    """Atomically remove entries and append a new entry under a single lock.
 
-    Rewrites the file excluding any entries whose exact (stripped) text
-    matches one of the given bodies. Returns True if at least one entry
-    was removed.
+    Pre-checks capacity after removals; if the append would exceed the
+    limit, nothing is modified and False is returned.  This prevents
+    the data-loss window where removals succeed but the append fails.
     """
-    if not bodies:
+    if not add_body:
         return False
     path = _builtin_path_for(target)
     if not path.exists():
-        return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    limits = {"memory": 2200, "user": 1375, "Memory": 2200, "User": 1375}
+    char_limit = limits.get(target, 2200)
 
     fd = _acquire_file_lock(path)
+    if fd is None:
+        return False
     try:
         entries = _read_builtin_entries(target)
         if not entries:
+            entries = []
+
+        # Remove old entries
+        filtered = [e for e in entries if e.strip() not in remove_bodies]
+
+        # Capacity check before committing
+        test_entries = filtered + [add_body]
+        new_total = len(ENTRY_DELIMITER.join(test_entries))
+        if new_total > char_limit:
+            logger.debug(
+                "Dir B replace skip (capacity): %s at ~%d/%d chars",
+                target, new_total, char_limit,
+            )
             return False
-        filtered = [e for e in entries if e.strip() not in bodies]
-        if len(filtered) == len(entries):
-            return False  # nothing removed
+
+        filtered.append(add_body)
         content = ENTRY_DELIMITER.join(filtered)
         path.write_text(content, encoding="utf-8")
         return True
