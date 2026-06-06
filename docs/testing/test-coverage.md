@@ -1,6 +1,6 @@
 # Test Coverage Documentation
 
-> Version: v1.1-beta  
+> Version: current  
 > Last updated: 2026-06-06  
 > Total tests: **227 passed, 14 errors** (14 Windows temp dir permission errors, non-code)  
 > Python 3.14 / Windows 11

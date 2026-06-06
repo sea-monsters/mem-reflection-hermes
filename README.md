@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.1-beta** — v0.16.0 telemetry hooks, episode compaction, dead code cleanup, and Hermes Agent interface compatibility fixes.
+**Current version** — see `plugin.yaml` for the canonical version. This release includes v0.16.0 telemetry hooks, episode compaction, dead code cleanup, and Hermes Agent interface compatibility fixes.
 
 ## Features
 
@@ -35,7 +35,7 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | Document | Description |
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v1.1-beta |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
 | [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |

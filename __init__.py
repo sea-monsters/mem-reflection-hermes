@@ -1,6 +1,6 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.0-beta2 Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
+Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
 - store.py: SQLite-backed MemoryStore, Markdown cold storage, token estimation, CJK tokenizer
 - search.py: Three-layer retrieval (Recall → RRF/Weighted Fusion → Rerank), embedding engine
 - graph.py: GraphIndex -- Hebbian edges, spreading activation, PageRank, cross-zone analysis
