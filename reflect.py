@@ -154,12 +154,18 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
 
     # Deduplicate + filter noise
     deduped = []
-    seen = []
+    seen_texts: list[str] = []
+    seen_tokens: list[set[str]] = []
     for f in facts:
         if _is_noise_text(f["text"]):
             continue
-        if all(len(set(_tokenise(f["text"])) & set(_tokenise(s))) / max(len(_tokenise(f["text"])), len(_tokenise(s)), 1) < 0.8 for s in seen):
-            seen.append(f["text"])
+        ft = _tokenise(f["text"])
+        if all(
+            len(set(ft) & st) / max(len(ft), len(st), 1) < 0.8
+            for st in seen_tokens
+        ):
+            seen_texts.append(f["text"])
+            seen_tokens.append(set(ft))
             deduped.append(f)
     return deduped
 

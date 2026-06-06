@@ -327,22 +327,14 @@ async def delete_memory(mem_id: str):
         ok = _get_store().delete("project", mem_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
-    # Clean up graph edges (beta3: wrap in transaction, fix context-manager misuse)
+    # Clean up graph edges (use GraphIndex public method to respect its RLock)
     gm = _get_graph_interface()
     if gm:
-        conn = None
         try:
-            conn = gm.store._connect()
-            conn.execute("BEGIN")
-            conn.execute("DELETE FROM edges WHERE source_id=? OR target_id=?", (mem_id, mem_id))
-            conn.execute("DELETE FROM graph_meta WHERE memory_id=?", (mem_id,))
-            conn.commit()
+            gi = getattr(gm, "_gi", None) or getattr(gm, "store", None)
+            if gi is not None:
+                gi.remove_memory(mem_id)
         except Exception as e:
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
             import logging
             logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
     return {"status": "deleted", "id": mem_id}

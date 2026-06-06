@@ -504,6 +504,20 @@ class GraphIndex:
             "bridges": bridge_memories[:20],
         }
 
+    def remove_memory(self, memory_id: str) -> None:
+        """Remove all edges and meta associated with *memory_id* (thread-safe)."""
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM edges WHERE source_id = ? OR target_id = ?",
+                (memory_id, memory_id),
+            )
+            conn.execute(
+                "DELETE FROM graph_meta WHERE memory_id = ?",
+                (memory_id,),
+            )
+            conn.commit()
+
     def close(self) -> None:
         """Checkpoint WAL and close connection."""
         if hasattr(self._local, "conn") and self._local.conn is not None:
