@@ -361,13 +361,18 @@ def test_register_contract():
     else:
         fail("runtime_tools.register_tools: 12 tools", f"got {len(fake.tools)}")
 
-    # 4 unique hooks from runtime_hooks.register_hooks()
+    # 8 unique hooks from runtime_hooks.register_hooks() (v0.16.0 enhanced)
     from mem_reflection_hermes.runtime_hooks import register_hooks as _rh_register_hooks
     _rh_register_hooks(fake)
-    if set(fake.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
-        ok("runtime_hooks.register_hooks: 4 unique hooks")
+    _expected_hooks_v016 = {
+        "on_session_start", "on_session_end", "on_session_reset",
+        "pre_llm_call", "post_tool_call",
+        "api_request_error", "subagent_start", "subagent_stop",
+    }
+    if set(fake.hooks) == _expected_hooks_v016:
+        ok("runtime_hooks.register_hooks: 8 unique hooks (v0.16.0)")
     else:
-        fail("runtime_hooks.register_hooks: 4 unique hooks", f"hooks={fake.hooks}")
+        fail("runtime_hooks.register_hooks: 8 unique hooks", f"hooks={fake.hooks}")
 
     # Verify pre_llm_call exists and accepts **kwargs
     try:
@@ -404,12 +409,11 @@ def test_register_contract():
                 "plugin.yaml provides_tools matches register(ctx)",
                 f"missing={sorted(manifest_tools - set(fake2.tools))}, extra={sorted(set(fake2.tools) - manifest_tools)}",
             )
-        # Full plugin: 4 unique hook names. The graph integration may add a
-        # second post_tool_call handler, but it is still the same hook surface.
-        if set(fake2.hooks) == {"on_session_start", "on_session_end", "pre_llm_call", "post_tool_call"}:
-            ok("register(ctx): 4 unique hooks")
+        # Full plugin: 8 unique hook names (v0.16.0 enhanced).
+        if set(fake2.hooks) == _expected_hooks_v016:
+            ok("register(ctx): 8 unique hooks (v0.16.0)")
         else:
-            fail("register(ctx): 4 unique hooks", f"hooks={fake2.hooks}")
+            fail("register(ctx): 8 unique hooks", f"hooks={fake2.hooks}")
         manifest_hooks = _read_manifest_list("provides_hooks")
         if set(fake2.hooks) == manifest_hooks:
             ok("plugin.yaml provides_hooks matches register(ctx)")

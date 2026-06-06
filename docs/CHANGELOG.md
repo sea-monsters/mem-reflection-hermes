@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.1 — Hermes Agent v0.16.0 Telemetry Hooks + Root-Cause Fixes
+
+### v0.16.0 Enhanced Hooks
+
+- **`subagent_start` hook**: New `_on_subagent_start` handler tracks concurrent
+  subagent count and records start timestamps for lifecycle tracking.
+- **Enhanced `_post_tool_call`**: Now consumes v0.16.0 kwargs:
+  - `status`: Skips graph enrichment on tool errors; bypasses Dir A bridge on
+    `memory` tool failures.
+  - `duration_ms`: Logs slow tool calls (>10s) with `turn_id` for diagnostics.
+  - `turn_id`/`session_id`/`tool_call_id`: Used in diagnostic logging for
+    per-turn traceability.
+- **Zero-cost gate**: All new hooks/hook kwargs are gated by `has_hook()` on
+  the host side — no overhead when no plugin subscribes.
+
+### Root-Cause Fixes
+
+- **P1-1 (context.py)**: Removed `_build_builtin_memory_block()` entirely.
+  Root cause: Dir A startup sync was missing, requiring context builder to
+  re-read MEMORY.md on every pre_llm_call. Fix: `sync_builtin_to_plugin()`
+  runs once at plugin registration, then Dir A handles incremental sync.
+- **P1-2 (runtime_tools.py)**: Removed Dir B delete-from-MEMORY.md logic.
+  Root cause: Dir B delete was using body-text matching against MEMORY.md,
+  risking false matches. Fix: Dir B is now purely APPEND-ONLY — MEMORY.md
+  is a frozen snapshot, not a plugin store mirror.
+
+### Housekeeping
+
+- Removed 210 lines of dead code: `dir_b_mapping.json` infrastructure,
+  unused imports, dashboard dead fallback, 3 retired test cases.
+- 254/254 tests pass.
+
 ## v1.0-beta3 — Beta3 Cleanup + Runtime Contract Review
 
 Beta3 retires the remaining pre-beta2 implementation files while preserving the beta2 runtime feature surface: 17 tools, 4 hooks, 8 slash commands, dashboard routes, runtime graph, search, store, and reflection flows.

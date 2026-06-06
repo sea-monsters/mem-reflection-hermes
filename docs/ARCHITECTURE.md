@@ -12,15 +12,29 @@
 │    ├── Inject triggered/always skills                 │
 │    └── Inject pinned memories                         │
 ├──────────────────────────────────────────────────────┤
-│  post_tool_call hook                                  │
-│    ├── Record tool effectiveness                      │
+│  post_tool_call hook (v0.16.0 enhanced)               │
+│    ├── Bridge Dir A: memory tool → plugin mirror      │
+│    ├── Record tool effectiveness (status/duration)    │
 │    ├── Update memory stats                            │
 │    └── Build runtime graph associations               │
 ├──────────────────────────────────────────────────────┤
+│  api_request_error hook (v0.16.0 telemetry)           │
+│    ├── Track API error count per session              │
+│    └── Log threshold crossings (1/5/10/25/50)         │
+├──────────────────────────────────────────────────────┤
+│  subagent_start/stop hook (v0.16.0 telemetry)         │
+│    ├── Track concurrent subagent count                │
+│    └── Record subagent lifecycle for reflection       │
+├──────────────────────────────────────────────────────┤
+│  on_session_reset hook (v0.16.0 lifecycle)            │
+│    ├── Log session rotation (old→new)                 │
+│    └── Clean up per-session state                     │
+├──────────────────────────────────────────────────────┤
 │  on_session_end hook                                  │
 │    ├── Full reflection pipeline                       │
+│    ├── Graph decay                                    │
 │    ├── Generate skill candidates                      │
-│    └── Write session summary                          │
+│    └── Write session summary + episode compaction     │
 ├──────────────────────────────────────────────────────┤
 │  Background Tasks                                     │
 │    ├── Micro-reflection queue (backpressure)          │
@@ -108,3 +122,55 @@ The `pre_llm_call` hook injects context in this priority order:
 
 Each layer respects the `max_context_token_preference` budget. Token estimation
 uses CJK-aware heuristics (3 bytes/token for CJK, 4 bytes/token for Latin).
+
+## v0.16.0 Enhanced Telemetry Hooks
+
+Starting with Hermes Agent v0.16.0 (Jun 5, 2026), the plugin system supports
+richer observer-style hooks. The mem-reflection-hermes plugin leverages
+all v0.16 hook points with zero-cost when no subscriber is active (`has_hook()` gate).
+
+### Hook Registration (`runtime_hooks.py`)
+
+| Hook Name | Handler | Purpose | v0.16+ kwargs Consumed |
+|-----------|---------|---------|----------------------|
+| `on_session_start` | `_on_session_start` | Reset turn counter, clear session exclusion set | — |
+| `on_session_end` | `_on_session_end` | Full reflection, graph decay, episode compaction, session cleanup | `session_id`, `reason` (v0.16: `"shutdown"` \| `"session_expired"` \| `"new_session"`) |
+| `on_session_reset` | `_on_session_reset` | Log session rotation, clean per-session state (v0.16) | `reason`, `old_session_id`, `new_session_id` |
+| `pre_llm_call` | `_pre_llm_call` | Inject layered memory context, trigger micro-reflection | `messages`, `user_message`, `session_id`, `ctx` |
+| `post_tool_call` | `_post_tool_call` | Bridge Dir A, record effectiveness, build graph associations | `tool_name`, `args`, `result`, **`status`**, **`duration_ms`**, **`session_id`**, **`turn_id`** (v0.16 enhanced) |
+| `api_request_error` | `_on_api_request_error` | Track API error count per session for reflection context (v0.16) | `session_id`, `error` |
+| `subagent_start` | `_on_subagent_start` | Track concurrent subagent count, record start time (v0.16) | `session_id` |
+| `subagent_stop` | `_on_subagent_stop` | Track total subagent count for reflection summary (v0.16) | `session_id` |
+
+### Enhanced `post_tool_call` Behavior
+
+In v0.16.0, ``_emit_post_tool_call_hook`` is called for **all** tool paths
+including agent-runtime tools (``memory``, ``todo``, ``session_search``,
+``clarify``, ``delegate_task``). The plugin uses the new kwargs:
+
+- **`status`**: If ``"error"``, skips graph enrichment (no point associating
+  memories from a failed tool call) and bypasses Dir A bridge for ``memory``
+  tool writes.
+- **`duration_ms`**: Slow calls (>10s) are logged with the ``turn_id`` tag
+  for diagnostics.
+- **`turn_id`**: Stable per-turn correlation ID (format:
+  ``{session_id}:{task_id}:{hex8}``) appended to diagnostic log messages.
+
+### Subagent Lifecycle Tracking
+
+The plugin tracks both ``subagent_start`` and ``subagent_stop`` events,
+maintaining a per-session state bag:
+
+```python
+_session_states[session_id] = {
+    "api_error_count": N,
+    "subagent_count": N,
+    "_subagent_active": N,     # concurrent subagents
+    "_subagent_start_time": t,  # latest start timestamp
+    "created_at": t,
+}
+```
+
+These stats are harvested in ``on_session_end`` and included in the reflection
+log for richer session summaries.
+
