@@ -252,6 +252,23 @@ def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     scope = args.get("scope", "user")
     if not mem_id:
         return _jd({"error": "id is required"})
+
+    # Dir B: remove from MEMORY.md if this memory was previously synced
+    try:
+        memory = mem_store.get(mem_id)
+        if memory is not None:
+            from .memory_bridge import bridge_enabled as _b_enabled
+            if _b_enabled():
+                from .memory_bridge import (
+                    DIR_B_SYNC_ZONES, DIR_B_MAX_CHARS,
+                    _remove_bodies_from_builtin,
+                )
+                body = memory.body.strip()
+                if memory.frontmatter.zone in DIR_B_SYNC_ZONES and len(body) <= DIR_B_MAX_CHARS:
+                    _remove_bodies_from_builtin("memory", [body])
+    except Exception:
+        logger.debug("Dir B MEMORY.md cleanup on delete failed", exc_info=True)
+
     ok = mem_store.delete(scope, mem_id)
     return _jd({"success": ok, "id": mem_id})
 

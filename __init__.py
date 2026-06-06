@@ -515,11 +515,9 @@ def _register_runtime_features(ctx):
         return
     except ImportError as e:
         logger.warning("runtime graph not available (skip integration): %s", e)
-        ctx.register_hook("post_tool_call", lambda **kwargs: None)
         return
     except Exception as e:
         logger.warning("runtime graph integration error: %s", e)
-        ctx.register_hook("post_tool_call", lambda **kwargs: None)
         return
 
 
