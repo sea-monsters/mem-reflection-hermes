@@ -149,8 +149,15 @@ def _build_builtin_memory_block() -> str:
 
     Respects the same §-delimited format as memory_tool.py.
     Only includes up to 10 entries per file to keep tokens low.
+    Each entry is scanned for prompt-injection threats before inclusion.
     """
     block_parts = []
+
+    # Lazy-import threat scanner (available when running inside Hermes Agent)
+    try:
+        from tools.threat_patterns import scan_for_threats as _threat_scan
+    except Exception:
+        _threat_scan = None
 
     for target in ("memory", "user"):
         entries = _read_builtin_entries(target)
@@ -159,6 +166,13 @@ def _build_builtin_memory_block() -> str:
         label = "Notes" if target == "memory" else "Profile"
         lines = [f"### Built-in Memory ({label})"]
         for e in entries[:10]:
+            # Threat scan before injection
+            if _threat_scan is not None:
+                hits = _threat_scan(e, scope="strict")
+                if hits:
+                    preview = f"[BLOCKED: {', '.join(hits)}]"
+                    lines.append(f"- {preview}")
+                    continue
             preview = e[:150]
             if len(e) > 150:
                 preview += "..."
