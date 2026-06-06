@@ -44,6 +44,10 @@ __all__ = [
     "_gm_singleton",
     "_on_session_end",
     "_on_session_start",
+    "_on_session_reset",
+    "_on_api_request_error",
+    "_on_subagent_start",
+    "_on_subagent_stop",
     "_pre_llm_call",
     "_slash_approve_skill",
     "_slash_compile_profile",
@@ -53,11 +57,35 @@ __all__ = [
     "_slash_reject_skill",
     "_slash_skills",
     "_turns_since_reflect",
+    "_ensure_session_state",
+    "_cleanup_session_state",
 ]
 
 _plugin_ctx: Any = None
 _session_messages: Dict[str, List[Dict[str, Any]]] = {}
 _session_messages_lock = threading.Lock()  # H20: protect concurrent session access
+
+# ── Session lifecycle tracking (v0.16.0 enhanced hooks) ─────────
+_SessionState = dict  # lightweight runtime state bag
+_session_states: Dict[str, _SessionState] = {}
+_session_states_lock = threading.Lock()
+
+def _ensure_session_state(session_id: str) -> _SessionState:
+    """Get or create a lightweight state bag for a session."""
+    with _session_states_lock:
+        if session_id not in _session_states:
+            _session_states[session_id] = {
+                "api_error_count": 0,
+                "rewind_count": 0,
+                "subagent_count": 0,
+                "created_at": time.time(),
+            }
+        return _session_states[session_id]
+
+def _cleanup_session_state(session_id: str) -> None:
+    """Remove session state after session ends."""
+    with _session_states_lock:
+        _session_states.pop(session_id, None)
 
 def _set_plugin_context(ctx: Any) -> None:
     """Remember the host plugin context for hooks that run without ctx kwargs."""
@@ -118,8 +146,20 @@ def _on_session_start(**kwargs) -> None:
 
 def _on_session_end(**kwargs) -> None:
     session_id = kwargs.get("session_id", "")
+    reason = kwargs.get("reason", "")  # v0.16.0: "shutdown" | "session_expired" | "new_session"
     with _session_messages_lock:
         messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
+
+    # Skip reflection on expired sessions (timeout, no substantive content)
+    if reason == "session_expired":
+        logger.debug("Session %s expired — skipping reflection", session_id)
+        _cleanup_session_state(session_id)
+        return
+
+    # Harvest API error stats for the reflection summary
+    stats = _session_states.get(session_id, {})
+    api_errors = stats.get("api_error_count", 0)
+    subagent_count = stats.get("subagent_count", 0)
 
     # ── Periodic graph decay ──────────────────────────────
     try:
@@ -140,7 +180,16 @@ def _on_session_end(**kwargs) -> None:
                 logger.warning("Full reflection failed: %s", e)
                 logger.warning("Full reflection traceback:", exc_info=True)
         else:
-            logger.info("mem-reflection-hermes: session ended with %d messages — full reflection queued (no ctx)", len(messages))
+            extras = []
+            if api_errors:
+                extras.append(f"{api_errors} API errors")
+            if subagent_count:
+                extras.append(f"{subagent_count} subagents")
+            extra_info = f" ({', '.join(extras)})" if extras else ""
+            logger.info(
+                "mem-reflection-hermes: session ended with %d messages%s — full reflection queued (no ctx)",
+                len(messages), extra_info,
+            )
     finally:
         # ── Episode compaction (v1.1) ──────────────────────
         # Run after reflection to compact raw episode entries into summaries.
@@ -160,6 +209,7 @@ def _on_session_end(**kwargs) -> None:
             logger.debug("Episode compaction skipped: %s", _ce)
 
         _reset_current_session_memory_ids()
+        _cleanup_session_state(session_id)
 
 
 def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
@@ -258,19 +308,32 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
 
 
 def _post_tool_call(**kwargs) -> None:
-    """Hook called after a tool invocation.
+    """Hook called after a tool invocation (v0.16.0 enhanced).
 
-    Two responsibilities:
-    1. Enrich graph with co-accessed memories (existing).
-    2. Bridge Dir A: mirror built-in ``memory`` tool writes to plugin store.
+    Three responsibilities:
+    1. Bridge Dir A: mirror built-in ``memory`` tool writes to plugin store.
+    2. Enrich graph with co-accessed memories (existing).
+    3. Track tool status/duration for effectiveness adjustments.
+
+    v0.16.0+ kwargs received:
+      tool_name, args, result,
+      session_id, task_id, tool_call_id, turn_id, api_request_id,
+      status, error_type, error_message, duration_ms
     """
     tool_name = kwargs.get("tool_name", "")
     result = kwargs.get("result", "")
     args = kwargs.get("args", {})
+    status = kwargs.get("status", "ok")
+    duration_ms = kwargs.get("duration_ms", 0)
+    session_id = kwargs.get("session_id", "")
+    turn_id = kwargs.get("turn_id", "")
+    tool_call_id = kwargs.get("tool_call_id", "")
+    _turn_tag = f" [{turn_id}]" if turn_id else ""
+
     mem_ids: List[str] = []
 
     # ── Dir A: Bridge built-in memory writes to plugin store ──────────────
-    if tool_name == "memory":
+    if tool_name == "memory" and status != "error":
         try:
             if isinstance(result, str):
                 result_obj = json.loads(result)
@@ -300,6 +363,14 @@ def _post_tool_call(**kwargs) -> None:
         except Exception:
             pass
 
+    # ── Effectiveness tracking (v0.16.0 enhanced) ─────────────────────────
+    # Log slow operations (>10s) for diagnostics
+    if duration_ms > 10_000:
+        logger.debug(
+            "Slow tool call%s: %s took %dms with status=%s",
+            _turn_tag, tool_name, duration_ms, status,
+        )
+
     # ── Graph enrichment (existing logic) ─────────────────────────────────
     if not any(t in tool_name for t in ("memory", "palace", "skill")):
         return
@@ -327,9 +398,73 @@ def _post_tool_call(**kwargs) -> None:
         try:
             gm = _get_graph_mgr()
             if gm:
-                gm.associator.on_co_occurrence(mem_ids, context=tool_name)
+                # v0.16.0: use status to gate graph enrichment —
+                # on error, skip association entirely (no point linking
+                # memories from a failed operation)
+                if status == "error":
+                    logger.debug(
+                        "Skipped graph enrichment%s: %s (status=%s)",
+                        _turn_tag, tool_name, status,
+                    )
+                else:
+                    gm.associator.on_co_occurrence(
+                        mem_ids, context=tool_name,
+                    )
         except Exception as e:
             logger.debug("Graph enrichment failed in post_tool_call: %s", e)
+
+
+def _on_api_request_error(**kwargs) -> None:
+    """Track API request failures for reflection triggers."""
+    session_id = kwargs.get("session_id", "")
+    if not session_id:
+        return
+    state = _ensure_session_state(session_id)
+    state["api_error_count"] = state.get("api_error_count", 0) + 1
+    error_type = kwargs.get("error", {}).get("type", "unknown")
+    # Log threshold crossing for debugging
+    n = state["api_error_count"]
+    if n in (1, 5, 10, 25, 50):
+        logger.info(
+            "mem-reflection: session %s hit %d API errors (latest: %s)",
+            session_id, n, error_type,
+        )
+
+
+def _on_subagent_start(**kwargs) -> None:
+    """Track subagent lifecycle start for session reflection context (v0.16.0 enhanced)."""
+    session_id = kwargs.get("session_id", "")
+    if not session_id:
+        return
+    state = _ensure_session_state(session_id)
+    state.setdefault("subagent_count", 0)
+    # Record start time for duration tracking on stop
+    state["_subagent_start_time"] = time.time()
+    state["_subagent_active"] = state.get("_subagent_active", 0) + 1
+    logger.debug(
+        "mem-reflection: subagent started in session %s (active=%d)",
+        session_id, state.get("_subagent_active", 0),
+    )
+
+
+def _on_subagent_stop(**kwargs) -> None:
+    """Track subagent lifecycle for session reflection context."""
+    session_id = kwargs.get("session_id", "")
+    if not session_id:
+        return
+    state = _ensure_session_state(session_id)
+    state["subagent_count"] = state.get("subagent_count", 0) + 1
+
+
+def _on_session_reset(**kwargs) -> None:
+    """Handle session rotation with enhanced v0.16.0 kwargs."""
+    reason = kwargs.get("reason", "unknown")
+    old_sid = kwargs.get("old_session_id", "")
+    new_sid = kwargs.get("new_session_id", "")
+    logger.debug(
+        "mem-reflection: session rotated %s -> %s (reason=%s)",
+        old_sid, new_sid, reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -534,15 +669,24 @@ on_session_start = _on_session_start
 on_session_end = _on_session_end
 pre_llm_call = _pre_llm_call
 post_tool_call = _post_tool_call
+on_api_request_error = _on_api_request_error
+on_subagent_start = _on_subagent_start
+on_subagent_stop = _on_subagent_stop
+on_session_reset = _on_session_reset
 
 
 def register_hooks(ctx) -> None:
-    """Register the public hook surface on the host context."""
+    """Register the public hook surface on the host context (v0.16.0 telemetry hooks)."""
     set_plugin_context(ctx)
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
+    # v0.16.0+ enhanced hooks — zero-cost via has_hook() when no listener
+    ctx.register_hook("api_request_error", on_api_request_error)
+    ctx.register_hook("subagent_start", on_subagent_start)
+    ctx.register_hook("subagent_stop", on_subagent_stop)
+    ctx.register_hook("on_session_reset", on_session_reset)
 
 
 register = register_hooks
@@ -551,6 +695,10 @@ register = register_hooks
 __all__ = list(__all__) + [
     "on_session_end",
     "on_session_start",
+    "on_session_reset",
+    "on_api_request_error",
+    "on_subagent_start",
+    "on_subagent_stop",
     "post_tool_call",
     "pre_llm_call",
     "register",
