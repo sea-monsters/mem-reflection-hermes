@@ -25,8 +25,8 @@ runtime_reflection.py # Canonical reflection runtime helpers
 dashboard/plugin_api.py # FastAPI dashboard (14 endpoints) (~646 lines)
 ```
 
-Full architecture documentation: `docs/research/beta2-architecture.md`
-Code review & fixes: `docs/research/beta2-code-review.md`
+Full architecture documentation: `docs/ARCHITECTURE.md`
+Code review & fixes: `docs/archive/` (versioned historical records)
 Test coverage docs: `docs/testing/test-coverage.md`
 
 **Retired pre-beta2 implementation files:**
@@ -90,9 +90,8 @@ python bench_latency.py
 
 ## Architecture
 
-> **Beta2 architecture docs**: `docs/research/beta2-architecture.md` (definitive)
-> **Original redesign**: `docs/research/1.0-beta2-redesign.md`
-> **Code review**: `docs/research/beta2-code-review.md`
+> **Architecture docs**: `docs/ARCHITECTURE.md` (definitive)
+> **Historical versions**: `docs/archive/` (versioned redesigns, reviews, and evaluation reports)
 > **Test coverage**: `docs/testing/test-coverage.md`
 
 ### Module Dependency DAG
