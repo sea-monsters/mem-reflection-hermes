@@ -97,12 +97,8 @@ class FakeSkills:
 # ---------------------------------------------------------------------------
 
 class TestBuildContextPriority:
-    def test_empty_store_returns_empty(self, temp_store, monkeypatch):
+    def test_empty_store_returns_empty(self, temp_store):
         """Empty store produces empty context block."""
-        # Mock home to a temp dir with no MEMORY.md
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
         search = SearchIndex(temp_store)
         skills = FakeSkills([])
         ctx = build_context(temp_store, search, skills, "test query", max_tokens=4000)
@@ -249,12 +245,8 @@ class TestFormatting:
 class TestV11ContextBlocks:
     """Test the v1.1 context injection features."""
 
-    def test_compacted_episode_block(self, temp_store, monkeypatch):
+    def test_compacted_episode_block(self, temp_store):
         """Compacted episode summaries should appear in context."""
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
-
         # Add a compacted episode entry to the store
         fm = MemoryFrontmatter.new(
             source="system", tags=["compacted", "auto-summary"], zone="episode",
@@ -267,11 +259,10 @@ class TestV11ContextBlocks:
         assert "Episode Summaries" in ctx
         assert "project planning" in ctx
 
-    def test_no_compacted_episode_block_when_empty(self, temp_store, monkeypatch):
+    def test_no_compacted_episode_block_when_empty(self, temp_store):
         """No compacted episode block when no compacted entries exist."""
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
+        search = SearchIndex(temp_store)
+        skills = FakeSkills([])
 
         search = SearchIndex(temp_store)
         skills = FakeSkills([])

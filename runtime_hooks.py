@@ -332,13 +332,19 @@ def _post_tool_call(**kwargs) -> None:
 
     mem_ids: List[str] = []
 
+    # Parse result once (shared by Dir A and graph enrichment)
+    result_obj: Any = None
+    try:
+        if isinstance(result, str):
+            result_obj = json.loads(result)
+        else:
+            result_obj = result
+    except Exception:
+        result_obj = None
+
     # ── Dir A: Bridge built-in memory writes to plugin store ──────────────
     if tool_name == "memory" and status != "error":
         try:
-            if isinstance(result, str):
-                result_obj = json.loads(result)
-            else:
-                result_obj = result
             if isinstance(result_obj, dict) and result_obj.get("success"):
                 action = args.get("action", "")
                 target = result_obj.get("target", "memory")
@@ -375,24 +381,15 @@ def _post_tool_call(**kwargs) -> None:
     if not any(t in tool_name for t in ("memory", "palace", "skill")):
         return
 
-    try:
-        if isinstance(result, str):
-            result_obj = json.loads(result)
-        else:
-            result_obj = result
-        if isinstance(result_obj, dict):
-            # Direct id fields
-            if "id" in result_obj:
-                mem_ids.append(result_obj["id"])
-            # Results array
-            for key in ("results", "memories", "chain", "graph_expanded"):
-                for item in result_obj.get(key, []):
-                    if isinstance(item, dict):
-                        mid = item.get("id") or item.get("memory_id")
-                        if mid:
-                            mem_ids.append(mid)
-    except Exception:
-        return
+    if isinstance(result_obj, dict):
+        if "id" in result_obj:
+            mem_ids.append(result_obj["id"])
+        for key in ("results", "memories", "chain", "graph_expanded"):
+            for item in result_obj.get(key, []):
+                if isinstance(item, dict):
+                    mid = item.get("id") or item.get("memory_id")
+                    if mid:
+                        mem_ids.append(mid)
 
     if len(mem_ids) >= 2:
         try:

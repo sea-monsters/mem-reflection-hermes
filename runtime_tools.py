@@ -654,12 +654,13 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
                     purpose=f"compile_zone_{_sanitize_zone_filename(zone)}",
                     max_tokens=1024,
                 )
-                if result and not result.error:
+                if result and result.content_type == "json" and result.parsed:
                     text = result.text.strip() if hasattr(result, 'text') else str(result)
                     save_zone_summary(zone, text)
                     results[zone] = {"tokens": len(text.split())}
                 else:
-                    results[zone] = {"error": str(result.error) if result and hasattr(result, 'error') else "unknown"}
+                    err_msg = f"LLM returned {result.content_type}" if result else "no result"
+                    results[zone] = {"error": err_msg}
             return {"success": True, "mode": "zone", "zones": results}
         else:
             return {"error": f"Unknown compilation mode: {mode}"}
@@ -672,8 +673,8 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
             max_tokens=4096,
         )
 
-        if not result or result.error:
-            return {"error": f"LLM compilation failed: {getattr(result, 'error', 'unknown')}"}
+        if not result or result.content_type != "json" or not result.parsed:
+            return {"error": f"LLM compilation failed: {result.content_type if result else 'no result'}"}
 
         text = result.text.strip() if hasattr(result, 'text') else str(result)
         if not text:

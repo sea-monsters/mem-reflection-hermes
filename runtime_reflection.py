@@ -26,7 +26,6 @@ try:
     from .search import (
         _embed_single, _cosine_sim, _extract_keywords,
         _is_explicit_memory_intent, _is_correction, _is_procedure,
-        _classify_intent,
     )
 except ImportError:
     import importlib.util as _i_util
@@ -42,7 +41,6 @@ except ImportError:
     _is_explicit_memory_intent = _search_mod._is_explicit_memory_intent
     _is_correction = _search_mod._is_correction
     _is_procedure = _search_mod._is_procedure
-    _classify_intent = _search_mod._classify_intent
 
 logger = logging.getLogger(__name__)
 
@@ -1024,33 +1022,15 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory],
         filtered = [m for m in existing_memories if m.id() not in exclude_ids]
         return 1.0 - _tfidf_max_similarity(new_text, filtered)
 
-    # Try to use store's embed_index for fast vector lookup
-    store = _get_mem_store()
+    # Encode each memory on demand (SearchIndex manages its own embed array)
     max_sim = 0.0
-    if store._embed_index is not None:
-        vectors = store._embed_index.get("vectors", {})
-        for m in existing_memories:
-            if m.id() in exclude_ids:
-                continue
-            m_emb = vectors.get(m.id())
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                max_sim = max(max_sim, sim)
-            else:
-                # Fallback: encode on demand
-                m_emb = _embed_single(m.body)
-                if m_emb is not None:
-                    sim = _cosine_sim(new_emb, m_emb)
-                    max_sim = max(max_sim, sim)
-    else:
-        # No embed index: encode each memory on demand
-        for m in existing_memories:
-            if m.id() in exclude_ids:
-                continue
-            m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                max_sim = max(max_sim, sim)
+    for m in existing_memories:
+        if m.id() in exclude_ids:
+            continue
+        m_emb = _embed_single(m.body)
+        if m_emb is not None:
+            sim = _cosine_sim(new_emb, m_emb)
+            max_sim = max(max_sim, sim)
 
     # Scale: 0.9 similarity = 0.1 novelty, 0.0 similarity = 1.0 novelty
     novelty = max(0.0, 1.0 - max_sim)
@@ -1068,32 +1048,17 @@ def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], thresh
     if new_emb is None:
         return None
 
-    store = _get_mem_store()
     best: Optional[Tuple[LoadedMemory, float]] = None
 
-    if store._embed_index is not None:
-        vectors = store._embed_index.get("vectors", {})
-        for m in existing:
-            if m.id() in exclude_ids:
-                continue
-            m_emb = vectors.get(m.id())
-            if m_emb is None:
-                m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                if sim > threshold:
-                    if best is None or sim > best[1]:
-                        best = (m, sim)
-    else:
-        for m in existing:
-            if m.id() in exclude_ids:
-                continue
-            m_emb = _embed_single(m.body)
-            if m_emb is not None:
-                sim = _cosine_sim(new_emb, m_emb)
-                if sim > threshold:
-                    if best is None or sim > best[1]:
-                        best = (m, sim)
+    for m in existing:
+        if m.id() in exclude_ids:
+            continue
+        m_emb = _embed_single(m.body)
+        if m_emb is not None:
+            sim = _cosine_sim(new_emb, m_emb)
+            if sim > threshold:
+                if best is None or sim > best[1]:
+                    best = (m, sim)
     return best
 
 
@@ -1935,10 +1900,26 @@ def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
         fallback = fallback[:297] + "..."
 
     try:
-        if hasattr(ctx, "llm") and callable(ctx.llm):
-            response = ctx.llm(prompt)
-            if response and isinstance(response, str) and response.strip():
-                text = response.strip()
+        if hasattr(ctx, "llm") and hasattr(ctx.llm, "complete_structured") and callable(ctx.llm.complete_structured):
+            schema = {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            }
+            result = ctx.llm.complete_structured(
+                instructions=prompt,
+                input=[{"type": "text", "text": prompt}],
+                json_schema=schema,
+                json_mode=True,
+                max_tokens=256,
+                timeout=15,
+            )
+            if result and result.parsed and isinstance(result.parsed, dict):
+                text = result.parsed.get("summary", "").strip()
+                if text:
+                    return text[:500]
+            elif result and isinstance(result.text, str) and result.text.strip():
+                text = result.text.strip()
                 return text[:500]
     except Exception as e:
         logger.debug("LLM summary failed for %s: %s", day, e)

@@ -92,7 +92,6 @@ def _hermes_home() -> Path:
 
 
 _BUILTIN_MEMORY_DIR_CACHE: Optional[Path] = None
-_BUILTIN_MEMORY_DIR_MTIME: float = 0.0
 
 
 def _get_builtin_memory_dir() -> Path:
@@ -276,26 +275,6 @@ def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
     except Exception:
         pass
     return False
-
-
-def _find_plugin_entry_by_content(
-    body: str, mem_store,
-) -> Optional[Any]:
-    """Find a plugin store entry whose body matches exactly.
-
-    Returns the LoadedMemory or None.
-    """
-    if not hasattr(mem_store, "search"):
-        return None
-    try:
-        results = mem_store.search(body, k=5, include_history=False)
-        for r in results:
-            if r.body.strip() == body.strip():
-                return r
-    except Exception:
-        pass
-    return None
-
 
 def _find_plugin_entry_by_substring(
     substring: str, mem_store,
