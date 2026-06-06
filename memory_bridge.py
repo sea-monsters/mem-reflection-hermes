@@ -547,6 +547,12 @@ def _do_mirror_plugin_to_builtin(
         old_bodies = _lookup_superseded_bodies(supersedes)
         if old_bodies:
             _remove_bodies_from_builtin("memory", old_bodies)
+        # Also clean up Dir B mapping for superseded IDs
+        for old_id in supersedes:
+            try:
+                remove_mirrored_id(old_id)
+            except Exception:
+                pass
 
     # ── Dedup ────────────────────────────────────────────────────────
     if _is_duplicate_in_builtin(body, target="memory"):
@@ -639,4 +645,66 @@ def bridge_enabled() -> bool:
     return bool(bridge_cfg.get("enabled", True))
 
 
+# ---------------------------------------------------------------------------
+# Dir B persistent mapping — track which plugin memory IDs were mirrored
+# ---------------------------------------------------------------------------
 
+_DIR_B_MAPPING_PATH: Optional[Path] = None
+_dir_b_mapping_lock = threading.Lock()
+
+
+def _get_dir_b_mapping_path() -> Path:
+    global _DIR_B_MAPPING_PATH
+    if _DIR_B_MAPPING_PATH is None:
+        try:
+            from .store import plugin_data_dir
+            _DIR_B_MAPPING_PATH = plugin_data_dir() / "dir_b_mapping.json"
+        except ImportError:
+            try:
+                from store import plugin_data_dir
+                _DIR_B_MAPPING_PATH = plugin_data_dir() / "dir_b_mapping.json"
+            except ImportError:
+                _DIR_B_MAPPING_PATH = (
+                    Path.home()
+                    / ".hermes" / "plugins" / "mem-reflection-hermes" / "dir_b_mapping.json"
+                )
+    return _DIR_B_MAPPING_PATH
+
+
+def _load_dir_b_mapping() -> Dict[str, bool]:
+    path = _get_dir_b_mapping_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_dir_b_mapping(mapping: Dict[str, bool]) -> None:
+    path = _get_dir_b_mapping_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+
+
+def record_mirrored_id(memory_id: str) -> None:
+    """Record that a plugin memory was successfully mirrored to MEMORY.md."""
+    with _dir_b_mapping_lock:
+        mapping = _load_dir_b_mapping()
+        mapping[memory_id] = True
+        _save_dir_b_mapping(mapping)
+
+
+def is_mirrored_id(memory_id: str) -> bool:
+    """Check if a plugin memory was ever mirrored to MEMORY.md."""
+    with _dir_b_mapping_lock:
+        mapping = _load_dir_b_mapping()
+        return mapping.get(memory_id, False)
+
+
+def remove_mirrored_id(memory_id: str) -> None:
+    """Remove a memory from the Dir B mapping (after deletion / superseded)."""
+    with _dir_b_mapping_lock:
+        mapping = _load_dir_b_mapping()
+        mapping.pop(memory_id, None)
+        _save_dir_b_mapping(mapping)
