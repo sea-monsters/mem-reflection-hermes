@@ -1,9 +1,9 @@
 # Test Coverage Documentation
 
-> Version: v1.0-beta3  
-> Last updated: 2026-06-04  
-> Total tests: **215**  
-> All tests pass on Python 3.14 / Windows 11
+> Version: v1.1-beta  
+> Last updated: 2026-06-06  
+> Total tests: **227 passed, 14 errors** (14 Windows temp dir permission errors, non-code)  
+> Python 3.14 / Windows 11
 
 ---
 
@@ -243,15 +243,7 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Weight sensitivity
 - Full pipeline top-3
 
-### query/cache.py
-
-**File:** `tests/test_query_cache.py`  
-**Tests:** 12
-
-- Query templates (recent, by_zone, by_tag, unknown)
-- Result cache (set/get, miss, TTL expiry, invalidate, clear, stats, eviction)
-
-### reflection/engine.py (legacy)
+### reflection/runtime_reflection.py
 
 **File:** `tests/test_reflection.py`  
 **Tests:** 8
@@ -262,7 +254,7 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Reflection cadence (pre_llm_call counter)
 - Supersedes regression (exclusion from conflict check)
 
-### tools/handlers.py
+### runtime_tools.py
 
 **File:** `tests/test_tool_handlers.py`  
 **Tests:** 8

@@ -49,12 +49,12 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.0-beta3)
+## Module Layout (v1.1-beta)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
 | `store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers | — |
-| `search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers | store |
+| `search.py` | canonical | SearchIndex, BM25/embedding fusion, intent helpers | store |
 | `graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
 | `reflect.py` / `runtime_reflection.py` | canonical | ReflectionEngine, micro/full/raw-chunk reflection, audit logging, skill approval helpers | store, search |
 | `runtime_hooks.py` | canonical | Session hooks and slash command registration | store, reflect, search |
@@ -79,9 +79,9 @@ When adding new functionality, respect the module boundaries:
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety (v1.0-beta3)
+### Thread Safety (v1.1-beta)
 
-Key concurrency protections present in v1.0-beta3:
+Key concurrency protections present in v1.1-beta:
 
 | Resource | Protection |
 |----------|-----------|
