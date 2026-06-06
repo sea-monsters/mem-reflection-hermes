@@ -19,37 +19,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Path helpers (for built-in memory)
-# ---------------------------------------------------------------------------
-
-ENTRY_DELIMITER = "\n\u00a7\n"  # Section sign delimiter, matching memory_tool.py
-
-
-def _hermes_home() -> Path:
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        return Path(env_home)
-    try:
-        from hermes_constants import get_hermes_home
-        return get_hermes_home()
-    except Exception:
-        return Path.home() / ".hermes"
-
-
-def _read_builtin_entries(target: str) -> List[str]:
-    """Read entries from MEMORY.md or USER.md (matches memory_tool.py format)."""
-    fname = "MEMORY.md" if target.lower() == "memory" else "USER.md"
-    path = _hermes_home() / "memories" / fname
-    if not path.exists():
-        return []
-    try:
-        raw = path.read_text(encoding="utf-8")
-        return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
-    except OSError:
-        return []
-
-
-# ---------------------------------------------------------------------------
 # Context assembly
 # ---------------------------------------------------------------------------
 
@@ -135,17 +104,13 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
 def _build_compacted_episode_block(store) -> str:
     """Load compacted episode summaries from the episode zone.
 
-    Searches for entries tagged 'compacted' and formats as a digest.
+    Scans episode zone for entries tagged 'compacted' and formats as a digest.
     """
     try:
-        compacted = store.search_by_tags(["compacted"], zone="episode", limit=20)
+        all_ep = store.list_by_zone("episode")
+        compacted = [m for m in all_ep if "compacted" in (m.frontmatter.tags or [])]
     except Exception:
-        # Fallback: scan episode zone for compacted entries
-        try:
-            all_ep = store.list_by_zone("episode")
-            compacted = [m for m in all_ep if "compacted" in (m.frontmatter.tags or [])]
-        except Exception:
-            return ""
+        return ""
 
     if not compacted:
         return ""
