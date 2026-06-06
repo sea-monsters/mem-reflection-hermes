@@ -23,7 +23,7 @@ Plugins do **not** implement their own auth layer — the host guarantees auth f
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 14 routes (v1.0-beta3).
+Current surface: 14 routes (v1.1-beta).
 
 | Method | Path | Purpose |
 |--------|------|---------|

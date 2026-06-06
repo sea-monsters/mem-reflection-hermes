@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mem-reflection-hermes** is a self-evolving memory & reflection system plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It provides structured memory persistence, semantic search, reflection pipelines, skill auto-matching, graph memory (Hebbian co-activation), and a dashboard UI. Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes).
 
-Current version: **v1.0-beta3** (plugin.yaml version field).
+Current version: **v1.1-beta** (plugin.yaml version field).
 
 ### Architecture (runtime modules + beta3 compatibility)
 
-The active runtime uses the beta2 module set plus beta3 runtime modules. Pre-beta2 implementation files have been retired; only a few explicit old import paths remain as deprecated compatibility entrypoints.
+The active runtime uses the beta3 module set plus v1.1 enhancements (episode compaction, v0.16.0 telemetry hooks). Pre-beta2 implementation files have been retired; only a few explicit old import paths remain as deprecated compatibility entrypoints.
 
 ```
 store.py              # SQLite-backed MemoryStore, frontmatter I/O, config, paths (~1024 lines)

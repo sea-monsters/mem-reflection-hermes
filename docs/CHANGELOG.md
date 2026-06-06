@@ -28,9 +28,10 @@
 
 ### Housekeeping
 
-- Removed 210 lines of dead code: `dir_b_mapping.json` infrastructure,
-  unused imports, dashboard dead fallback, 3 retired test cases.
-- 254/254 tests pass.
+- **Episode Compaction** (v1.1): `_compact_episode_zone()` clusters raw episode entries into daily summaries via LLM, running automatically after `on_session_end` reflection.
+- **Dead code cleanup**: Removed `QueryTemplate`/`ResultCache` (~170 lines) from `search.py`, `_classify_intent` embedding prototypes, `_embed_texts`, `_find_plugin_entry_by_content`, `_BUILTIN_MEMORY_DIR_MTIME`, duplicate `_hermes_home`/`_read_builtin_entries` from `context.py`, and legacy singleton functions from `__init__.py`. Net reduction: 625 lines across 9 files.
+- **Hermes Agent v1.1 compat fixes**: `PluginLlmStructuredResult.error` → `.content_type`/`.parsed` check; empty `input=[]` in `complete_structured` → text block; removed stale `test_query_cache.py`.
+- 227/241 tests pass (14 Windows temp dir permission errors, non-code).
 
 ## v1.0-beta3 — Beta3 Cleanup + Runtime Contract Review
 

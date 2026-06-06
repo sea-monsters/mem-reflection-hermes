@@ -1,9 +1,11 @@
 # v1.0-beta2 架构文档 — 实现状态
 
-> **更新日期**: 2026-06-04
-> **状态**: runtime 模块已接线，215 测试通过，代码审查修复、边界补强与命名清洁完成
+> **更新日期**: 2026-06-06
+> **状态**: v1.1-beta 已发布 — runtime 模块稳定，227 测试通过，死代码清理完成，Hermes Agent v0.16.0 兼容
 > **Wave A 性能优化**: bm25s + datasketch 引入完成
 > **旧版本记录**: 见 [1.0-beta2-redesign.md](1.0-beta2-redesign.md) (原始设计) 和 [beta2-plan.md](beta2-plan.md) (开发计划)
+>
+> **v1.1 变更**: QueryTemplate/ResultCache 已从 search.py 移除；episode compaction 新增；`PluginLlmStructuredResult.error` → `.content_type`/`.parsed`
 
 ---
 
