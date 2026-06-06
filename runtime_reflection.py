@@ -1848,13 +1848,23 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
 
         bodies = [m.body.strip() for m in mems]
 
-        # Build summary: LLM if available, otherwise longest
+        # Build summary: LLM if available, otherwise extractive
         if ctx is not None and llm_summary_enabled and hasattr(ctx, "llm"):
             summary = _llm_summarize_cluster(day, bodies, ctx)
         else:
-            summary = max(bodies, key=len)
-            if len(summary) > 300:
-                summary = summary[:297] + "..."
+            # No LLM: concatenate all unique facts so nothing is lost.
+            # De-duplicate near-identical bodies, then join with " | "
+            # and truncate to stay within reasonable token budget.
+            seen: set[str] = set()
+            unique: list[str] = []
+            for b in bodies:
+                if b not in seen:
+                    seen.add(b)
+                    unique.append(b)
+            joined = " | ".join(unique)
+            if len(joined) > 800:
+                joined = joined[:797] + "..."
+            summary = joined
 
         fm = MemoryFrontmatter.new(
             source="system",
