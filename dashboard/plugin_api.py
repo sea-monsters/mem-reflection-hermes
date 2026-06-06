@@ -118,12 +118,7 @@ def _get_graph_interface():
         except Exception:
             return None
     except Exception:
-        try:
-            import importlib
-            mod = importlib.import_module("mem_reflection_hermes.graph.ahe_graph")
-            return mod.get_graph_manager()
-        except Exception:
-            return None
+        return None
 
 
 def _get_cross_layer_query():

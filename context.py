@@ -61,8 +61,7 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
     2. Active memories (zone-based relevance via search)
     3. Triggered skills (per-turn token overlap)
     4. Always-active skills (user-configured)
-    5. (v1.1) Built-in memory snapshot (MEMORY.md/USER.md)
-    6. (v1.1) Compacted episode summaries
+    5. (v1.1) Compacted episode summaries
     """
     parts: List[str] = []
     token_budget = max_tokens
@@ -112,21 +111,9 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
             parts.append(block)
             used_tokens += t
 
-    # 5. (v1.1) Built-in memory snapshot
+    # 5. (v1.1) Compacted episode summaries
     try:
         cfg = plugin_config()
-        if cfg.get("context_builtin", True):
-            builtin_block = _build_builtin_memory_block()
-            if builtin_block:
-                t = _estimate_block_tokens(builtin_block)
-                if used_tokens + t <= token_budget:
-                    parts.append(builtin_block)
-                    used_tokens += t
-    except Exception:
-        pass
-
-    # 6. (v1.1) Compacted episode summaries
-    try:
         if cfg.get("context_compacted_episode", True):
             episode_block = _build_compacted_episode_block(store)
             if episode_block:
@@ -143,45 +130,6 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
 # ---------------------------------------------------------------------------
 # v1.1 context blocks
 # ---------------------------------------------------------------------------
-
-def _build_builtin_memory_block() -> str:
-    """Read MEMORY.md/USER.md and format as a context block.
-
-    Respects the same §-delimited format as memory_tool.py.
-    Only includes up to 10 entries per file to keep tokens low.
-    Each entry is scanned for prompt-injection threats before inclusion.
-    """
-    block_parts = []
-
-    # Lazy-import threat scanner (available when running inside Hermes Agent)
-    try:
-        from tools.threat_patterns import scan_for_threats as _threat_scan
-    except Exception:
-        _threat_scan = None
-
-    for target in ("memory", "user"):
-        entries = _read_builtin_entries(target)
-        if not entries:
-            continue
-        label = "Notes" if target == "memory" else "Profile"
-        lines = [f"### Built-in Memory ({label})"]
-        for e in entries[:10]:
-            # Threat scan before injection
-            if _threat_scan is not None:
-                hits = _threat_scan(e, scope="strict")
-                if hits:
-                    preview = f"[BLOCKED: {', '.join(hits)}]"
-                    lines.append(f"- {preview}")
-                    continue
-            preview = e[:150]
-            if len(e) > 150:
-                preview += "..."
-            lines.append(f"- {preview}")
-        if len(entries) > 10:
-            lines.append(f"- ... ({len(entries) - 10} more)")
-        block_parts.append("\n".join(lines))
-
-    return "\n\n".join(block_parts) if block_parts else ""
 
 
 def _build_compacted_episode_block(store) -> str:
