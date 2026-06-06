@@ -6,7 +6,6 @@ import logging
 import re
 import sys
 import time
-from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -230,15 +229,12 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
         from .memory_bridge import bridge_enabled as _b_enabled
         if _b_enabled():
             from .memory_bridge import mirror_plugin_to_builtin as _mirror_b
-            from .memory_bridge import record_mirrored_id as _rec_mir
-            _result = _mirror_b(
+            _mirror_b(
                 body=body,
                 zone=zone,
                 source="srh_memory_write",
                 supersedes=fm.supersedes or None,
             )
-            if _result and _result.get("mirrored"):
-                _rec_mir(fm.id)
     except Exception as _dir_b_err:
         logger.debug("Bridge Dir B failed: %s", _dir_b_err)
 
@@ -255,20 +251,6 @@ def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     scope = args.get("scope", "user")
     if not mem_id:
         return _jd({"error": "id is required"})
-
-    # Dir B: remove from MEMORY.md only if this memory was actually mirrored
-    try:
-        from .memory_bridge import bridge_enabled as _b_enabled
-        if _b_enabled():
-            from .memory_bridge import is_mirrored_id as _is_mir, remove_mirrored_id as _rm_mir
-            from .memory_bridge import _remove_bodies_from_builtin
-            if _is_mir(mem_id):
-                memory = mem_store.get(mem_id)
-                if memory is not None:
-                    _remove_bodies_from_builtin("memory", [memory.body.strip()])
-                _rm_mir(mem_id)
-    except Exception:
-        logger.debug("Dir B MEMORY.md cleanup on delete failed", exc_info=True)
 
     ok = mem_store.delete(scope, mem_id)
     return _jd({"success": ok, "id": mem_id})

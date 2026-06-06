@@ -17,16 +17,12 @@ Legacy modules retired in beta3:
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import math
 import os
-import queue
 import re
 import sys
 import time
-import uuid
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -464,17 +460,6 @@ def _build_context_block_inner(query: str = "") -> str:
         for s in always_active:
             parts.append(f"### {s.frontmatter.name}\n{s.body.strip()}\n")
 
-    # (v1.1) Built-in memory snapshot
-    try:
-        from .context import _build_builtin_memory_block as _builtin_blk
-        _cfg = plugin_config()
-        if _cfg.get("context_builtin", True):
-            builtin_block = _builtin_blk()
-            if builtin_block:
-                parts.append(builtin_block)
-    except Exception:
-        pass
-
     # (v1.1) Compacted episode summaries
     try:
         from .context import _build_compacted_episode_block as _episode_blk
@@ -512,6 +497,17 @@ def _register_runtime_features(ctx):
             graph_db_path=plugin_data_dir() / "graph.db",
         )
         logger.info("runtime graph integration registered")
+        # One-time sync of pre-existing built-in memory entries
+        try:
+            from .memory_bridge import sync_builtin_to_plugin
+            result = sync_builtin_to_plugin(_get_mem_store())
+            if result.get("synced", 0):
+                logger.info(
+                    "startup sync: %d entries mirrored from MEMORY.md",
+                    result["synced"],
+                )
+        except Exception:
+            pass
         return
     except ImportError as e:
         logger.warning("runtime graph not available (skip integration): %s", e)

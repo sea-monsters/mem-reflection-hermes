@@ -249,33 +249,6 @@ class TestFormatting:
 class TestV11ContextBlocks:
     """Test the v1.1 context injection features."""
 
-    def test_builtin_block_with_memories(self, temp_store, monkeypatch):
-        """Built-in memory block should include content from MEMORY.md."""
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        fake_home.joinpath("memories").mkdir(parents=True, exist_ok=True)
-        mem_path = fake_home / "memories" / "MEMORY.md"
-        mem_path.write_text("Note 1\n\u00a7\nNote 2", encoding="utf-8")
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
-
-        search = SearchIndex(temp_store)
-        skills = FakeSkills([])
-        ctx = build_context(temp_store, search, skills, "", max_tokens=4000)
-        assert "Built-in Memory" in ctx
-        assert "Note 1" in ctx
-        assert "Note 2" in ctx
-
-    def test_builtin_block_empty_when_no_file(self, temp_store, monkeypatch):
-        """Built-in block should be empty when MEMORY.md doesn't exist."""
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
-
-        search = SearchIndex(temp_store)
-        skills = FakeSkills([])
-        ctx = build_context(temp_store, search, skills, "", max_tokens=4000)
-        assert "Built-in Memory" not in ctx
-
     def test_compacted_episode_block(self, temp_store, monkeypatch):
         """Compacted episode summaries should appear in context."""
         import tempfile as _tf
@@ -304,18 +277,4 @@ class TestV11ContextBlocks:
         skills = FakeSkills([])
         ctx = build_context(temp_store, search, skills, "", max_tokens=4000)
         assert "Episode Summaries" not in ctx
-
-    def test_token_budget_excludes_builtin(self, temp_store, monkeypatch):
-        """When budget is tight, built-in block should be omitted."""
-        import tempfile as _tf
-        fake_home = Path(_tf.mkdtemp(prefix="hermes_test_home_"))
-        fake_home.joinpath("memories").mkdir(parents=True, exist_ok=True)
-        mem_path = fake_home / "memories" / "MEMORY.md"
-        mem_path.write_text("A" * 2000, encoding="utf-8")
-        monkeypatch.setattr(_context, "_hermes_home", lambda: fake_home)
-
-        search = SearchIndex(temp_store)
-        skills = FakeSkills([])
-        ctx = build_context(temp_store, search, skills, "", max_tokens=10)
-        assert "Built-in Memory" not in ctx
 

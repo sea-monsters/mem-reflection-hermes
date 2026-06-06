@@ -26,9 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import threading
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,7 +39,7 @@ logger = logging.getLogger(__name__)
 CONFIG_SECTION = "mem_reflection_hermes"
 DIR_B_MAX_CHARS = 200          # Max body length for plugin → built-in sync
 DIR_B_SYNC_ZONES = ("core",)   # Which zones trigger Dir B
-ENTRY_DELIMITER = "\n§\n"      # Must match memory_tool.py
+ENTRY_DELIMITER = "\n\u00a7\n"      # Must match memory_tool.py
 
 # ---------------------------------------------------------------------------
 # Thread safety
@@ -262,15 +260,19 @@ def _do_append_builtin(path: Path, target: str, body: str) -> bool:
 # Plugin-store helpers (Dir A)
 # ---------------------------------------------------------------------------
 
-def _is_duplicate_in_plugin(body: str, mem_store) -> bool:
-    """Check if an exact-duplicate body exists in the plugin store."""
+def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
+    """Check if an exact-duplicate body exists in the plugin store.
+
+    If ``zone`` is provided, restrict check to entries in that zone.
+    """
     if not hasattr(mem_store, "search"):
         return False
     try:
         results = mem_store.search(body, k=5, include_history=False)
         for r in results:
             if r.body.strip() == body.strip():
-                return True
+                if zone is None or r.frontmatter.zone == zone:
+                    return True
     except Exception:
         pass
     return False
@@ -377,9 +379,6 @@ def _do_mirror_builtin_to_plugin(
     try:
         if action == "remove":
             # Handle removes BEFORE the empty-content early return.
-            # Built-in memory tool passes content="" and the deleted text in
-            # old_text — we must tombstone the plugin entry even when
-            # content is empty.
             old_entry_text = old_text.strip()
             if not old_entry_text:
                 result["skipped"] += 1
@@ -460,8 +459,6 @@ def _write_to_plugin(
     try:
         from .store import MemoryFrontmatter  # type: ignore[import-untyped]
     except ImportError:
-        # Fallback when loaded standalone (test imports or direct use)
-        # Use a minimal frontmatter construction
         try:
             from store import MemoryFrontmatter  # type: ignore[import-untyped]
         except ImportError:
@@ -471,7 +468,7 @@ def _write_to_plugin(
     fm = MemoryFrontmatter.new(
         source="bridge",
         confidence="medium",
-        tags=["bridge", "auto-sync"],
+        tags=["bridge", "built-in-sync"],
         zone=zone,
     )
     if supersedes:
@@ -547,12 +544,6 @@ def _do_mirror_plugin_to_builtin(
         old_bodies = _lookup_superseded_bodies(supersedes)
         if old_bodies:
             _remove_bodies_from_builtin("memory", old_bodies)
-        # Also clean up Dir B mapping for superseded IDs
-        for old_id in supersedes:
-            try:
-                remove_mirrored_id(old_id)
-            except Exception:
-                pass
 
     # ── Dedup ────────────────────────────────────────────────────────
     if _is_duplicate_in_builtin(body, target="memory"):
@@ -646,65 +637,40 @@ def bridge_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Dir B persistent mapping — track which plugin memory IDs were mirrored
+# Startup sync — one-time bulk mirror of built-in memory to plugin store
 # ---------------------------------------------------------------------------
 
-_DIR_B_MAPPING_PATH: Optional[Path] = None
-_dir_b_mapping_lock = threading.Lock()
 
+def sync_builtin_to_plugin(mem_store) -> dict:
+    """Sync all current MEMORY.md/USER.md entries to the plugin store.
 
-def _get_dir_b_mapping_path() -> Path:
-    global _DIR_B_MAPPING_PATH
-    if _DIR_B_MAPPING_PATH is None:
-        try:
-            from .store import plugin_data_dir
-            _DIR_B_MAPPING_PATH = plugin_data_dir() / "dir_b_mapping.json"
-        except ImportError:
-            try:
-                from store import plugin_data_dir
-                _DIR_B_MAPPING_PATH = plugin_data_dir() / "dir_b_mapping.json"
-            except ImportError:
-                _DIR_B_MAPPING_PATH = (
-                    Path.home()
-                    / ".hermes" / "plugins" / "mem-reflection-hermes" / "dir_b_mapping.json"
-                )
-    return _DIR_B_MAPPING_PATH
+    Called once at plugin registration.  For each entry not already present
+    in the plugin store (by body+zone), writes to core zone with
+    ``tags=["built-in-sync"]``.  This eliminates the need for the context
+    builder to read MEMORY.md raw on every turn — Dir A handles future
+    incremental syncs via ``post_tool_call`` hook.
 
+    Returns a dict with ``synced``, ``skipped``, and ``errors`` counts.
+    """
+    result: Dict[str, int] = {"synced": 0, "skipped": 0, "errors": 0}
+    if mem_store is None:
+        return result
 
-def _load_dir_b_mapping() -> Dict[str, bool]:
-    path = _get_dir_b_mapping_path()
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    for target in ("memory", "user"):
+        entries = _read_builtin_entries(target)
+        if not entries:
+            continue
+        zone = "core" if target == "memory" else "general"
+        for entry in entries:
+            body = entry.strip()
+            if not body:
+                continue
+            # Skip if already in plugin store (by body + zone)
+            if _is_duplicate_in_plugin(body, mem_store, zone=zone):
+                result["skipped"] += 1
+                continue
+            # Write to plugin store
+            _write_to_plugin(mem_store, body, zone)
+            result["synced"] += 1
 
-
-def _save_dir_b_mapping(mapping: Dict[str, bool]) -> None:
-    path = _get_dir_b_mapping_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
-
-
-def record_mirrored_id(memory_id: str) -> None:
-    """Record that a plugin memory was successfully mirrored to MEMORY.md."""
-    with _dir_b_mapping_lock:
-        mapping = _load_dir_b_mapping()
-        mapping[memory_id] = True
-        _save_dir_b_mapping(mapping)
-
-
-def is_mirrored_id(memory_id: str) -> bool:
-    """Check if a plugin memory was ever mirrored to MEMORY.md."""
-    with _dir_b_mapping_lock:
-        mapping = _load_dir_b_mapping()
-        return mapping.get(memory_id, False)
-
-
-def remove_mirrored_id(memory_id: str) -> None:
-    """Remove a memory from the Dir B mapping (after deletion / superseded)."""
-    with _dir_b_mapping_lock:
-        mapping = _load_dir_b_mapping()
-        mapping.pop(memory_id, None)
-        _save_dir_b_mapping(mapping)
+    return result
