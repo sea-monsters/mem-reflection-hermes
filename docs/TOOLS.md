@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: 17 registered tools (v1.1-beta).
+Current SRH tool surface: 17 registered tools.
 
 Graph-related capabilities are exposed both as SRH tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`) and through the dashboard API.
 
@@ -90,7 +90,7 @@ srh_graph_stats()
 srh_graph_viz(tier="summary")
 ```
 
-## Health Metrics (introduced in v0.9.2-beta2, hardened through v1.1-beta)
+## Health Metrics
 
 ```python
 # Get memory health metrics and recommendations
@@ -134,4 +134,4 @@ Returns:
 - `srh_graph_viz`
 
 ### Health & Governance (1)
-- `srh_memory_health` (introduced in v0.9.2-beta2, hardened through v1.1-beta)
+- `srh_memory_health`

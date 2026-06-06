@@ -39,10 +39,10 @@ Always use anyhow for app-level error handling in Rust.
 | `rank` | int (v0.6.1+) | Explicit ordering. Higher rank = appears earlier. Default 0 |
 | `supersedes` | string[] | Memory IDs this memory replaces (version lineage) |
 | `version` | string (v0.8.0+) | Optional version string for tracking iterations |
-| `supersedes_reason` | string (v0.9.2-beta2+) | Human-readable reason why this memory supersedes the referenced IDs |
-| `valid_from` | ISO 8601 (v0.9.2-beta2+) | Earliest date this memory is considered active |
-| `valid_until` | ISO 8601 (v0.9.2-beta2+) | Expiration date; memories past this date are flagged as expired in health checks |
-| `context_scope` | string (v0.9.2-beta2+) | Context qualifier (e.g., `project:X`, `domain:backend`) for scoped filtering |
+| `supersedes_reason` | string | Human-readable reason why this memory supersedes the referenced IDs |
+| `valid_from` | ISO 8601 | Earliest date this memory is considered active |
+| `valid_until` | ISO 8601 | Expiration date; memories past this date are flagged as expired in health checks |
+| `context_scope` | string | Context qualifier (e.g., `project:X`, `domain:backend`) for scoped filtering |
 
 ## Supersedes Semantics
 

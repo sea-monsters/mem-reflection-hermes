@@ -49,7 +49,7 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.1-beta)
+## Module Layout
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
@@ -79,9 +79,9 @@ When adding new functionality, respect the module boundaries:
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety (v1.1-beta)
+### Thread Safety
 
-Key concurrency protections present in v1.1-beta:
+Key concurrency protections:
 
 | Resource | Protection |
 |----------|-----------|
