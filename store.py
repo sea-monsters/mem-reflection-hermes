@@ -1428,7 +1428,8 @@ class MemoryStore:
                 frontmatter=fm, body=body,
                 source_path=Path(row["path"]), scope=row["scope"],
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("SQLite row parse failed for %s: %s", row.get("id", "?"), exc)
             return self._row_to_loaded_from_disk(row)
 
     def _row_to_loaded_from_disk(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
