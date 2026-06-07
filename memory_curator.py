@@ -176,28 +176,36 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
         return False
     # Re-write cold store minus the restored entry
     path = _cold_store_path(mem_store)
+
+    # Restore to active store FIRST before touching archive
+    try:
+        from .store import MemoryFrontmatter
+        zone = found.get("zone", "general")
+        orig_fm = found.get("original_frontmatter", {})
+        fm = MemoryFrontmatter(
+            id=found["id"],
+            created=orig_fm.get("created", found.get("archived_at", datetime.now(timezone.utc).isoformat())),
+            source="restored",
+            confidence=orig_fm.get("confidence", "medium"),
+            zone=zone,
+            tags=found.get("tags", ["restored"]),
+            pinned=orig_fm.get("pinned", False),
+            supersedes=orig_fm.get("supersedes", []),
+            supersedes_reason=orig_fm.get("supersedes_reason", ""),
+        )
+        mem_store.put("user", fm, found.get("body", ""))
+    except Exception as e:
+        logger.warning("Cold restore failed to write active memory: %s", e)
+        return False
+
+    # Only rewrite cold store AFTER successful restore
     try:
         with open(path, "w", encoding="utf-8") as f:
             for entry in entries:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     except OSError:
         pass
-    # Write back to active store
-    try:
-        from .store import MemoryFrontmatter
-        zone = found.get("zone", "general")
-        fm = MemoryFrontmatter(
-            id=found["id"],
-            body=found.get("body", ""),
-            zone=zone,
-            created=found.get("archived_at", datetime.now(timezone.utc).isoformat()),
-            tags=found.get("tags", ["restored"]),
-        )
-        mem_store.put("user", fm, found.get("body", ""))
-        return True
-    except Exception as e:
-        logger.warning("Cold restore failed to write active memory: %s", e)
-        return False
+    return True
 
 
 # ── Phase 1: TTL + Staleness ──────────────────────────────────
@@ -309,7 +317,11 @@ def archive_superseded(mem_store) -> int:
     Returns count of memories archived.
     """
     try:
-        all_active = mem_store.list_active()
+        # Must include historical/superseded memories — list_active() filters them out
+        if hasattr(mem_store, 'list'):
+            all_active = mem_store.list(active_only=False)
+        else:
+            all_active = mem_store.list_active()
     except Exception:
         return 0
     now = time.time()
@@ -359,11 +371,14 @@ def archive_superseded(mem_store) -> int:
 
 
 def _find_superseding_memories(mem_store, memory_id: str) -> List[str]:
-    """Find active memories that supersede the given memory_id."""
+    """Find memories (including superseded) that supersede the given memory_id."""
     result: List[str] = []
     try:
-        all_active = mem_store.list_active()
-        for m in all_active:
+        if hasattr(mem_store, 'list'):
+            all_items = mem_store.list(active_only=False)
+        else:
+            all_items = mem_store.list_active()
+        for m in all_items:
             if memory_id in (m.frontmatter.supersedes or []):
                 result.append(m.id())
     except Exception:

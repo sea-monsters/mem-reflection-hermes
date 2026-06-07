@@ -75,6 +75,15 @@ class MockStore:
             tags=getattr(fm, 'tags', []),
         )
 
+    def list(self, *, zone=None, active_only=False, sort="rank", limit=None):
+        """Mock for MemoryStore.list — returns all memories (ignores active_only)."""
+        mems = list(self.memories.values())
+        if zone:
+            mems = [m for m in mems if m.frontmatter.zone == zone]
+        if limit is not None:
+            mems = mems[:limit]
+        return mems
+
     def delete(self, scope: str, mid: str) -> bool:
         if mid in self.memories:
             del self.memories[mid]
