@@ -160,7 +160,7 @@ def _prune_cold_store(mem_store, cap_mb: int) -> int:
             for entry in entries:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     except OSError:
-        pass
+        logger.warning("Cold store prune failed to write pruned file: %s", path)
     return pruned
 
 
@@ -248,6 +248,7 @@ def scan_for_stale(mem_store) -> List[str]:
                 pass
 
         # Check access time (effectiveness gives us access recency)
+        eff = None
         try:
             eff = _load_effectiveness(mem_store, mid)
             last_access = eff.get("last_accessed", 0) if eff else 0
@@ -406,8 +407,10 @@ def scan_for_similar(mem_store) -> List[Tuple[str, str, float]]:
     if len(all_active) < 2:
         return []
 
-    # Clamp to 500 most recent for performance
-    all_active = sorted(all_active, key=lambda m: getattr(m, "_sort_key", ""), reverse=True)[:500]
+    # Clamp to 500 most recent for performance (sort by created desc)
+    all_active = sorted(all_active,
+                        key=lambda m: getattr(getattr(m, 'frontmatter', None), 'created', ''),
+                        reverse=True)[:500]
 
     candidates: List[Tuple[str, str, float]] = []
     seen: set = set()
