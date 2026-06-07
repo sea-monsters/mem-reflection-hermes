@@ -709,15 +709,24 @@ def _refine_body(body: str, max_chars: int = 500) -> str:
 
     # Strip fenced code blocks (json/python/yaml/xml/bash/sql/text/markdown)
     text = re.sub(
-        r"```(?:json|python|yaml|xml|bash|sql|text|markdown|toml|ini|sh|shell|console)\s*\n.*?\n```",
+        r"```(?:json|python|yaml|xml|bash|sql|text|markdown|toml|ini|sh|shell|console|diff|patch)?\s*\n.*?\n```",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Strip quad-backtick code blocks
+    text = re.sub(
+        r"````\w*\s*\n.*?\n````",
         "",
         text,
         flags=re.DOTALL,
     )
 
-    # Strip [Tool: xxx] / [tool_output] inline markers
-    text = re.sub(r"\[Tool:?\s*\w+\]", "", text)
+    # Strip [Tool: xxx] / [tool_output] / {Tool: xxx} inline markers
+    text = re.sub(r"[\[{]\s*(?:[Tt][Oo][Oo][Ll]|tool|TOOL)\s*:?\s*\w+\s*[\]}]", "", text)
     text = re.sub(r"\[tool_output\].*?\[/tool_output\]", "", text, flags=re.DOTALL)
+    text = re.sub(r"\{tool_output\}.*?\{/tool_output\}", "", text, flags=re.DOTALL)
 
     # Strip "Tool xxx result:" / "Tool xxx returned:" prefixed text
     text = re.sub(r"Tool\s+\w+\s+(?:result|output|returned):\s*", "", text)

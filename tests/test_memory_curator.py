@@ -68,6 +68,13 @@ class MockStore:
     def get(self, mid: str) -> Optional[MockMemory]:
         return self.memories.get(mid)
 
+    def put(self, scope: str, fm, body: str):
+        """Mock for MemoryStore.put — adds to memories dict."""
+        self.memories[fm.id] = MockMemory(
+            fm.id, body, zone=getattr(fm, 'zone', 'general'),
+            tags=getattr(fm, 'tags', []),
+        )
+
     def delete(self, scope: str, mid: str) -> bool:
         if mid in self.memories:
             del self.memories[mid]
@@ -96,7 +103,7 @@ from memory_curator import _append_to_cold_store, _curator_config  # noqa: E402
 
 
 @pytest.fixture
-def store():
+def store(tmp_path):
     s = MockStore()
     s.memories["keep"] = MockMemory("keep", "pinned", pinned=True, tags=["keep"])
     s.memories["fresh"] = MockMemory("fresh", "recent", confidence="high")
@@ -107,6 +114,7 @@ def store():
         "fresh": {"last_accessed": _MOCK_TIME, "effectiveness": 0.9},
         "stale": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.05},
     }
+    s._cold_store_path_override = str(tmp_path / "_cold_store.jsonl")
     return s
 
 

@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 # ── Config keys ────────────────────────────────────────────────
 _CURATOR_CFG_KEY = "curator"
+
+# Thread-safe lock for cold store writes
+_cold_store_lock = threading.Lock()
 
 _DEFAULT_CFG: Dict[str, Any] = {
     "enabled": True,
@@ -79,11 +84,16 @@ _COLD_STORE_FILENAME = "cold_store.jsonl"
 
 def _cold_store_path(mem_store) -> Path:
     """Path to the cold storage JSONL file."""
+    # Allow caller to override path (used in tests)
+    if hasattr(mem_store, '_cold_store_path_override'):
+        p = Path(mem_store._cold_store_path_override)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
     try:
         from .store import plugin_data_dir
         return plugin_data_dir() / _COLD_STORE_FILENAME
     except Exception:
-        return Path.home() / ".hermes" / "plugins" / "mem-reflection-hermes" / _COLD_STORE_FILENAME
+        return Path.home() / ".hermes" / "memory" / _COLD_STORE_FILENAME
 
 
 def _load_cold_store(mem_store) -> List[Dict[str, Any]]:
@@ -111,12 +121,13 @@ def _append_to_cold_store(mem_store, entry: Dict[str, Any]) -> bool:
     path = _cold_store_path(mem_store)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        cap_mb = _curator_config(mem_store).get("cold_storage", {}).get("max_archive_size_mb", 10)
-        # Prune oldest entries if over cap
-        if path.exists() and path.stat().st_size >= cap_mb * 1024 * 1024:
-            _prune_cold_store(mem_store, cap_mb)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        with _cold_store_lock:
+            cap_mb = _curator_config(mem_store).get("cold_storage", {}).get("max_archive_size_mb", 10)
+            # Prune oldest entries if over cap
+            if path.exists() and path.stat().st_size >= cap_mb * 1024 * 1024:
+                _prune_cold_store(mem_store, cap_mb)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
         return True
     except OSError as e:
         logger.warning("Cold storage append failed: %s", e)
@@ -132,12 +143,17 @@ def _prune_cold_store(mem_store, cap_mb: int) -> int:
     # Estimate size per entry and remove oldest
     entries.sort(key=lambda e: e.get("archived_at", ""))
     pruned = 0
-    while entries:
-        test_json = json.dumps(entries, ensure_ascii=False, default=str)
+    lo, hi = 0, len(entries)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        test_json = json.dumps(entries[mid:], ensure_ascii=False, default=str)
         if len(test_json.encode("utf-8")) <= cap_bytes:
-            break
-        entries.pop(0)
-        pruned += 1
+            hi = mid
+        else:
+            lo = mid + 1
+    if lo > 0:
+        entries = entries[lo:]
+        pruned = lo
     path = _cold_store_path(mem_store)
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -168,7 +184,7 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
         pass
     # Write back to active store
     try:
-        from .store import MemoryFrontmatter, _write_memory, user_memories_dir
+        from .store import MemoryFrontmatter
         zone = found.get("zone", "general")
         fm = MemoryFrontmatter(
             id=found["id"],
@@ -177,9 +193,7 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
             created=found.get("archived_at", datetime.now(timezone.utc).isoformat()),
             tags=found.get("tags", ["restored"]),
         )
-        dest = user_memories_dir()
-        path_out = dest / f"{fm.created[:10]}-{fm.id[:16]}.md"
-        _write_memory(path_out, fm, found.get("body", ""))
+        mem_store.put("user", fm, found.get("body", ""))
         return True
     except Exception as e:
         logger.warning("Cold restore failed to write active memory: %s", e)
@@ -257,7 +271,7 @@ def _load_effectiveness(mem_store, memory_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def archive_expired(mem_store, memory_ids: List[str], ctx=None) -> int:
+def archive_expired(mem_store, memory_ids: List[str]) -> int:
     """Move expired/stale memories to cold storage. Returns count archived."""
     archived = 0
     for mid in memory_ids:
@@ -384,8 +398,10 @@ def scan_for_similar(mem_store) -> List[Tuple[str, str, float]]:
     seen: set = set()
     try:
         from .store import _tokenise as _tokenise_fn
-    except Exception:
-        def _tokenise_fn(t): return t.lower().split()
+    except ImportError:
+        import re as _re
+        def _tokenise_fn(t):
+            return _re.findall(r'\w+', t.lower())
 
     for i in range(len(all_active)):
         for j in range(i + 1, len(all_active)):
@@ -460,7 +476,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
     try:
         stale_ids = scan_for_stale(mem_store)
         if stale_ids:
-            archived = archive_expired(mem_store, stale_ids, ctx)
+            archived = archive_expired(mem_store, stale_ids)
             result["stale"] = len(stale_ids)
             result["archived"] = archived
     except Exception as e:
