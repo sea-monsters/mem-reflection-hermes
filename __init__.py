@@ -1,6 +1,6 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.0-beta2 Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
+Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
 - store.py: SQLite-backed MemoryStore, Markdown cold storage, token estimation, CJK tokenizer
 - search.py: Three-layer retrieval (Recall → RRF/Weighted Fusion → Rerank), embedding engine
 - graph.py: GraphIndex -- Hebbian edges, spreading activation, PageRank, cross-zone analysis
@@ -22,8 +22,6 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -44,7 +42,6 @@ from .store import (  # noqa: F401
     _ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL,
     _VALID_ZONES, _PROJECT_ZONE_PREFIX,
     _ZONE_SPLIT_THRESHOLD, _ZONE_MERGE_THRESHOLD,
-    _write_queue, _pending_writes, _write_path_lock, _cancel_pending_write, _write_memory,
     _lineage_latest, _lineage_root, _lineage_depth, _lineage_cycle_check,
     _classify_update_intent, _is_expired, _is_context_mismatch,
 )
@@ -68,9 +65,7 @@ _sanitize_zone_filename = sanitize_zone_filename
 _read_memory = read_memory
 _normalize_zone = normalize_zone
 _fast_hash = fast_hash
-_async_write_memory = async_write_memory
 _batch_record_stats = batch_record_stats
-_stats_path = lambda: plugin_data_dir() / "memory-stats.jsonl"
 
 def _palace_instructions_enabled() -> bool:
     return bool(plugin_config().get("palace_instructions", True))
@@ -90,6 +85,11 @@ def _triggered_skill_cap() -> int:
 def _config_compaction() -> bool:
     """Check if episode compaction is enabled in plugin config (default: True)."""
     return bool(plugin_config().get("compaction", {}).get("enabled", True))
+
+
+def _curator_enabled() -> bool:
+    """Check if memory curator is enabled in plugin config (default: True)."""
+    return bool(plugin_config().get("curator", {}).get("enabled", True))
 
 logger = logging.getLogger(__name__)
 
@@ -534,14 +534,9 @@ def _get_skill_store() -> SkillStore:
     return _skill_store
 
 
-# Keep package-native helpers before star imports from submodules add wrappers
-# with the same names.
-_package_get_mem_store = _get_mem_store
-_package_get_skill_store = _get_skill_store
-_package_build_context_block = _build_context_block
-_package_normalize_zone = _normalize_zone
-_package_micro_reflection_enabled = _micro_reflection_enabled
-_package_estimate_tokens = _estimate_tokens
+# Runtime submodules are imported explicitly by register() and compatibility
+# entrypoints. Avoid package-root star imports so beta3 no longer exposes every
+# private tool/hook/reflection helper as a root-level symbol.
 
 # Re-export runtime tool handlers for dashboard / external consumers
 from .runtime_tools import _tool_srh_memory_write, _tool_srh_palace_zones  # noqa: E402
@@ -596,13 +591,11 @@ def register(ctx) -> None:
 from . import store as _storage_module      # noqa: E402
 from . import search as _search_module      # noqa: E402
 from . import graph as _graph_module        # noqa: E402
-from . import reflect as _reflection_module # noqa: E402
-from . import context as _context_module    # noqa: E402
+from . import reflect as _reflection_module  # noqa: E402
 
 _memory_store = None
 _search_index = None
 _graph_index = None
-_reflection_engine = None
 
 
 def _get_indexed_mem_store():
@@ -636,28 +629,6 @@ def _get_graph_index():
             _storage_module.plugin_data_dir() / "graph.db"
         )
     return _graph_index
-
-
-def _get_reflection_engine():
-    """Get the reflection engine."""
-    global _reflection_engine
-    if _reflection_engine is None:
-        _reflection_engine = _reflection_module.ReflectionEngine(
-            _get_indexed_mem_store(),
-            _get_search_index(),
-            _get_graph_index(),
-            log_path=_storage_module.plugin_data_dir() / "reflect-log.jsonl",
-        )
-    return _reflection_engine
-
-
-def _get_memory_context(query: str = "", max_tokens: int = 4000) -> str:
-    """Build context from memory, search, and skills."""
-    from .store import SkillStore
-    store = _get_indexed_mem_store()
-    search = _get_search_index()
-    skills = SkillStore(_storage_module.user_skills_dir(), _storage_module.project_skills_dir())
-    return _context_module.build_context(store, search, skills, query, max_tokens)
 
 
 def _get_indexed_skill_store():

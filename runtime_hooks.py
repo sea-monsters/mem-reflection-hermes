@@ -63,7 +63,7 @@ __all__ = [
 
 _plugin_ctx: Any = None
 _session_messages: Dict[str, List[Dict[str, Any]]] = {}
-_session_messages_lock = threading.Lock()  # H20: protect concurrent session access
+_session_messages_lock = threading.Lock()
 
 # ── Session lifecycle tracking (v0.16.0 enhanced hooks) ─────────
 _SessionState = dict  # lightweight runtime state bag
@@ -208,6 +208,17 @@ def _on_session_end(**kwargs) -> None:
         except Exception as _ce:
             logger.debug("Episode compaction skipped: %s", _ce)
 
+        # ── Memory curator (v1.2) — runs after compaction ─────
+        try:
+            from .memory_curator import _curator_enabled, _run_curator
+            mem_store = _lb("_get_mem_store")()
+            if _curator_enabled(mem_store):
+                cur_result = _run_curator(ctx, mem_store)
+                if cur_result.get("archived", 0) or cur_result.get("superseded", 0) or cur_result.get("similar", 0):
+                    logger.info("Memory curator: %s", cur_result.get("report", "done"))
+        except Exception as _cue:
+            logger.debug("Memory curator skipped: %s", _cue)
+
         _reset_current_session_memory_ids()
         _cleanup_session_state(session_id)
 
@@ -332,13 +343,19 @@ def _post_tool_call(**kwargs) -> None:
 
     mem_ids: List[str] = []
 
+    # Parse result once (shared by Dir A and graph enrichment)
+    result_obj: Any = None
+    try:
+        if isinstance(result, str):
+            result_obj = json.loads(result)
+        else:
+            result_obj = result
+    except Exception:
+        result_obj = None
+
     # ── Dir A: Bridge built-in memory writes to plugin store ──────────────
     if tool_name == "memory" and status != "error":
         try:
-            if isinstance(result, str):
-                result_obj = json.loads(result)
-            else:
-                result_obj = result
             if isinstance(result_obj, dict) and result_obj.get("success"):
                 action = args.get("action", "")
                 target = result_obj.get("target", "memory")
@@ -375,24 +392,15 @@ def _post_tool_call(**kwargs) -> None:
     if not any(t in tool_name for t in ("memory", "palace", "skill")):
         return
 
-    try:
-        if isinstance(result, str):
-            result_obj = json.loads(result)
-        else:
-            result_obj = result
-        if isinstance(result_obj, dict):
-            # Direct id fields
-            if "id" in result_obj:
-                mem_ids.append(result_obj["id"])
-            # Results array
-            for key in ("results", "memories", "chain", "graph_expanded"):
-                for item in result_obj.get(key, []):
-                    if isinstance(item, dict):
-                        mid = item.get("id") or item.get("memory_id")
-                        if mid:
-                            mem_ids.append(mid)
-    except Exception:
-        return
+    if isinstance(result_obj, dict):
+        if "id" in result_obj:
+            mem_ids.append(result_obj["id"])
+        for key in ("results", "memories", "chain", "graph_expanded"):
+            for item in result_obj.get(key, []):
+                if isinstance(item, dict):
+                    mid = item.get("id") or item.get("memory_id")
+                    if mid:
+                        mem_ids.append(mid)
 
     if len(mem_ids) >= 2:
         try:
