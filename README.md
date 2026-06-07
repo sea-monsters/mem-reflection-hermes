@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.2-beta** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive), v0.16.0 telemetry hooks, and episode compaction.
+**Current version: v1.2-beta** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive with tool-noise stripping), v0.16.0 telemetry hooks, episode compaction, and bidirectional memory bridge. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
@@ -20,8 +20,8 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Runtime Graph Memory**: GraphIndex-backed Hebbian co-occurrence learning, decay, PageRank, and adaptive retrieval
 - **Runtime Query APIs**: Dashboard/search query paths combine MemoryStore, search templates/cache, graph neighbors, and supersedes-aware recall
 - **PageRank**: Centrality scores for hub memory identification
-- **Query Templates & Cache**: 8 predefined patterns with TTL-based result caching
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
+- **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
 - **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + runtime search + zone analysis
 - **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
 - **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
@@ -35,17 +35,18 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | Document | Description |
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history from v0.1.0 to v1.2-beta |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
 | [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
-| [docs/review/DESIGN_EVALUATION.md](docs/review/DESIGN_EVALUATION.md) | Design-level evaluation of supersedes chains, graph memory, refinement, and recall |
-| [docs/design/PLAN_0_9_2_BETA2.md](docs/design/PLAN_0_9_2_BETA2.md) | Historical v0.9.2-beta2 development plan based on design-review gaps |
-| [docs/research/beta2-architecture.md](docs/research/beta2-architecture.md) | Current runtime module architecture and service wiring |
-| [docs/research/beta2-code-review.md](docs/research/beta2-code-review.md) | Current code review, fixes, and naming cleanup record |
-| [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Current test coverage map and host-contract smoke status |
-| [docs/review/CODE_REVIEW_v1.0-beta3_R1.md](docs/review/CODE_REVIEW_v1.0-beta3_R1.md) | v1.0-beta3 Round 1 cleanup/runtime code review |
-| [docs/review/CODE_REVIEW_v1.0-beta_R1.md](docs/review/CODE_REVIEW_v1.0-beta_R1.md) | v1.0-beta Round 1 code review with 19 CRITICAL and 52 HIGH fixes |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
+| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
+| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
+| [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
+| [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Test coverage map and host-contract smoke status |
+| [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
+| [docs/PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
 | [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
 

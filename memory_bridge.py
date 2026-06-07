@@ -92,7 +92,6 @@ def _hermes_home() -> Path:
 
 
 _BUILTIN_MEMORY_DIR_CACHE: Optional[Path] = None
-_BUILTIN_MEMORY_DIR_MTIME: float = 0.0
 
 
 def _get_builtin_memory_dir() -> Path:
@@ -277,40 +276,24 @@ def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
         pass
     return False
 
-
-def _find_plugin_entry_by_content(
-    body: str, mem_store,
-) -> Optional[Any]:
-    """Find a plugin store entry whose body matches exactly.
-
-    Returns the LoadedMemory or None.
-    """
-    if not hasattr(mem_store, "search"):
-        return None
-    try:
-        results = mem_store.search(body, k=5, include_history=False)
-        for r in results:
-            if r.body.strip() == body.strip():
-                return r
-    except Exception:
-        pass
-    return None
-
-
 def _find_plugin_entry_by_substring(
-    substring: str, mem_store,
+    substring: str, mem_store, zone: str = "",
 ) -> Optional[Any]:
-    """Find a plugin entry whose body *contains* the substring."""
+    """Find a plugin entry whose body *contains* the substring.
+
+    If ``zone`` is provided, restrict matches to that zone only.
+    """
     if not hasattr(mem_store, "search"):
         return None
     try:
         results = mem_store.search(substring, k=10, include_history=False)
         for r in results:
             if substring in r.body:
-                return r
-        # Fallback: scan core zone directly
-        if hasattr(mem_store, "list_by_zone"):
-            for r in mem_store.list_by_zone("core"):
+                if not zone or r.frontmatter.zone == zone:
+                    return r
+        # Fallback: scan target zone directly
+        if zone and hasattr(mem_store, "list_by_zone"):
+            for r in mem_store.list_by_zone(zone):
                 if substring in r.body:
                     return r
     except Exception:
@@ -423,11 +406,11 @@ def _do_mirror_builtin_to_plugin(
                 result["skipped"] += 1
                 return result
 
-            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store)
+            existing = _find_plugin_entry_by_substring(old_entry_text, mem_store, zone=plugin_zone)
             if existing is not None:
-                # Supersede the old entry
+                # Supersede the old entry (always write into target zone)
                 _write_to_plugin(
-                    mem_store, new_entry, existing.frontmatter.zone,
+                    mem_store, new_entry, plugin_zone,
                     supersedes=[existing.id()],
                 )
                 result["mirrored"] = 1
@@ -475,7 +458,7 @@ def _write_to_plugin(
         fm.supersedes = supersedes
         fm.supersedes_reason = "Auto-synced from built-in memory update"
     try:
-        mem_store.put("user", fm, body)
+        mem_store.put("user", fm, _refine_body(body))
     except ValueError:
         # Duplicate id (unlikely but guard)
         pass
@@ -539,29 +522,37 @@ def _do_mirror_plugin_to_builtin(
         result["reason"] = f"body too long ({len(body)} > {DIR_B_MAX_CHARS})"
         return result
 
-    # ── Supersedes: remove old entries from MEMORY.md ────────────────
+    # ── Atomic replace (remove old + append new in one lock) ────────
     if supersedes:
         old_bodies = _lookup_superseded_bodies(supersedes)
-        if old_bodies:
-            _remove_bodies_from_builtin("memory", old_bodies)
-
-    # ── Dedup ────────────────────────────────────────────────────────
-    if _is_duplicate_in_builtin(body, target="memory"):
-        _incr_stat("dir_b_skip_dup")
-        result["reason"] = "duplicate in MEMORY.md"
-        return result
-
-    # ── Write ────────────────────────────────────────────────────────
-    success = _append_to_builtin("memory", body)
-    if success:
-        _incr_stat("dir_b_mirror")
-        result["mirrored"] = True
-        result["target"] = "memory"
-        result["entry"] = body
+        # Atomically remove old entries and append the new body.
+        # If capacity would be exceeded, nothing is changed.
+        success = _replace_in_builtin("memory", old_bodies, body)
+        if not success:
+            # Check whether it failed because body was already present
+            if _is_duplicate_in_builtin(body, target="memory"):
+                _incr_stat("dir_b_skip_dup")
+                result["reason"] = "duplicate in MEMORY.md"
+            else:
+                _incr_stat("dir_b_skip_fallback")
+                result["reason"] = "replace failed (capacity or I/O)"
+            return result
     else:
-        _incr_stat("dir_b_skip_fallback")
-        result["reason"] = "append failed (capacity or I/O)"
+        # No old entries to remove — simple append
+        if _is_duplicate_in_builtin(body, target="memory"):
+            _incr_stat("dir_b_skip_dup")
+            result["reason"] = "duplicate in MEMORY.md"
+            return result
+        success = _append_to_builtin("memory", body)
+        if not success:
+            _incr_stat("dir_b_skip_fallback")
+            result["reason"] = "append failed (capacity or I/O)"
+            return result
 
+    _incr_stat("dir_b_mirror")
+    result["mirrored"] = True
+    result["target"] = "memory"
+    result["entry"] = body
     return result
 
 
@@ -586,27 +577,44 @@ def _lookup_superseded_bodies(supersedes: List[str]) -> List[str]:
     return bodies
 
 
-def _remove_bodies_from_builtin(target: str, bodies: List[str]) -> bool:
-    """Remove specific body texts from MEMORY.md/USER.md under lock.
+def _replace_in_builtin(target: str, remove_bodies: List[str], add_body: str) -> bool:
+    """Atomically remove entries and append a new entry under a single lock.
 
-    Rewrites the file excluding any entries whose exact (stripped) text
-    matches one of the given bodies. Returns True if at least one entry
-    was removed.
+    Pre-checks capacity after removals; if the append would exceed the
+    limit, nothing is modified and False is returned.  This prevents
+    the data-loss window where removals succeed but the append fails.
     """
-    if not bodies:
+    if not add_body:
         return False
     path = _builtin_path_for(target)
     if not path.exists():
-        return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    limits = {"memory": 2200, "user": 1375, "Memory": 2200, "User": 1375}
+    char_limit = limits.get(target, 2200)
 
     fd = _acquire_file_lock(path)
+    if fd is None:
+        return False
     try:
         entries = _read_builtin_entries(target)
         if not entries:
+            entries = []
+
+        # Remove old entries
+        filtered = [e for e in entries if e.strip() not in remove_bodies]
+
+        # Capacity check before committing
+        test_entries = filtered + [add_body]
+        new_total = len(ENTRY_DELIMITER.join(test_entries))
+        if new_total > char_limit:
+            logger.debug(
+                "Dir B replace skip (capacity): %s at ~%d/%d chars",
+                target, new_total, char_limit,
+            )
             return False
-        filtered = [e for e in entries if e.strip() not in bodies]
-        if len(filtered) == len(entries):
-            return False  # nothing removed
+
+        filtered.append(add_body)
         content = ENTRY_DELIMITER.join(filtered)
         path.write_text(content, encoding="utf-8")
         return True
@@ -674,3 +682,63 @@ def sync_builtin_to_plugin(mem_store) -> dict:
             result["synced"] += 1
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Body Refinement (v1.2) — tool-call noise stripping + smart truncation
+# ---------------------------------------------------------------------------
+
+
+def _refine_body(body: str, max_chars: int = 500) -> str:
+    """Strip tool-call noise and truncate long memory bodies.
+
+    Applied at bridge write and cold-store archive time so stored memories
+    contain clean, concise content rather than raw tool output.
+
+    Strips:
+      - Fenced code blocks with common language tags (json, python, yaml, etc.)
+      - [Tool: xxx] / [tool_output] markers
+      - Excess whitespace and blank lines
+    Then truncates at the nearest sentence boundary within max_chars.
+    """
+    import re
+
+    text = body.strip()
+    if not text:
+        return text
+
+    # Strip fenced code blocks (json/python/yaml/xml/bash/sql/text/markdown)
+    text = re.sub(
+        r"```(?:json|python|yaml|xml|bash|sql|text|markdown|toml|ini|sh|shell|console)\s*\n.*?\n```",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Strip [Tool: xxx] / [tool_output] inline markers
+    text = re.sub(r"\[Tool:?\s*\w+\]", "", text)
+    text = re.sub(r"\[tool_output\].*?\[/tool_output\]", "", text, flags=re.DOTALL)
+
+    # Strip "Tool xxx result:" / "Tool xxx returned:" prefixed text
+    text = re.sub(r"Tool\s+\w+\s+(?:result|output|returned):\s*", "", text)
+
+    # Collapse excess whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = text.strip()
+
+    # Smart truncation — break at sentence boundary
+    if len(text) > max_chars:
+        truncated = text[:max_chars]
+        last_period = truncated.rfind(".")
+        last_question = truncated.rfind("?")
+        last_break = max(last_period, last_question)
+        last_space = truncated.rfind(" ")
+        if last_break > max_chars * 0.7:
+            text = text[: last_break + 1] + " .."
+        elif last_space > max_chars * 0.5:
+            text = text[:last_space] + " .."
+        else:
+            text = truncated + " .."
+
+    return text

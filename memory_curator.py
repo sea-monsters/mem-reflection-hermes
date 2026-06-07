@@ -22,6 +22,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from .memory_bridge import _refine_body
+except ImportError:
+    def _refine_body(body: str, max_chars: int = 500) -> str:
+        return body.strip()[:max_chars]
+
 logger = logging.getLogger(__name__)
 
 # ── Config keys ────────────────────────────────────────────────
@@ -260,7 +266,7 @@ def archive_expired(mem_store, memory_ids: List[str], ctx=None) -> int:
             continue
         entry = {
             "id": mid,
-            "body": mem.body,
+            "body": _refine_body(mem.body),
             "zone": mem.frontmatter.zone,
             "archived_at": datetime.now(timezone.utc).isoformat(),
             "tags": list(mem.frontmatter.tags or []) + ["archived", "cold"],
@@ -316,7 +322,7 @@ def archive_superseded(mem_store) -> int:
             continue  # Recently accessed, keep
         entry = {
             "id": mid,
-            "body": mem.body,
+            "body": _refine_body(mem.body),
             "zone": fm.zone,
             "archived_at": datetime.now(timezone.utc).isoformat(),
             "tags": list(fm.tags or []) + ["archived", "cold", "superseded"],
@@ -478,11 +484,26 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         logger.warning("Curator similarity scan failed: %s", e)
 
     result["errors"] = errors
-    result["report"] = generate_report(
+    report_text = generate_report(
         stale_count=result["stale"],
         archived_count=result["archived"],
         superseded_count=result["superseded"],
         similar_pairs=result["similar"],
         errors=errors,
     )
+    result["report"] = report_text
+    # Persist the last run report for dashboard consumption
+    try:
+        report_path = _cold_store_path(mem_store).with_suffix(".report.json")
+        report_path.write_text(json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "report": report_text,
+            "stale": result["stale"],
+            "archived": result["archived"],
+            "superseded": result["superseded"],
+            "similar": result["similar"],
+            "errors": result["errors"],
+        }, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception:
+        pass
     return result

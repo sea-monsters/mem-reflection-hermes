@@ -259,6 +259,85 @@ class TestStatsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Curator Dashboard (v1.2)
+# ---------------------------------------------------------------------------
+
+class TestCuratorEndpoint:
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_not_available(self, temp_dashboard):
+        """When memory_curator module is missing, curator returns available=False."""
+        client, store, graph = temp_dashboard
+        resp = client.get("/api/curator")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is False
+        assert "error" in data
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_available(self, temp_dashboard):
+        """With memory_curator loaded, return config + cold storage stats."""
+        client, store, graph = temp_dashboard
+        # Register memory_curator module for this test
+        _spec_cur = importlib.util.spec_from_file_location(
+            "mem_reflection_hermes.memory_curator",
+            str(_REPO / "memory_curator.py"),
+        )
+        _cur_mod = importlib.util.module_from_spec(_spec_cur)
+        sys.modules["mem_reflection_hermes.memory_curator"] = _cur_mod
+        # Patch srh to point the existing mock at curator helpers
+        _srh_mock = sys.modules.get("mem_reflection_hermes")
+        if _srh_mock and hasattr(_srh_mock, "_get_mem_store"):
+            pass  # mock is already set up
+        _spec_cur.loader.exec_module(_cur_mod)  # type: ignore
+        try:
+            resp = client.get("/api/curator")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["available"] is True
+            assert "enabled" in data
+            assert "config" in data
+            assert "cold_storage" in data
+            assert "last_run" in data
+        finally:
+            sys.modules.pop("mem_reflection_hermes.memory_curator", None)
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_report_persisted(self, temp_dashboard):
+        """When _run_curator has saved a report, last_run populates."""
+        client, store, graph = temp_dashboard
+        # Register memory_curator module
+        _spec_cur = importlib.util.spec_from_file_location(
+            "mem_reflection_hermes.memory_curator",
+            str(_REPO / "memory_curator.py"),
+        )
+        _cur_mod = importlib.util.module_from_spec(_spec_cur)
+        sys.modules["mem_reflection_hermes.memory_curator"] = _cur_mod
+        _spec_cur.loader.exec_module(_cur_mod)  # type: ignore
+        try:
+            # Write a cached report
+            cold_path = _cur_mod._cold_store_path(store)
+            report_path = cold_path.with_suffix(".report.json")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps({
+                "timestamp": "2026-06-07T00:00:00Z",
+                "report": "curator: stale: 5 archived",
+                "stale": 5,
+                "archived": 3,
+                "superseded": 1,
+                "similar": 0,
+                "errors": [],
+            }), encoding="utf-8")
+            resp = client.get("/api/curator")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["last_run"] is not None
+            assert data["last_run"]["report"] == "curator: stale: 5 archived"
+            assert data["last_run"]["stale"] == 5
+        finally:
+            sys.modules.pop("mem_reflection_hermes.memory_curator", None)
+
+
+# ---------------------------------------------------------------------------
 # Reflections
 # ---------------------------------------------------------------------------
 

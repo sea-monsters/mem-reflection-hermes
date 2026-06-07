@@ -24,6 +24,7 @@ from memory_bridge import (
     _is_duplicate_in_builtin,
     _is_duplicate_in_plugin,
     _read_builtin_entries,
+    _refine_body,
     bridge_enabled,
     get_bridge_stats,
     mirror_builtin_to_plugin,
@@ -417,5 +418,77 @@ class TestStats:
         stats = get_bridge_stats()
         for v in stats.values():
             assert v == 0
+
+
+# =====================================================================
+# Body Refinement (v1.2)
+# =====================================================================
+
+
+class TestRefineBody:
+    """Test _refine_body tool-call noise stripping + truncation."""
+
+    def test_strips_fenced_code_block(self):
+        body = 'User likes Python\n```json\n{"key": "value"}\n```\nThis is fine'
+        result = _refine_body(body)
+        assert "```json" not in result
+        assert '{"key": "value"}' not in result
+        assert "User likes Python" in result
+        assert "This is fine" in result
+
+    def test_strips_tool_marker(self):
+        body = "[Tool: search] found the answer"
+        result = _refine_body(body)
+        assert "[Tool:" not in result
+        assert "found the answer" in result
+
+    def test_strips_tool_output_tag(self):
+        body = "Before [tool_output]lots of noise[/tool_output] After"
+        result = _refine_body(body)
+        assert "[tool_output]" not in result
+        assert "Before" in result
+        assert "After" in result
+
+    def test_collapses_excess_whitespace(self):
+        body = "Line 1\n\n\n\nLine 2\n   \nLine 3"
+        result = _refine_body(body, max_chars=2000)
+        assert "\n\n\n" not in result
+        assert "Line 1" in result
+        assert "Line 2" in result
+
+    def test_truncates_long_body(self):
+        body = "A." + "x" * 600 + " B."
+        result = _refine_body(body, max_chars=100)
+        assert len(result) < 150
+        assert result.endswith("..")
+
+    def test_strips_tool_result_prefix(self):
+        body = "Tool search result: the sky is blue"
+        result = _refine_body(body)
+        assert "the sky is blue" in result
+        assert "Tool search" not in result
+
+    def test_preserves_clean_body(self):
+        body = "User prefers dark mode in all applications"
+        result = _refine_body(body)
+        assert result == body
+
+    def test_empty_body(self):
+        assert _refine_body("") == ""
+        assert _refine_body("   ") == ""
+
+    def test_strips_multiple_code_blocks(self):
+        body = (
+            "Summary:\n"
+            '```json\n{"a": 1}\n```\n'
+            "More:\n"
+            '```python\nx = 1\n```\n'
+            "Done"
+        )
+        result = _refine_body(body)
+        assert "```json" not in result
+        assert "```python" not in result
+        assert "Summary:" in result
+        assert "Done" in result
 
 

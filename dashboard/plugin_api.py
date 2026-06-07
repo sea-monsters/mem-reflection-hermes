@@ -697,6 +697,77 @@ async def get_stats():
 
 
 # ---------------------------------------------------------------------------
+# Curator Dashboard (v1.2)
+# ---------------------------------------------------------------------------
+
+@router.get("/curator")
+async def get_curator():
+    """Return memory curator status and latest run report."""
+    store = _get_store()
+    result: Dict[str, Any] = {"available": False}
+
+    # Try to load the curator module
+    curator = None
+    try:
+        from ..memory_curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+        curator = True
+    except Exception:
+        try:
+            from mem_reflection_hermes.memory_curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+            curator = True
+        except Exception:
+            curator = None
+
+    if curator is None:
+        result["error"] = "memory_curator module not loaded"
+        return result
+
+    try:
+        result["enabled"] = _curator_enabled(store)
+    except Exception:
+        result["enabled"] = False
+
+    try:
+        result["config"] = _curator_config(store)
+    except Exception:
+        result["config"] = {}
+
+    # Cold storage stats
+    try:
+        cold_path = _cold_store_path(store)
+        if cold_path.exists():
+            size_mb = round(cold_path.stat().st_size / (1024 * 1024), 2)
+            entries = _load_cold_store(store)
+            result["cold_storage"] = {
+                "path": str(cold_path),
+                "size_mb": size_mb,
+                "entry_count": len(entries),
+                "cap_mb": result.get("config", {}).get("cold_storage", {}).get("max_archive_size_mb", 10),
+            }
+            if entries:
+                result["cold_storage"]["oldest_entry"] = entries[0].get("archived_at", "unknown")
+                result["cold_storage"]["newest_entry"] = entries[-1].get("archived_at", "unknown")
+        else:
+            result["cold_storage"] = {"path": str(cold_path), "size_mb": 0, "entry_count": 0}
+    except Exception as e:
+        result["cold_storage"] = {"error": str(e)}
+
+    # Last run report
+    try:
+        report_path = _cold_store_path(store).with_suffix(".report.json")
+        if report_path.exists():
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            result["last_run"] = report_data
+        else:
+            result["last_run"] = None
+    except Exception:
+        result["last_run"] = None
+
+    result["available"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CLUQI Query (v0.9.2)
 # ---------------------------------------------------------------------------
 
