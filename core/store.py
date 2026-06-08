@@ -50,6 +50,7 @@ CONFIG_KEY_SKILL_INDEX_CAP = "skill_index_cap"
 CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
 CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
 CONFIG_KEY_INTENT_PROTOTYPES = "intent_prototypes"
+CONFIG_KEY_RERANKER = "reranker"
 
 # ---------------------------------------------------------------------------
 # Config & paths (with mtime-aware caching)
@@ -1641,7 +1642,12 @@ class MemoryStore:
                     sys.modules["_memory_search_module"] = mod
                     spec.loader.exec_module(mod)
                 SearchIndex = mod.SearchIndex
-            self._search_index = SearchIndex(self, graph=self._graph)
+            try:
+                from .reranker import _build_reranker
+                reranker = _build_reranker(plugin_config().get(CONFIG_KEY_RERANKER, {}))
+            except Exception:
+                reranker = None
+            self._search_index = SearchIndex(self, graph=self._graph, reranker=reranker)
         return self._search_index
 
     def set_graph(self, graph) -> None:

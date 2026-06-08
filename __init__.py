@@ -1,6 +1,6 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.2-beta Architecture (organized by functionality):
+v1.2-beta2 Architecture (organized by functionality):
 - core/: SQLite storage, search engine, graph index (3,650 LOC)
 - reflection/: Reflection engine and runtime (2,503 LOC)
 - memory/: Curation, bridge, context assembly (1,783 LOC)
@@ -213,7 +213,11 @@ def _get_search_index():
         with _search_lock:
             if _search_index is None:
                 from .core.search import SearchIndex
-                _search_index = SearchIndex(_get_mem_store())
+                from .core.reranker import _build_reranker
+                from .core.store import plugin_config, CONFIG_KEY_RERANKER
+                cfg = plugin_config()
+                reranker = _build_reranker(cfg.get(CONFIG_KEY_RERANKER, {}))
+                _search_index = SearchIndex(_get_mem_store(), reranker=reranker)
     return _search_index
 
 
