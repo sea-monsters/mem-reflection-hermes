@@ -595,9 +595,10 @@ class SearchIndex:
         cache_ttl: TTL cache for search results (seconds)
     """
 
-    def __init__(self, store, graph=None, cache_ttl: int = 60):
+    def __init__(self, store, graph=None, cache_ttl: int = 60, reranker=None):
         self.store = store
         self._graph = graph  # GraphIndex, optional — enables Hebbian boost
+        self._reranker = reranker  # BaseReranker, optional — second-stage rerank
         self._embed_array: Optional[Any] = None  # numpy array, rebuilt lazily
         self._embed_ids: List[str] = []
         self._embed_version = 0
@@ -903,6 +904,13 @@ class SearchIndex:
 
         reranked.sort(key=lambda x: x[0], reverse=True)
         results = [m for _, m in reranked]
+
+        # Optional second-stage reranker (cross-encoder / Cohere)
+        if self._reranker is not None:
+            try:
+                results = self._reranker.rerank(query, results, top_k=k * 2)
+            except Exception as e:
+                logger.warning("Reranker failed, continuing with fusion order: %s", e)
 
         # MMR diversity re-ranking (optional, λ=0.7 balances relevance vs diversity)
         if k > 1:
