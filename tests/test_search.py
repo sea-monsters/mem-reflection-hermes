@@ -18,7 +18,7 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "core" / "store.py"))
 _store = importlib.util.module_from_spec(_spec_store)
 sys.modules["_store"] = _store
 _spec_store.loader.exec_module(_store)
@@ -26,13 +26,13 @@ MemoryStore = _store.MemoryStore
 MemoryFrontmatter = _store.MemoryFrontmatter
 LoadedMemory = _store.LoadedMemory
 
-_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "search.py"))
+_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "core" / "search.py"))
 _search = importlib.util.module_from_spec(_spec_search)
 sys.modules["_search"] = _search
 _spec_search.loader.exec_module(_search)
 SearchIndex = _search.SearchIndex
 
-_spec_graph = importlib.util.spec_from_file_location("_graph", str(_REPO / "graph.py"))
+_spec_graph = importlib.util.spec_from_file_location("_graph", str(_REPO / "core" / "graph.py"))
 _graph = importlib.util.module_from_spec(_spec_graph)
 sys.modules["_graph"] = _graph
 _spec_graph.loader.exec_module(_graph)

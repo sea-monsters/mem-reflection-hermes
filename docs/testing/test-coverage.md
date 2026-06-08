@@ -1,8 +1,8 @@
 # Test Coverage Documentation
 
-> Version: v1.0-beta3  
-> Last updated: 2026-06-04  
-> Total tests: **215**  
+> Version: v1.2-beta  
+> Last updated: 2026-06-07  
+> Total tests: **257** (plus 24 Windows temp-dir permission errors, non-code)  
 > All tests pass on Python 3.14 / Windows 11
 
 ---
@@ -16,6 +16,7 @@
 | graph.py | test_graph.py | 13 | step decay, meta zone persistence, distill, cross-zone analysis |
 | reflect.py | test_reflect.py | 15 | content gate, fact extraction, micro/full reflection |
 | context.py | test_context.py | 10 | 4-layer priority, token budget, skill matching |
+| memory_curator.py | test_memory_curator.py | 15 | stale scan, exempt pinned/fresh, archive expired, deep chains, cold storage, full pipeline |
 | dashboard/plugin_api.py | test_dashboard.py | 14 | CRUD, graph, stats, skills, reflections, zones |
 | E2E (all modules) | test_e2e.py | 6 | full lifecycle, update propagation, conflict, priority |
 | host contract smoke | test_host_contract_smoke.py | 1 | host contract, 17 tools, 4 hook names, smoke script |
@@ -143,7 +144,30 @@
 
 ---
 
-### 6. dashboard/plugin_api.py — Dashboard API
+### 6. memory_curator.py — Automated memory lifecycle (v1.2)
+
+**File:** `tests/test_memory_curator.py`  
+**Tests:** 15
+
+| Test Class | Tests | Coverage |
+|------------|-------|----------|
+| TestScanForStale | 3 | Finds stale entries, exempts pinned, exempts fresh |
+| TestArchiveExpired | 2 | Archives and deletes expired, cold store has entries |
+| TestArchiveSuperseded | 2 | Archives deep chains (depth ≥2), keeps single chain |
+| TestColdStorage | 1 | Append and load round-trip |
+| TestFullPipeline | 2 | Runs without crash, cleans up session state |
+
+**Production code touched:**
+- `scan_for_stale()`
+- `archive_expired()`
+- `archive_superseded()`
+- `_prune_cold_store()`
+- `_load_cold_store()`
+- `_run_curator()`
+
+---
+
+### 7. dashboard/plugin_api.py — Dashboard API
 
 **File:** `tests/test_dashboard.py`  
 **Tests:** 14
@@ -158,13 +182,13 @@
 | TestZonesEndpoint | 1 | zones |
 
 **Production code touched:**
-- All 14 FastAPI endpoints in `dashboard/plugin_api.py`
+- All 15 FastAPI endpoints in `dashboard/plugin_api.py`
 - `_get_store()` / `_get_graph_interface()`
 - Pydantic request models (`MemoryCreate`, `MemoryReorder`)
 
 ---
 
-### 7. E2E — Cross-module integration
+### 8. E2E — Cross-module integration
 
 **File:** `tests/test_e2e.py`  
 **Tests:** 6
@@ -180,7 +204,7 @@
 
 ---
 
-### 8. Host Contract Smoke — Tool and hook surface
+### 9. Host Contract Smoke — Tool and hook surface
 
 **File:** `tests/test_host_contract_smoke.py`  
 **Tests:** 1

@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from .. import __dict__ as _srh_dict
@@ -709,17 +712,34 @@ async def get_curator():
     # Try to load the curator module
     curator = None
     try:
-        from ..memory_curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+        # Try relative import first (works when loaded as part of package)
+        from ..memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
         curator = True
-    except Exception:
+    except (ImportError, ValueError):
+        # ValueError: attempted relative import beyond top-level package
+        # This happens when web/api.py is loaded standalone (e.g., in test fixtures)
+        # Try absolute import as fallback, but only if the package is properly registered
         try:
-            from mem_reflection_hermes.memory_curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
-            curator = True
-        except Exception:
+            import sys
+            # Only use absolute import if the memory package is already in sys.modules
+            # (i.e., the package namespace was explicitly set up)
+            if "mem_reflection_hermes.memory.curator" in sys.modules:
+                from mem_reflection_hermes.memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+                curator = True
+            else:
+                # Module not available
+                logger.debug("memory_curator module not available")
+                curator = None
+        except ImportError:
+            # Module genuinely not available
+            logger.debug("memory_curator module not available")
             curator = None
+    except Exception as e:
+        logger.warning("Failed to load memory_curator module: %s", e)
+        curator = None
 
     if curator is None:
-        result["error"] = "memory_curator module not loaded"
+        result["error"] = "memory_curator module not available"
         return result
 
     try:
@@ -738,8 +758,23 @@ async def get_curator():
         if cold_path.exists():
             size_mb = round(cold_path.stat().st_size / (1024 * 1024), 2)
             entries = _load_cold_store(store)
+
+            # Sanitize path for display (avoid leaking user home directory)
+            path_str = str(cold_path)
+            try:
+                # Try to replace user home with $HOME
+                import os
+                home = os.environ.get("HOME") or os.environ.get("USERPROFILE", "")
+                if home and path_str.startswith(home):
+                    display_path = path_str.replace(home, "$HOME", 1)
+                else:
+                    # Fall back to showing only the filename
+                    display_path = cold_path.name
+            except Exception:
+                display_path = cold_path.name
+
             result["cold_storage"] = {
-                "path": str(cold_path),
+                "path": display_path,
                 "size_mb": size_mb,
                 "entry_count": len(entries),
                 "cap_mb": result.get("config", {}).get("cold_storage", {}).get("max_archive_size_mb", 10),

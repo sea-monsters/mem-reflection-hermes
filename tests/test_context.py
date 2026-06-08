@@ -20,7 +20,7 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "core" / "store.py"))
 _store = importlib.util.module_from_spec(_spec_store)
 sys.modules["_store"] = _store
 _spec_store.loader.exec_module(_store)
@@ -30,13 +30,13 @@ LoadedMemory = _store.LoadedMemory
 SkillFrontmatter = _store.SkillFrontmatter
 LoadedSkill = _store.LoadedSkill
 
-_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "search.py"))
+_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "core" / "search.py"))
 _search = importlib.util.module_from_spec(_spec_search)
 sys.modules["_search"] = _search
 _spec_search.loader.exec_module(_search)
 SearchIndex = _search.SearchIndex
 
-_spec_context = importlib.util.spec_from_file_location("_context", str(_REPO / "context.py"))
+_spec_context = importlib.util.spec_from_file_location("_context", str(_REPO / "memory" / "context.py"))
 _context = importlib.util.module_from_spec(_spec_context)
 sys.modules["_context"] = _context
 _spec_context.loader.exec_module(_context)
@@ -225,9 +225,14 @@ class TestFormatting:
         store.put("user", fm, "a" * 1000)
         mem = store.get(fm.id)
         formatted = _context._format_memory(mem, max_tokens=10)
-        # Should be shorter than full body
-        assert len(formatted) < len(mem.body)
+        # Should contain the zone prefix
         assert "[general]" in formatted
+        # The body portion should be truncated (not the full 1000 chars)
+        # Extract body from formatted: "- [general] <body>"
+        lines = formatted.split('\n')
+        body_line = lines[0]  # First line contains the body
+        body_portion = body_line.split('] ', 1)[1] if '] ' in body_line else body_line
+        assert len(body_portion) < len(mem.body)
 
     def test_format_skill_basic(self, temp_store, temp_skills_dir):
         """Skill formatting includes name and description."""

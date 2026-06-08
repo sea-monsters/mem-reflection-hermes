@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: 17 registered tools (v1.0-beta3).
+Current SRH tool surface: 17 registered tools (v1.2-beta).
 
 Graph-related capabilities are exposed both as SRH tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`) and through the dashboard API.
 

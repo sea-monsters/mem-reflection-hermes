@@ -19,7 +19,7 @@ from typing import Dict, Optional
 
 import pytest
 
-from store import (
+from core.store import (
     MemoryFrontmatter,
     MemoryEffectiveness,
     LoadedMemory,

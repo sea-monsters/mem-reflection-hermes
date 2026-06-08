@@ -23,8 +23,8 @@ if "mem_reflection_hermes" not in sys.modules:
     sys.modules["mem_reflection_hermes"] = mod
     spec.loader.exec_module(mod)
 
-from mem_reflection_hermes.runtime_graph import GraphStore
-from store import MemoryStore, MemoryFrontmatter
+from mem_reflection_hermes.runtime.graph import GraphStore
+from core.store import MemoryStore, MemoryFrontmatter
 
 
 def test_runtime_graph_surface():

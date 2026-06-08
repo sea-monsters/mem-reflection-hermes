@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from graph.compat import GraphStore
+from mem_reflection_hermes.runtime.graph import GraphStore
 
 
 class TestEdgeCRUD:

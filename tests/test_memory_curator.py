@@ -98,7 +98,7 @@ class MockStore:
 # Import curator module under test
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from memory_curator import (  # noqa: E402
+from memory.curator import (  # noqa: E402
     scan_for_stale,
     archive_expired,
     archive_superseded,
@@ -108,7 +108,7 @@ from memory_curator import (  # noqa: E402
     _run_curator,
     generate_report,
 )
-from memory_curator import _append_to_cold_store, _curator_config  # noqa: E402
+from memory.curator import _append_to_cold_store, _curator_config  # noqa: E402
 
 
 @pytest.fixture

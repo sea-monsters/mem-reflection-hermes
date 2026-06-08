@@ -20,6 +20,14 @@ All public mutation methods on `MemoryStore` are guarded with `RLock` to prevent
 
 All silent failure paths (async write flush, stat recording, effectiveness loading, embedding fallback, graph operations) log at `logger.warning` level in production. Debug-level logging is reserved for non-critical cleanup operations (e.g., WAL checkpoint during close).
 
+## Cold Storage Safety (v1.2)
+
+The curator's cold storage engine uses write-then-swap for JSONL rewrites:
+
+- **Prune rewrite**: Reads entire cold store, filters entries, writes to `.tmp`, then `os.replace()` atomically swaps — prevents partial JSONL corruption.
+- **Append**: Uses `_cold_store_lock` to serialize concurrent append operations.
+- **OSError handling**: Write failures log `logger.warning` (never silent) so operators can detect disk-full or permission issues.
+
 ## Known Issues
 
 ### ONNX Fallback Cache Guard (Known, P3)

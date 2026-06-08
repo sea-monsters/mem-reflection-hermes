@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .store import (
+from ..core.store import (
     LoadedMemory, MemoryFrontmatter,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
     user_skills_dir as _user_skills_dir,
@@ -22,27 +22,11 @@ from .store import (
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
 )
-try:
-    from .search import (
-        _embed_single, _cosine_sim, _extract_keywords,
-        _is_explicit_memory_intent, _is_correction, _is_procedure,
-        _classify_intent,
-    )
-except ImportError:
-    import importlib.util as _i_util
-    from pathlib import Path as _Path
-    _search_path = _Path(__file__).resolve().parent / "search.py"
-    _spec = _i_util.spec_from_file_location(
-        "mem_reflection_hermes.search", str(_search_path))
-    _search_mod = _i_util.module_from_spec(_spec)
-    _spec.loader.exec_module(_search_mod)
-    _embed_single = _search_mod._embed_single
-    _cosine_sim = _search_mod._cosine_sim
-    _extract_keywords = _search_mod._extract_keywords
-    _is_explicit_memory_intent = _search_mod._is_explicit_memory_intent
-    _is_correction = _search_mod._is_correction
-    _is_procedure = _search_mod._is_procedure
-    _classify_intent = _search_mod._classify_intent
+from ..core.search import (
+    _embed_single, _cosine_sim, _extract_keywords,
+    _is_explicit_memory_intent, _is_correction, _is_procedure,
+    _classify_intent,
+)
 
 logger = logging.getLogger(__name__)
 

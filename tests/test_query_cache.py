@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
-_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "search.py"))
+_spec_search = importlib.util.spec_from_file_location("_search", str(_REPO / "core" / "search.py"))
 _search = importlib.util.module_from_spec(_spec_search)
 sys.modules["_search"] = _search
 assert _spec_search is not None and _spec_search.loader is not None

@@ -17,7 +17,7 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from memory_bridge import (
+from memory.bridge import (
     _append_to_builtin,
     _char_count_builtin,
     _get_builtin_memory_dir,
@@ -180,7 +180,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_core_zone_and_short_body(self, tmp_path, monkeypatch):
         """Zone=core with short body should write to MEMORY.md."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "Testing is essential for software quality"
@@ -198,7 +198,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_non_core_zone_skipped(self, tmp_path, monkeypatch):
         """Non-core zones should not trigger Dir B."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "This is a work-related note"
@@ -211,7 +211,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_long_body_skipped(self, tmp_path, monkeypatch):
         """Bodies longer than DIR_B_MAX_CHARS should not sync."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "A" * 300  # > 200 char limit
@@ -224,7 +224,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_duplicate_skipped(self, tmp_path, monkeypatch):
         """Already-existing content should not be duplicated."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "This entry already exists"
@@ -241,7 +241,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_empty_body_noop(self, tmp_path, monkeypatch):
         """Empty body should not write anything."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         result = mirror_plugin_to_builtin(body="", zone="core")
@@ -250,7 +250,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_capacity_check(self, tmp_path, monkeypatch):
         """When MEMORY.md is near capacity, new entries should be rejected."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         # Fill MEMORY.md over capacity (memory limit is 2200 chars)
@@ -273,7 +273,7 @@ class TestBuiltinFileOps:
     def test_read_builtin_entries_missing_file(self, tmp_path, monkeypatch):
         """Non-existent file returns empty list."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         entries = _read_builtin_entries("memory")
@@ -282,7 +282,7 @@ class TestBuiltinFileOps:
     def test_read_builtin_entries_parses_delimiter(self, tmp_path, monkeypatch):
         """Entries separated by § should be correctly parsed."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         mem_path = tmp_path / "MEMORY.md"
@@ -296,7 +296,7 @@ class TestBuiltinFileOps:
     def test_is_duplicate_in_builtin_exists(self, tmp_path, monkeypatch):
         """Should detect existing entry."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "test dupe")
@@ -305,7 +305,7 @@ class TestBuiltinFileOps:
     def test_is_duplicate_in_builtin_missing(self, tmp_path, monkeypatch):
         """Should return False for non-existent entry."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         assert _is_duplicate_in_builtin("nonexistent") is False
@@ -313,7 +313,7 @@ class TestBuiltinFileOps:
     def test_append_to_builtin_adds_entry(self, tmp_path, monkeypatch):
         """Appending should write to the file."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         result = _append_to_builtin("memory", "new entry")
@@ -325,7 +325,7 @@ class TestBuiltinFileOps:
     def test_append_to_builtin_duplicate(self, tmp_path, monkeypatch):
         """Duplicate append should be rejected."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "dupe entry")
@@ -335,7 +335,7 @@ class TestBuiltinFileOps:
     def test_char_count_calculation(self, tmp_path, monkeypatch):
         """Char count should reflect total delimited size."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "hello")
@@ -345,7 +345,7 @@ class TestBuiltinFileOps:
     def test_user_target_ops(self, tmp_path, monkeypatch):
         """USER.md operations should work independently."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("user", "user detail")

@@ -5,6 +5,11 @@ __pycache__/
 *.so
 .Python
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Virtual environments
 venv/
 env/
@@ -20,6 +25,12 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Temporary files
+.omo/
+*.bak
+*.tmp
+fix_decay.py
+
 # Sync script (local only)
 sync-to-github.sh
 memory-stats.jsonl
@@ -31,4 +42,17 @@ AGENTS.md
 .rtk/
 
 # Session memory (local AI assistant state)
+# NOTE: memory/ is a package dir, so we use !negation to track it.
+# The pattern below only ignores files *inside* the memory dir, not the dir itself
+# when it's tracked via explicit add.
 memory/
+
+# Package dirs (tracked) — negate any blanket ignores
+!/core/
+!/reflection/
+!/memory/
+!/runtime/
+!/web/
+
+# Local review artifacts (not for git)
+docs/review/

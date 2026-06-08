@@ -112,7 +112,8 @@ valid and readable.
 │   │       └── SKILL.md
 │   ├── zone-cache/                   # Per-zone summary caches
 │   ├── palace-index.md              # Palace zone index
-│   └── memory-stats.jsonl           # Effectiveness tracking
+│   ├── memory-stats.jsonl           # Effectiveness tracking
+│   └── cold_store.jsonl             # Curator cold storage archive (v1.2)
 ├── plugins/
 │   └── mem-reflection-hermes/
 │       ├── __init__.py              # Plugin registration and runtime singletons
@@ -120,6 +121,8 @@ valid and readable.
 │       ├── search.py                # SearchIndex, embeddings, query templates/cache
 │       ├── graph.py                 # GraphIndex, PageRank, cross-zone analysis
 │       ├── reflect.py               # ReflectionEngine public facade
+│       ├── memory_bridge.py         # Bidirectional host memory sync (v1.1)
+│       ├── memory_curator.py        # Automated lifecycle curation (v1.2)
 │       ├── runtime_tools.py         # 12 base SRH tool handlers
 │       ├── runtime_hooks.py         # Hooks and slash commands
 │       ├── runtime_graph.py         # Graph/health tools and graph compat surface
@@ -134,7 +137,7 @@ valid and readable.
 │       │   └── bench_latency.py     # Performance benchmark
 │       ├── PERF_REPORT.md           # Optimization report
 │       └── dashboard/
-│           ├── plugin_api.py        # FastAPI routes (14 endpoints)
+│           ├── plugin_api.py        # FastAPI routes (15 endpoints)
 │           ├── dist/index.js        # React frontend (Memory Manager)
 │           └── manifest.json         # Dashboard tab registration
 └── models/                          # ONNX model (optional)

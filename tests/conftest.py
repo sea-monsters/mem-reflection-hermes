@@ -1,22 +1,72 @@
 """conftest.py — Shared test fixtures for mem-reflection-hermes test suite."""
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
+
+
+def pytest_configure(config):
+    """Override basetemp to avoid Windows ACL issues with default pytest-of-<user> dir.
+
+    On Windows, the default pytest temp directory (pytest-of-<user>) can accumulate
+    stale ACLs from other processes, causing PermissionError during test setup.
+    Using a plugin-specific basetemp avoids this entirely and works on all platforms.
+    """
+    if config.option.basetemp is None:
+        config.option.basetemp = str(Path(tempfile.gettempdir()) / "hermes_pytest")
+
 
 # Ensure project root is importable
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from graph.compat import GraphStore
-from store import LoadedMemory, MemoryEffectiveness, MemoryFrontmatter, MemoryStore
+# Register mem_reflection_hermes package so relative imports in submodules work
+if "mem_reflection_hermes" not in sys.modules:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes",
+        str(_REPO / "__init__.py"),
+        submodule_search_locations=[str(_REPO)],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["mem_reflection_hermes"] = mod
+    spec.loader.exec_module(mod)
+
+from mem_reflection_hermes.runtime.graph import GraphStore
+from mem_reflection_hermes.core.store import LoadedMemory, MemoryEffectiveness, MemoryFrontmatter, MemoryStore
 
 # Import helpers (exposed for fixtures)
 from tests._helpers import make_memory, make_memory_with_id, effectiveness_for
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform temp directory cleanup
+# ---------------------------------------------------------------------------
+
+def _rmtree_safe(path: Path, retries: int = 8, delay: float = 0.15) -> None:
+    """Remove a directory tree with Windows-compatible retry logic.
+
+    Windows holds file handles on SQLite WAL/SHM files transiently.
+    Retry with exponential backoff to avoid PermissionError on cleanup.
+    """
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(str(path))
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+            else:
+                shutil.rmtree(str(path), ignore_errors=True)
+        except FileNotFoundError:
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -25,8 +75,36 @@ from tests._helpers import make_memory, make_memory_with_id, effectiveness_for
 
 @pytest.fixture
 def temp_dir():
-    with tempfile.TemporaryDirectory(prefix="hermes_test_") as tmpdir:
-        yield Path(tmpdir)
+    """Temp directory with guaranteed cleanup on both Windows and Linux."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="hermes_test_"))
+    yield tmpdir
+    _rmtree_safe(tmpdir)
+
+
+@pytest.fixture
+def safe_tmp_path(tmp_path):
+    """Drop-in replacement for tmp_path that wraps cleanup for Windows.
+
+    Use this instead of bare ``tmp_path`` when the test creates SQLite files
+    or other files that may hold handles on Windows.  The fixture yields the
+    original tmp_path unchanged; cleanup is handled by the conftest-level
+    temp_dir fixture pattern for tests that need it.
+
+    For tests that only need a writable temp directory (no pytest-of
+    permission issues), prefer ``temp_dir`` instead.
+    """
+    return tmp_path
+
+
+@pytest.fixture
+def hermes_tmp(tmp_path):
+    """Cross-platform temp path for tests that need monkeypatch-able dirs.
+
+    Yields a fresh temp directory (via pytest's tmp_path) and does no
+    extra cleanup — pytest handles it.  Use when the test only needs a
+    Path to write to and won't hold SQLite handles past teardown.
+    """
+    return tmp_path
 
 
 @pytest.fixture
@@ -49,21 +127,13 @@ def temp_store(temp_dir):
 @pytest.fixture
 def temp_graph():
     """GraphStore backed by a temporary SQLite database."""
-    import time as _time
-    import shutil as _shutil
     tmpdir = Path(tempfile.mkdtemp(prefix="hermes_graph_"))
     db_path = tmpdir / "test_graph.db"
     store = GraphStore(db_path)
     yield store
     store.close()
-    # Windows: retry cleanup — SQLite WAL files may hold handles transiently
-    for _attempt in range(5):
-        try:
-            _shutil.rmtree(tmpdir)
-            return
-        except PermissionError:
-            _time.sleep(0.1)
-    _shutil.rmtree(tmpdir, ignore_errors=True)
+    _rmtree_safe(tmpdir)
+
 
 @pytest.fixture
 def seeded_store(temp_store):

@@ -81,11 +81,21 @@ try:
         plugin_config,
         _tokenise,
         embeddings_enabled,
-        estimate_tokens,
+        _memory_tokens as estimate_tokens,
         _bm25_search_scored,
     )
 except ImportError:
-    import store as _store_mod
+    import sys
+    from pathlib import Path
+    # Fallback for direct loading (e.g., via importlib.util.spec_from_file_location)
+    _repo = Path(__file__).resolve().parent.parent
+    import importlib.util
+
+    _store_spec = importlib.util.spec_from_file_location("_store_fallback", str(_repo / "core" / "store.py"))
+    _store_mod = importlib.util.module_from_spec(_store_spec)
+    sys.modules["_store_fallback"] = _store_mod
+    _store_spec.loader.exec_module(_store_mod)
+
     LoadedMemory = _store_mod.LoadedMemory
     MemoryEffectiveness = _store_mod.MemoryEffectiveness
     adaptive_conflict_threshold = _store_mod.adaptive_conflict_threshold
@@ -94,7 +104,7 @@ except ImportError:
     plugin_config = _store_mod.plugin_config
     _tokenise = _store_mod._tokenise
     embeddings_enabled = _store_mod.embeddings_enabled
-    estimate_tokens = _store_mod.estimate_tokens
+    estimate_tokens = _store_mod._memory_tokens
     _bm25_search_scored = _store_mod._bm25_search_scored
 
 logger = logging.getLogger(__name__)

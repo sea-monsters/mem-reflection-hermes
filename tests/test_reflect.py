@@ -22,26 +22,26 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-_spec_store = importlib.util.spec_from_file_location("_memory_store_module", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_memory_store_module", str(_REPO / "core" / "store.py"))
 _store_module = importlib.util.module_from_spec(_spec_store)
 sys.modules["_memory_store_module"] = _store_module
 _spec_store.loader.exec_module(_store_module)
 MemoryStore = _store_module.MemoryStore
 MemoryFrontmatter = _store_module.MemoryFrontmatter
 
-_spec_search = importlib.util.spec_from_file_location("_memory_search_module", str(_REPO / "search.py"))
+_spec_search = importlib.util.spec_from_file_location("_memory_search_module", str(_REPO / "core" / "search.py"))
 _search_module = importlib.util.module_from_spec(_spec_search)
 sys.modules["_memory_search_module"] = _search_module
 _spec_search.loader.exec_module(_search_module)
 SearchIndex = _search_module.SearchIndex
 
-_spec_graph = importlib.util.spec_from_file_location("_memory_graph_module", str(_REPO / "graph.py"))
+_spec_graph = importlib.util.spec_from_file_location("_memory_graph_module", str(_REPO / "core" / "graph.py"))
 _graph_module = importlib.util.module_from_spec(_spec_graph)
 sys.modules["_memory_graph_module"] = _graph_module
 _spec_graph.loader.exec_module(_graph_module)
 GraphIndex = _graph_module.GraphIndex
 
-_spec_reflect = importlib.util.spec_from_file_location("_memory_reflection_module", str(_REPO / "reflect.py"))
+_spec_reflect = importlib.util.spec_from_file_location("_memory_reflection_module", str(_REPO / "reflection" / "engine.py"))
 _reflection_module = importlib.util.module_from_spec(_spec_reflect)
 sys.modules["_memory_reflection_module"] = _reflection_module
 _spec_reflect.loader.exec_module(_reflection_module)

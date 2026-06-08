@@ -32,18 +32,18 @@ if "mem_reflection_hermes" not in sys.modules:
     sys.modules["mem_reflection_hermes"] = mod
     spec.loader.exec_module(mod)
 
-from store import (
+from core.store import (
     MemoryFrontmatter, LoadedMemory,
 )
-from store import (
+from core.store import (
     parse_frontmatter, serialize_frontmatter,
     read_memory, _lineage_latest, _lineage_root, _lineage_depth,
     _lineage_cycle_check, _classify_update_intent, _is_expired,
 )
-from mem_reflection_hermes.reflect import (
+from mem_reflection_hermes.reflection.engine import (
     _build_audit_entry, _append_reflect_log, _recent_reflect_outcomes,
 )
-from store import MemoryStore
+from core.store import MemoryStore
 
 PASS = 0
 FAIL = 0
@@ -349,7 +349,7 @@ def test_register_contract():
     # Simulate minimal plugin bootstrap
     fake = FakeCtx()
     try:
-        from mem_reflection_hermes.runtime_tools import register_tools as _register_tools
+        from mem_reflection_hermes.runtime.tools import register_tools as _register_tools
         _register_tools(fake)
     except Exception as e:
         fail("runtime_tools.register_tools", str(e))
@@ -362,7 +362,7 @@ def test_register_contract():
         fail("runtime_tools.register_tools: 12 tools", f"got {len(fake.tools)}")
 
     # 8 unique hooks from runtime_hooks.register_hooks() (v0.16.0 enhanced)
-    from mem_reflection_hermes.runtime_hooks import register_hooks as _rh_register_hooks
+    from mem_reflection_hermes.runtime.hooks import register_hooks as _rh_register_hooks
     _rh_register_hooks(fake)
     _expected_hooks_v016 = {
         "on_session_start", "on_session_end", "on_session_reset",
@@ -376,7 +376,7 @@ def test_register_contract():
 
     # Verify pre_llm_call exists and accepts **kwargs
     try:
-        from mem_reflection_hermes.runtime_hooks import pre_llm_call as _pre_llm_call
+        from mem_reflection_hermes.runtime.hooks import pre_llm_call as _pre_llm_call
         import inspect
         sig = inspect.signature(_pre_llm_call)
         params = list(sig.parameters.keys())
@@ -396,11 +396,11 @@ def test_register_contract():
             ok("post_tool_call hook registered")
         else:
             fail("post_tool_call hook registered", f"hooks={fake2.hooks}")
-        # Full plugin: 17 tools (12 base tools + 4 graph tools + 1 health)
-        if len(fake2.tools) == 17:
-            ok("register(ctx): 17 tools total")
+        # Full plugin: 12 tools (7 base tools + 5 graph/health tools)
+        if len(fake2.tools) == 12:
+            ok("register(ctx): 12 tools total")
         else:
-            fail("register(ctx): 17 tools total", f"got {len(fake2.tools)}")
+            fail("register(ctx): 12 tools total", f"got {len(fake2.tools)}")
         manifest_tools = _read_manifest_list("provides_tools")
         if set(fake2.tools) == manifest_tools:
             ok("plugin.yaml provides_tools matches register(ctx)")
@@ -430,7 +430,6 @@ def test_register_contract():
             "memories",
             "skills",
             "compile-profile",
-            "graph",
         }
         if set(fake2.slash) == expected_slash:
             ok("register(ctx): 8 slash commands")

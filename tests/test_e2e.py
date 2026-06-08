@@ -23,7 +23,7 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 
 # Load store module
-_spec_store = importlib.util.spec_from_file_location("_e2e_store", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_e2e_store", str(_REPO / "core" / "store.py"))
 _e2e_store = importlib.util.module_from_spec(_spec_store)
 sys.modules["_e2e_store"] = _e2e_store
 _spec_store.loader.exec_module(_e2e_store)
@@ -32,28 +32,28 @@ MemoryFrontmatter = _e2e_store.MemoryFrontmatter
 LoadedMemory = _e2e_store.LoadedMemory
 
 # Load search module
-_spec_search = importlib.util.spec_from_file_location("_e2e_search", str(_REPO / "search.py"))
+_spec_search = importlib.util.spec_from_file_location("_e2e_search", str(_REPO / "core" / "search.py"))
 _e2e_search = importlib.util.module_from_spec(_spec_search)
 sys.modules["_e2e_search"] = _e2e_search
 _spec_search.loader.exec_module(_e2e_search)
 SearchIndex = _e2e_search.SearchIndex
 
 # Load graph module
-_spec_graph = importlib.util.spec_from_file_location("_e2e_graph", str(_REPO / "graph.py"))
+_spec_graph = importlib.util.spec_from_file_location("_e2e_graph", str(_REPO / "core" / "graph.py"))
 _e2e_graph = importlib.util.module_from_spec(_spec_graph)
 sys.modules["_e2e_graph"] = _e2e_graph
 _spec_graph.loader.exec_module(_e2e_graph)
 GraphIndex = _e2e_graph.GraphIndex
 
 # Load reflect module
-_spec_reflect = importlib.util.spec_from_file_location("_e2e_reflect", str(_REPO / "reflect.py"))
+_spec_reflect = importlib.util.spec_from_file_location("_e2e_reflect", str(_REPO / "reflection" / "engine.py"))
 _e2e_reflect = importlib.util.module_from_spec(_spec_reflect)
 sys.modules["_e2e_reflect"] = _e2e_reflect
 _spec_reflect.loader.exec_module(_e2e_reflect)
 ReflectionEngine = _e2e_reflect.ReflectionEngine
 
 # Load context module
-_spec_context = importlib.util.spec_from_file_location("_e2e_context", str(_REPO / "context.py"))
+_spec_context = importlib.util.spec_from_file_location("_e2e_context", str(_REPO / "memory" / "context.py"))
 _e2e_context = importlib.util.module_from_spec(_spec_context)
 sys.modules["_e2e_context"] = _e2e_context
 _spec_context.loader.exec_module(_e2e_context)
