@@ -17,7 +17,7 @@ tasks:
       - tests/test_memory_curator.py
   - id: p2-orphan
     name: "Orphaned graph edge cleanup (P2)"
-    status: pending
+    status: completed
     files:
       - core/store.py
       - core/graph.py
@@ -25,7 +25,7 @@ tasks:
       - tests/test_graph.py
   - id: p2-restore
     name: "Cold restore graph edge rebuild (P2)"
-    status: pending
+    status: completed
     files:
       - memory/curator.py
       - tests/test_memory_curator.py
