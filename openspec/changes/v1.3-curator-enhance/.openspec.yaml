@@ -4,7 +4,7 @@ summary: "4-phase curator enhancement: similar memory merge, orphan edge cleanup
 tasks:
   - id: p0-merge
     name: "Similar memory merge/dedup (P0)"
-    status: pending
+    status: completed
     files:
       - memory/curator.py
       - tests/test_memory_curator.py
