@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2-beta2 — Optional Reranker Layer (mem0 pattern)
+
+### Optional Reranker Layer
+
+New `core/reranker.py` module (~150 LOC) providing pluggable second-stage reranking after the primary retrieval pipeline:
+
+- **Providers**: `cross_encoder` (local, default) and `cohere` (API-based).
+- **Integration**: Inserted after Hebbian boost and before MMR in `SearchIndex.search()`.
+- **Lazy loading**: Models/clients initialized on first `rerank()` call.
+- **Graceful fallback**: On any failure returns original order with `logger.warning`.
+- **Config**: `reranker.*` under plugin config — disabled by default (no config = no reranker).
+- **Tests**: 13 unit tests covering interface, factory, lazy load, and integration. 13/13 pass.
+- **Zero regression**: Full test suite 294/294 pass.
+
+### Ported from mem0
+
+Design pattern borrowed from mem0's `reranker/` package (base ABC + factory + provider implementations). Adapted for SRH's config style (YAML dict vs Pydantic) and candidate shape (`.body` attribute vs `{"memory": ...}` dict).
+
+---
+
 ## v1.2-beta — Memory Curator + v0.16.0 Telemetry Hooks
 
 ### Memory Curator Module
