@@ -1,19 +1,27 @@
 # Tools Reference
 
-Current SRH tool surface: 17 registered tools (v1.2-beta).
+Current SRH tool surface: **12 registered tools** (v1.2-beta).
 
-Graph-related capabilities are exposed both as SRH tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`) and through the dashboard API.
+The 12 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 
 > **Graph semantics note**: The runtime graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not "these entities have a typed factual relationship".
 
-## Memory Operations
+## Memory Operations (3)
+
+### `srh_memory_search`
+
+Search active memories by relevance.
 
 ```python
-# Search active memories by relevance
 srh_memory_search(query="Python error handling", k=5)
 srh_memory_search(query="部署流程", k=5, zone="work")  # zone filter
+```
 
-# Write a new memory
+### `srh_memory_write`
+
+Write a new memory or update existing.
+
+```python
 srh_memory_write(
     body="Always use anyhow for app-level error handling",
     scope="user",
@@ -23,77 +31,103 @@ srh_memory_write(
     supersedes=[],
     zone="general",
 )
+```
 
-# Delete a memory
+### `srh_memory_delete`
+
+Delete a memory by ID.
+
+```python
 srh_memory_delete(id="mem_abc123", scope="user")
-
-# Trace version lineage through supersedes chains
-srh_memory_history(id="mem_abc123", max_depth=5)
 ```
 
-## Skill Operations
+## Palace Navigation (1)
+
+### `srh_palace_navigate`
+
+Topic-based recall within the Memory Palace, optionally scoped to a zone. Under the hood this delegates to `srh_palace_recall`.
 
 ```python
-# Search skills by token overlap
-srh_skill_search(query="rust async", k=3)
+srh_palace_navigate(topic="editor preference", zone="work", limit=5)
 ```
 
-## Reflection
+> **Note**: Earlier versions exposed separate tools (`srh_palace_zones`, `srh_palace_read_zone`, `srh_palace_search`, `srh_palace_rebalance`, `srh_palace_recall`). These have been consolidated into the single `srh_palace_navigate` tool surface. The internal functions remain in `runtime/tools.py` for backward-compat dashboard routes.
+
+## Reflection & Profile (2)
+
+### `srh_reflect_now`
+
+Trigger reflection pipeline manually.
 
 ```python
-# Trigger reflection pipeline
-srh_reflect_now()  # session-end structured summary
+srh_reflect_now(messages=[...], mode="full")
 ```
 
-## Palace Navigation
+Modes: `full` (session-end structured summary), `micro` (per-turn background), `embedding` (vector-only, zero LLM).
+
+### `srh_compile_profile`
+
+Compile memories into a structured profile.
 
 ```python
-# List all zones with memory counts
-srh_palace_zones()
-
-# Read a zone's summary
-srh_palace_read_zone(zone="work")
-
-# Topic-based recall within a zone
-srh_palace_recall(topic="editor preference", zone="work", limit=5)
-
-# Cross-zone search
-srh_palace_search(query="Docker", limit=10)
-
-# Auto split/merge zones (dry_run first)
-srh_palace_rebalance(dry_run=True)
-srh_palace_rebalance(dry_run=False)
-```
-
-## Profile Compilation
-
-```python
-# Compile memories into a structured profile
 srh_compile_profile(mode="profile")       # profile.md format
-srh_compile_profile(mode="palace_index")  # palace index format
-srh_compile_profile(mode="zone")          # per-zone summaries
+srh_compile_profile(mode="summary")       # brief summary
+srh_compile_profile(mode="stats")         # statistics only
 ```
 
-## Graph Tools
+## Skills (1)
+
+### `srh_skill_query`
+
+Query skills by token overlap.
 
 ```python
-# Associate memories via co-activation edges
+srh_skill_query(query="rust async", k=3)
+```
+
+> **Note**: Internally delegates to `srh_skill_search`. The `_tool_srh_skill_search` internal function is used by both the tool handler and slash command logic.
+
+## Graph Memory (4)
+
+### `srh_associate`
+
+Associate memories via co-activation edges.
+
+```python
 srh_associate(memory_ids=["mem_a", "mem_b"], relation="co_occurs")
-
-# Retrieve associative neighbors (Hebbian co-activation propagation)
-srh_graph_retrieve(memory_ids=["mem_a"], task_type="reasoning", tier="list")
-
-# Get associative graph stats
-srh_graph_stats()
-
-# Get graph visualization data
-srh_graph_viz(tier="summary")
 ```
 
-## Health Metrics (introduced in v0.9.2-beta2, hardened through v1.0-beta3)
+### `srh_graph_retrieve`
+
+Retrieve associative neighbors (Hebbian co-activation propagation).
 
 ```python
-# Get memory health metrics and recommendations
+srh_graph_retrieve(seed_ids=["mem_a"], max_results=10, tier="rank")
+```
+
+### `srh_graph_stats`
+
+Get associative graph statistics.
+
+```python
+srh_graph_stats(format="nodes", depth=2)
+```
+
+### `srh_graph_viz`
+
+Generate graph visualization data.
+
+```python
+srh_graph_viz(format="adjacency", depth=2)
+```
+
+## Health Metrics (1)
+
+### `srh_memory_health`
+
+Get memory health metrics and recommendations.
+
+```python
 srh_memory_health()
 ```
 
@@ -105,33 +139,21 @@ Returns:
 - `expired_count`: memories past their `valid_until` date
 - `reflection_acceptance_rate`: ratio of accepted to total audit entries
 
-## Registered Tools (17 total)
+## Tool Summary Table
 
-### Core Memory (4)
-- `srh_memory_search`
-- `srh_memory_write`
-- `srh_memory_delete`
-- `srh_memory_history`
+| Tool | Category | Handler | Notes |
+|------|----------|---------|-------|
+| `srh_memory_search` | Memory | `runtime/tools.py` | |
+| `srh_memory_write` | Memory | `runtime/tools.py` | |
+| `srh_memory_delete` | Memory | `runtime/tools.py` | |
+| `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall` |
+| `srh_reflect_now` | Reflection | `runtime/tools.py` | |
+| `srh_skill_query` | Skills | `runtime/tools.py` | Delegates to `_tool_srh_skill_search` |
+| `srh_compile_profile` | Profile | `runtime/tools.py` | |
+| `srh_associate` | Graph | `runtime/graph.py` | |
+| `srh_graph_retrieve` | Graph | `runtime/graph.py` | |
+| `srh_graph_stats` | Graph | `runtime/graph.py` | |
+| `srh_graph_viz` | Graph | `runtime/graph.py` | |
+| `srh_memory_health` | Health | `runtime/graph.py` | |
 
-### Palace Navigation (5)
-- `srh_palace_zones`
-- `srh_palace_read_zone`
-- `srh_palace_recall`
-- `srh_palace_search`
-- `srh_palace_rebalance`
-
-### Reflection & Profile (2)
-- `srh_reflect_now`
-- `srh_compile_profile`
-
-### Skills (1)
-- `srh_skill_search`
-
-### Graph Memory (4)
-- `srh_associate`
-- `srh_graph_retrieve`
-- `srh_graph_stats`
-- `srh_graph_viz`
-
-### Health & Governance (1)
-- `srh_memory_health` (introduced in v0.9.2-beta2, hardened through v1.0-beta3)
+**7 base tools** live in `runtime/tools.py`; **5 graph/health tools** live in `runtime/graph.py`.

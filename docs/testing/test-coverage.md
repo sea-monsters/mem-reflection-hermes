@@ -1,8 +1,8 @@
 # Test Coverage Documentation
 
-> Version: v1.2-beta  
-> Last updated: 2026-06-07  
-> Total tests: **257** (plus 24 Windows temp-dir permission errors, non-code)  
+> Version: v1.2-beta
+> Last updated: 2026-06-07
+> Total tests: **257** (plus 24 Windows temp-dir permission errors, non-code)
 > All tests pass on Python 3.14 / Windows 11
 
 ---
@@ -17,17 +17,19 @@
 | reflect.py | test_reflect.py | 15 | content gate, fact extraction, micro/full reflection |
 | context.py | test_context.py | 10 | 4-layer priority, token budget, skill matching |
 | memory_curator.py | test_memory_curator.py | 15 | stale scan, exempt pinned/fresh, archive expired, deep chains, cold storage, full pipeline |
-| dashboard/plugin_api.py | test_dashboard.py | 14 | CRUD, graph, stats, skills, reflections, zones |
+| web/api.py | test_dashboard.py | 14 | CRUD, graph, stats, skills, reflections, zones |
 | E2E (all modules) | test_e2e.py | 6 | full lifecycle, update propagation, conflict, priority |
-| host contract smoke | test_host_contract_smoke.py | 1 | host contract, 17 tools, 4 hook names, smoke script |
+| host contract smoke | test_host_contract_smoke.py | 1 | host contract, 12 tools, 4 hook names, smoke script |
 | store compat contracts | test_core_data.py | 10 | frontmatter roundtrip, effectiveness, lineage, safe write |
-| runtime graph compat contracts | test_graph_operations.py | 11 | edge CRUD, supersedes, spreading activation, PageRank |
-| search compat contracts | test_bm25.py | 7 | tokenisation, BM25 scoring, CJK handling |
+| runtime graph compat | test_graph_operations.py | 11 | edge CRUD, supersedes, spreading activation, PageRank |
+| search compat | test_bm25.py | 7 | tokenisation, BM25 scoring, CJK handling |
 | retrieval | test_fusion_rerank.py | 17 | recency, effectiveness, Hebbian additive boost, zone filter |
-| search query/cache surface | test_query_cache.py | 12 | query templates, TTL cache, invalidation |
-| runtime reflection compat contracts | test_reflection.py | 8 | JSON parsing, repair, audit, cadence, supersedes |
-| runtime tools compat contracts | test_tool_handlers.py | 8 | lineage cycle check, write/read cycle |
+| query/cache surface | test_query_cache.py | 12 | query templates, TTL cache, invalidation |
+| runtime reflection compat | test_reflection.py | 8 | JSON parsing, repair, audit, cadence, supersedes |
+| runtime tools compat | test_tool_handlers.py | 8 | lineage cycle check, write/read cycle |
 | wave3 retrieval | test_wave3_retrieval.py | 10 | spreading activation, hub detection, BM25 CJK, fusion |
+| memory bridge | test_bridge.py | 9 | Dir A/B sync, dedup, zone filter, stats |
+| episode compaction | test_compaction.py | 8 | clustering, empty store, dry run, LLM fallback |
 
 ---
 
@@ -35,7 +37,7 @@
 
 ### 1. store.py — Memory persistence layer
 
-**File:** `tests/test_store.py`  
+**File:** `tests/test_store.py`
 **Tests:** 13
 
 | Test Class | Tests | Coverage |
@@ -57,7 +59,7 @@
 
 ### 2. search.py — Three-layer retrieval
 
-**File:** `tests/test_search.py`  
+**File:** `tests/test_search.py`
 **Tests:** 16
 
 | Test Class | Tests | Coverage |
@@ -81,7 +83,7 @@
 
 ### 3. graph.py — Hebbian graph memory
 
-**File:** `tests/test_graph.py`  
+**File:** `tests/test_graph.py`
 **Tests:** 13
 
 | Test Class | Tests | Coverage |
@@ -103,7 +105,7 @@
 
 ### 4. reflect.py — Reflection pipeline
 
-**File:** `tests/test_reflect.py`  
+**File:** `tests/test_reflect.py`
 **Tests:** 15
 
 | Test Class | Tests | Coverage |
@@ -126,7 +128,7 @@
 
 ### 5. context.py — Context assembly
 
-**File:** `tests/test_context.py`  
+**File:** `tests/test_context.py`
 **Tests:** 10
 
 | Test Class | Tests | Coverage |
@@ -146,14 +148,14 @@
 
 ### 6. memory_curator.py — Automated memory lifecycle (v1.2)
 
-**File:** `tests/test_memory_curator.py`  
+**File:** `tests/test_memory_curator.py`
 **Tests:** 15
 
 | Test Class | Tests | Coverage |
 |------------|-------|----------|
 | TestScanForStale | 3 | Finds stale entries, exempts pinned, exempts fresh |
 | TestArchiveExpired | 2 | Archives and deletes expired, cold store has entries |
-| TestArchiveSuperseded | 2 | Archives deep chains (depth ≥2), keeps single chain |
+| TestArchiveSuperseded | 2 | Archives deep chains (depth >=2), keeps single chain |
 | TestColdStorage | 1 | Append and load round-trip |
 | TestFullPipeline | 2 | Runs without crash, cleans up session state |
 
@@ -167,9 +169,9 @@
 
 ---
 
-### 7. dashboard/plugin_api.py — Dashboard API
+### 7. web/api.py — Dashboard API
 
-**File:** `tests/test_dashboard.py`  
+**File:** `tests/test_dashboard.py`
 **Tests:** 14
 
 | Test Class | Tests | Coverage |
@@ -182,15 +184,46 @@
 | TestZonesEndpoint | 1 | zones |
 
 **Production code touched:**
-- All 15 FastAPI endpoints in `dashboard/plugin_api.py`
+- All 15 FastAPI endpoints in `web/api.py`
 - `_get_store()` / `_get_graph_interface()`
 - Pydantic request models (`MemoryCreate`, `MemoryReorder`)
 
 ---
 
-### 8. E2E — Cross-module integration
+### 8. memory_bridge.py — Bidirectional host sync (v1.1)
 
-**File:** `tests/test_e2e.py`  
+**File:** `tests/test_bridge.py`
+**Tests:** 9
+
+| Test | Coverage |
+|------|----------|
+| test_dir_a_mirror_builtin | Built-in memory tool args → plugin store |
+| test_dir_a_skip_duplicate | Duplicate detection in Dir A |
+| test_dir_b_mirror_short_core | Plugin → built-in for short core memories |
+| test_dir_b_skip_long | Dir B skips bodies >200 chars |
+| test_dir_b_skip_non_core | Dir B only syncs zone=core |
+| test_bridge_stats | Stats accumulation |
+| test_refine_body_strips_tool_noise | `_refine_body` tool-noise stripping |
+
+---
+
+### 9. episode compaction (v1.1)
+
+**File:** `tests/test_compaction.py`
+**Tests:** 8
+
+| Test Class | Tests | Coverage |
+|------------|-------|----------|
+| TestCompactEpisodeZone | 8 | Empty store, clusters episodes, respects dry_run, LLM fallback, idempotency |
+
+**Production code touched:**
+- `_compact_episode_zone()`
+
+---
+
+### 10. E2E — Cross-module integration
+
+**File:** `tests/test_e2e.py`
 **Tests:** 6
 
 | Test | Coverage |
@@ -204,25 +237,26 @@
 
 ---
 
-### 9. Host Contract Smoke — Tool and hook surface
+### 11. Host Contract Smoke — Tool and hook surface
 
-**File:** `tests/test_host_contract_smoke.py`  
+**File:** `tests/test_host_contract_smoke.py`
 **Tests:** 1
 
 Runs `scripts/smoke_host_contract.py` under pytest so the acceptance smoke is part
 of the normal suite. The script validates frontmatter preservation,
 lineage-aware recall, supersedes validation, temporal hints, reflection audit
-round-trip, 17 registered tools, and the 4 public hook names.
+round-trip, **12 registered tools**, and the 4 public hook names.
 
 ---
 
 ## Legacy Module Coverage
 
-These modules are deprecated in beta3 but still tested for regression safety.
+These modules are tested for regression safety even where the module is primarily
+accessed through the new package layout.
 
-### core.py
+### core.py (store compat)
 
-**File:** `tests/test_core_data.py`  
+**File:** `tests/test_core_data.py`
 **Tests:** 10
 
 - Frontmatter roundtrip (YAML → dict → file → object)
@@ -231,9 +265,9 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Safe atomic write
 - Intent classification (correction, append)
 
-### graph/ (ahe_graph, cluqi, pagerank, cross_zone)
+### graph/ compat surface
 
-**File:** `tests/test_graph_operations.py`  
+**File:** `tests/test_graph_operations.py`
 **Tests:** 11
 
 - Edge CRUD (upsert, accumulate, symmetric)
@@ -243,9 +277,9 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Graph regression (meta refresh, decay prune)
 - Thread safety (multithreaded reads)
 
-### search/ (BM25 + embed)
+### search BM25
 
-**File:** `tests/test_bm25.py`  
+**File:** `tests/test_bm25.py`
 **Tests:** 7
 
 - Tokenisation (English, CJK bigrams, mixed)
@@ -254,8 +288,8 @@ These modules are deprecated in beta3 but still tested for regression safety.
 
 ### retrieval (fusion + rerank)
 
-**File:** `tests/test_fusion_rerank.py`  
-**Tests:** 13
+**File:** `tests/test_fusion_rerank.py`
+**Tests:** 17
 
 - Recency exponential decay
 - Effectiveness boost / decay
@@ -267,17 +301,17 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Weight sensitivity
 - Full pipeline top-3
 
-### query/cache.py
+### query templates/cache
 
-**File:** `tests/test_query_cache.py`  
+**File:** `tests/test_query_cache.py`
 **Tests:** 12
 
 - Query templates (recent, by_zone, by_tag, unknown)
 - Result cache (set/get, miss, TTL expiry, invalidate, clear, stats, eviction)
 
-### reflection/engine.py (legacy)
+### reflection runtime compat
 
-**File:** `tests/test_reflection.py`  
+**File:** `tests/test_reflection.py`
 **Tests:** 8
 
 - JSON output parsing (valid, code fence, empty, non-JSON)
@@ -286,18 +320,18 @@ These modules are deprecated in beta3 but still tested for regression safety.
 - Reflection cadence (pre_llm_call counter)
 - Supersedes regression (exclusion from conflict check)
 
-### tools/handlers.py
+### runtime tools compat
 
-**File:** `tests/test_tool_handlers.py`  
+**File:** `tests/test_tool_handlers.py`
 **Tests:** 8
 
 - Lineage cycle detection (direct, 3-node, self, no chain)
 - Lineage root / latest helpers
 - Write/read cycle
 
-### wave3 retrieval (additional)
+### wave3 retrieval
 
-**File:** `tests/test_wave3_retrieval.py`  
+**File:** `tests/test_wave3_retrieval.py`
 **Tests:** 10
 
 - Spreading activation (empty, single, two nodes, convergence, adjacency cache)
@@ -322,6 +356,9 @@ pytest tests/test_reflect.py -v
 pytest tests/test_context.py -v
 pytest tests/test_dashboard.py -v
 pytest tests/test_e2e.py -v
+pytest tests/test_memory_curator.py -v
+pytest tests/test_bridge.py -v
+pytest tests/test_compaction.py -v
 
 # Specific test class
 pytest tests/test_search.py::TestRRFFusion -v
@@ -337,9 +374,9 @@ pytest tests/ --cov=. --cov-report=term-missing
 
 ## Notes for Future Maintenance
 
-- **Import isolation:** Tests for runtime modules (`store.py`, `search.py`, `graph.py`, `reflect.py`, `context.py`) use `importlib.util.spec_from_file_location` to avoid package-relative import issues. Fallback `try/except ImportError` blocks in production code support both package and direct loading.
+- **Import isolation:** Tests for runtime modules (`core/*.py`, `reflection/*.py`, `memory/*.py`) use `importlib.util.spec_from_file_location` to avoid package-relative import issues. Fallback `try/except ImportError` blocks in production code support both package and direct loading.
 - **Windows cleanup:** Temp directory fixtures include retry loops with `shutil.rmtree` to handle SQLite file locking on Windows.
 - **Search cache invalidation:** `SearchIndex` caches BM25 index, embedding array, and result cache. E2E tests that mutate memories must clear all three (`_bm25_retriever = None`, `_embed_array = None`, `invalidate_cache()`, `_embed_single.cache_clear()`).
-- **Dashboard mock isolation:** `test_dashboard.py` mocks `mem_reflection_hermes` via `sys.modules` before loading `plugin_api.py`. `plugin_api.py` now checks `sys.modules` first to avoid overwriting the mock.
+- **Dashboard mock isolation:** `test_dashboard.py` mocks `mem_reflection_hermes` via `sys.modules` before loading `web/api.py`. `web/api.py` now checks `sys.modules` first to avoid overwriting the mock.
 - **Reflection log isolation:** `ReflectionEngine` accepts a test log path, and both reflection/E2E tests write logs under their temp directories.
 - **Plugin data dir isolation:** Dashboard tests use `store._test_data_dir` (set by `temp_dashboard` fixture) to write reflection logs, preventing cross-test pollution.
