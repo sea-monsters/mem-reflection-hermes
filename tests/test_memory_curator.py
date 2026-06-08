@@ -111,6 +111,29 @@ class MockStore:
             mem.frontmatter.pinned = pinned
         return mem
 
+    def is_superseded(self, mem_id: str) -> bool:
+        """Check if any active memory supersedes mem_id."""
+        for mem in self.memories.values():
+            if mem_id in (mem.frontmatter.supersedes or []):
+                return True
+        return False
+
+    def latest_for(self, mem_id: str):
+        """Walk forward to find the newest memory in the chain."""
+        visited: set = set()
+        current = mem_id
+        while current not in visited:
+            visited.add(current)
+            next_id = None
+            for mem in self.memories.values():
+                if current in (mem.frontmatter.supersedes or []):
+                    next_id = mem.id()
+                    break
+            if next_id is None:
+                break
+            current = next_id
+        return self.memories.get(current)
+
 
 # Import curator module under test
 import sys
@@ -119,6 +142,7 @@ from memory.curator import (  # noqa: E402
     scan_for_stale,
     archive_expired,
     archive_superseded,
+    compact_superseded_chains,
     scan_for_similar,
     merge_similar,
     _cold_store_path,
@@ -201,6 +225,42 @@ class TestArchiveSuperseded:
                                            zone="core")
         archived = archive_superseded(store)
         assert archived == 0  # no supersedes, not archived
+
+
+# ── Phase 2b: Chain Compaction ─────────────────────────────
+
+
+class TestCompactChains:
+    def test_compacts_long_chain(self, store):
+        """v1→v2→v3→v4→v5: v2,v3,v4 archived, v5.supersedes→[v1]."""
+        store.memories["v1"] = MockMemory("v1", "oldest", zone="core",
+                                           supersedes=[])
+        store.memories["v2"] = MockMemory("v2", "v2 body", zone="core",
+                                           supersedes=["v1"])
+        store.memories["v3"] = MockMemory("v3", "v3 body", zone="core",
+                                           supersedes=["v2"])
+        store.memories["v4"] = MockMemory("v4", "v4 body", zone="core",
+                                           supersedes=["v3"])
+        store.memories["v5"] = MockMemory("v5", "newest", zone="core",
+                                           supersedes=["v4"])
+        result = compact_superseded_chains(store)
+        assert result == 3  # v2, v3, v4
+        # v1 and v5 should remain
+        assert "v1" in store.memories
+        assert "v5" in store.memories
+        # v5.supersedes should now point to v1 (skip intermediates)
+        assert store.memories["v5"].frontmatter.supersedes == ["v1"]
+
+    def test_skips_short_chain(self, store):
+        """Chain of 2 (v1→v2) is not compacted."""
+        store.memories["v1"] = MockMemory("v1", "oldest", zone="core",
+                                           supersedes=[])
+        store.memories["v2"] = MockMemory("v2", "newest", zone="core",
+                                           supersedes=["v1"])
+        result = compact_superseded_chains(store)
+        assert result == 0
+        assert "v1" in store.memories
+        assert "v2" in store.memories
 
 
 # ── Phase 3: Similarity Detection ──────────────────────────────

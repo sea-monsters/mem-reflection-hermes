@@ -587,6 +587,109 @@ def _find_superseding_memories(mem_store, memory_id: str) -> List[str]:
     return result
 
 
+# ── Phase 2b: Supersedes Chain Compaction (v1.3) ──────────
+
+
+def compact_superseded_chains(mem_store) -> int:
+    """Compress long supersedes chains by archiving intermediate nodes.
+
+    For a chain v1→v2→v3→v4→v5 with length >= compact_min_chain:
+      - v2, v3, v4 (intermediate) → cold storage with chain evidence
+      - v5.supersedes updated to [v1] (skip intermediate)
+      - Returns count of memories archived during compaction.
+    """
+    cfg = _curator_config(mem_store)
+    min_chain = cfg.get("supersedes", {}).get("compact_min_chain", 3)
+    protect_days = cfg.get("supersedes", {}).get("protect_days", 7)
+
+    # Find chain heads: active memories that supersede something but are not superseded
+    chain_heads: List[str] = []
+    try:
+        for mem in mem_store.list_active():
+            if not mem.frontmatter.supersedes:
+                continue
+            if not getattr(mem_store, 'is_superseded', lambda _: False)(mem.id()):
+                chain_heads.append(mem.id())
+    except Exception:
+        return 0
+
+    now = time.time()
+    archived = 0
+
+    for head_id in chain_heads:
+        try:
+            # Walk backward from head to collect full chain
+            chain: List[str] = []
+            current_id = head_id
+            visited: set = set()
+
+            while current_id and current_id not in visited:
+                visited.add(current_id)
+                chain.insert(0, current_id)  # prepend → [oldest, ..., head]
+                mem = mem_store.get(current_id)
+                if mem is None or not mem.frontmatter.supersedes:
+                    break
+                current_id = mem.frontmatter.supersedes[0]  # immediate predecessor
+
+            # chain[0] = oldest, chain[-1] = head (newest)
+            if len(chain) < min_chain:
+                continue
+
+            # Check if any chain member was recently accessed (protect_days)
+            recent = False
+            for mid in chain:
+                try:
+                    eff = _load_effectiveness(mem_store, mid)
+                    last_access = eff.get("last_accessed", 0) if eff else 0
+                    if last_access > 0 and (now - last_access) < protect_days * 86400:
+                        recent = True
+                        break
+                except Exception:
+                    pass
+            if recent:
+                continue
+
+            tail_id = chain[0]
+            inter_ids = chain[1:-1]  # skip oldest and newest
+
+            # Archive intermediate nodes
+            for mid in inter_ids:
+                mem = mem_store.get(mid)
+                if mem is None:
+                    continue
+                entry = {
+                    "id": mid,
+                    "body": _refine_body(mem.body),
+                    "zone": mem.frontmatter.zone,
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                    "tags": list(mem.frontmatter.tags or []) + ["archived", "cold", "compacted"],
+                    "supersedes_chain": list(chain),
+                    "original_frontmatter": {
+                        "created": mem.frontmatter.created,
+                        "confidence": mem.frontmatter.confidence,
+                        "pinned": mem.frontmatter.pinned,
+                        "supersedes": list(mem.frontmatter.supersedes or []),
+                    },
+                }
+                if _append_to_cold_store(mem_store, entry):
+                    try:
+                        mem_store.delete(mem.scope, mid)
+                        archived += 1
+                    except Exception:
+                        pass
+
+            # Update head's supersedes to skip intermediates
+            if archived > 0:
+                head = mem_store.get(head_id)
+                if head is not None:
+                    head.frontmatter.supersedes = [tail_id]
+
+        except Exception:
+            continue
+
+    return archived
+
+
 # ── Phase 3: Similarity Detection ──────────────────────────────
 
 def scan_for_similar(mem_store) -> List[Tuple[str, str, float]]:
@@ -794,7 +897,8 @@ def generate_report(
     archived_superseded: int,
     similar_pairs: int,
     errors: List[str],
-    merged_count: int = 0,  # v1.3: merged memory count
+    merged_count: int = 0,
+    compacted_count: int = 0,  # v1.3: chain compaction count
 ) -> str:
     """Generate a text summary of curator actions for the reflection log.
 
@@ -804,6 +908,7 @@ def generate_report(
         archived_superseded: Number of superseded memories archived
         similar_pairs: Number of similar memory pairs detected
         merged_count: Number of memories archived during merge (v1.3)
+        compacted_count: Number of memories archived during chain compaction (v1.3)
         errors: List of error messages
     """
     parts: List[str] = []
@@ -813,6 +918,8 @@ def generate_report(
         parts.append(f"stale: {archived_stale} archived")
     if archived_superseded:
         parts.append(f"superseded: {archived_superseded} archived")
+    if compacted_count:
+        parts.append(f"compacted: {compacted_count} archived")
     if similar_pairs:
         parts.append(f"similar: {similar_pairs} candidate pair(s) found")
     if merged_count:
@@ -837,6 +944,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         "stale": 0,
         "archived": 0,
         "superseded": 0,
+        "compacted": 0,  # v1.3: chain compaction
         "similar": 0,
         "merged": 0,  # v1.3: memories archived during merge
         "total_archived": 0,
@@ -863,8 +971,16 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         errors.append(f"superseded: {e}")
         logger.warning("Curator supersedes archiving failed: %s", e)
 
-    # Calculate total archived
-    result["total_archived"] = result["archived"] + result["superseded"]
+    # Phase 2b: Chain Compaction (v1.3)
+    try:
+        compacted = compact_superseded_chains(mem_store)
+        result["compacted"] = compacted
+    except Exception as e:
+        errors.append(f"compacted: {e}")
+        logger.warning("Curator chain compaction failed: %s", e)
+
+    # Recalculate total archived
+    result["total_archived"] = result["archived"] + result["superseded"] + result["compacted"]
 
     # Phase 3: Similarity Detection
     try:
@@ -892,6 +1008,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         archived_superseded=result["superseded"],
         similar_pairs=result["similar"],
         merged_count=result["merged"],
+        compacted_count=result["compacted"],
         errors=errors,
     )
     result["report"] = report_text
@@ -906,6 +1023,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "stale": result["stale"],
             "archived": result["archived"],
             "superseded": result["superseded"],
+            "compacted": result["compacted"],
             "similar": result["similar"],
             "merged": result["merged"],
             "total_archived": result["total_archived"],
@@ -924,6 +1042,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "stale": result["stale"],
             "archived": result["archived"],
             "superseded": result["superseded"],
+            "compacted": result["compacted"],
             "similar": result["similar"],
             "merged": result["merged"],
             "errors": result["errors"],
