@@ -10,7 +10,7 @@ tasks:
       - tests/test_memory_curator.py
   - id: p1-compact
     name: "Supersedes chain compaction (P1)"
-    status: pending
+    status: completed
     files:
       - memory/curator.py
       - core/store.py
