@@ -94,7 +94,7 @@ class MockStore:
     def list_active_effectiveness(self) -> Dict[str, Dict[str, Any]]:
         return self.eff_data
 
-    def update(self, mem_id, body=None, zone=None, confidence=None, tags=None, pinned=None):
+    def update(self, mem_id, body=None, zone=None, confidence=None, tags=None, pinned=None, supersedes=None):
         """Mock for MemoryStore.update."""
         mem = self.memories.get(mem_id)
         if mem is None:
@@ -109,6 +109,8 @@ class MockStore:
             mem.frontmatter.tags = tags
         if pinned is not None:
             mem.frontmatter.pinned = pinned
+        if supersedes is not None:
+            mem.frontmatter.supersedes = supersedes
         return mem
 
     def is_superseded(self, mem_id: str) -> bool:

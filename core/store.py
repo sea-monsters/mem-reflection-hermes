@@ -1524,7 +1524,8 @@ class MemoryStore:
     def update(self, mem_id: str, body: Optional[str] = None,
                zone: Optional[str] = None, confidence: Optional[str] = None,
                tags: Optional[List[str]] = None,
-               pinned: Optional[bool] = None) -> Optional[LoadedMemory]:
+               pinned: Optional[bool] = None,
+               supersedes: Optional[List[str]] = None) -> Optional[LoadedMemory]:
         """Atomically update a memory's content or metadata.
 
         Builds a new frontmatter from the old one, writes the file, then
@@ -1549,7 +1550,7 @@ class MemoryStore:
                 confidence=confidence if confidence is not None else fm.confidence,
                 pinned=pinned if pinned is not None else fm.pinned,
                 tags=tags if tags is not None else fm.tags,
-                supersedes=fm.supersedes,
+                supersedes=supersedes if supersedes is not None else fm.supersedes,
                 supersedes_reason=fm.supersedes_reason,
                 valid_from=fm.valid_from,
                 valid_until=fm.valid_until,

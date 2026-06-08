@@ -691,9 +691,10 @@ def compact_superseded_chains(mem_store) -> int:
 
             # Update head's supersedes to skip intermediates
             if archived > 0:
-                head = mem_store.get(head_id)
-                if head is not None:
-                    head.frontmatter.supersedes = [tail_id]
+                try:
+                    mem_store.update(head_id, supersedes=[tail_id])
+                except Exception:
+                    pass
 
         except Exception:
             continue
@@ -924,7 +925,7 @@ def clean_orphan_edges(mem_store) -> int:
         all_ids = {m.id() for m in mem_store.list_active()}
         if not all_ids:
             return 0
-        return gm.store._gi.clean_orphan_edges(all_ids)
+        return gm.store.clean_orphan_edges(all_ids)
     except Exception as e:
         logger.warning("Curator orphan edge cleanup failed: %s", e)
         return 0
