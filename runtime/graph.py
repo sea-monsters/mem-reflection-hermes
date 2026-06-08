@@ -132,6 +132,10 @@ class _GraphStoreShim:
         )
         conn.commit()
 
+    def remove_memory(self, memory_id: str) -> None:
+        """Remove all edges and meta for *memory_id*."""
+        self._gi.remove_memory(memory_id)
+
     def get_meta(self, memory_id: str) -> Optional[dict]:
         conn = self._conn()
         row = conn.execute(

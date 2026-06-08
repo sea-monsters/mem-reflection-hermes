@@ -25,7 +25,6 @@ from ..core.store import (
 from ..core.search import (
     _embed_single, _cosine_sim, _extract_keywords,
     _is_explicit_memory_intent, _is_correction, _is_procedure,
-    _classify_intent,
 )
 
 logger = logging.getLogger(__name__)

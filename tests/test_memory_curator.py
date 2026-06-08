@@ -360,7 +360,83 @@ class TestColdStorage:
         assert "test1" in ids
 
 
-# ── Phase 5: Report ────────────────────────────────────────────
+# ── P2b: Cold Restore Graph Rebuild ─────────────────────────
+
+
+class TestRestoreGraphRebuild:
+    def test_restore_succeeds_without_graph(self, store):
+        """_restore_from_cold succeeds even when graph manager unavailable."""
+        from memory.curator import _restore_from_cold, _append_to_cold_store
+
+        entry = {
+            "id": "restored-mem",
+            "body": "restored content",
+            "zone": "general",
+            "archived_at": "2026-06-01T00:00:00Z",
+            "tags": ["archived", "cold"],
+            "original_frontmatter": {
+                "created": "2026-01-01T00:00:00Z",
+                "confidence": "medium",
+                "pinned": False,
+                "supersedes": [],
+                "supersedes_reason": "",
+            },
+        }
+        _append_to_cold_store(store, entry)
+
+        result = _restore_from_cold(store, "restored-mem")
+        assert result is True
+
+        # Memory should be back in active store
+        mem = store.get("restored-mem")
+        assert mem is not None
+        assert mem.body == "restored content"
+
+    def test_restore_fail_open_on_graph_error(self, store):
+        """Restore still works even if graph ensure_meta throws."""
+        from memory.curator import _restore_from_cold, _append_to_cold_store
+
+        entry = {
+            "id": "restored-mem-2",
+            "body": "restored again",
+            "zone": "general",
+            "archived_at": "2026-06-01T00:00:00Z",
+            "tags": ["archived"],
+            "original_frontmatter": {
+                "created": "2026-01-01T00:00:00Z",
+                "confidence": "high",
+                "pinned": False,
+                "supersedes": [],
+                "supersedes_reason": "",
+            },
+        }
+        _append_to_cold_store(store, entry)
+
+        # Should succeed (graph ensure_meta is fail-open)
+        result = _restore_from_cold(store, "restored-mem-2")
+        assert result is True
+        assert store.get("restored-mem-2") is not None
+
+
+# ── Phase 5: Orphan Edge Cleanup (P2a) ──────────────────────
+
+
+class TestCleanOrphanEdges:
+    def test_graceful_when_no_graph(self, store):
+        """Returns 0 gracefully when graph manager is unavailable."""
+        from memory.curator import clean_orphan_edges
+        result = clean_orphan_edges(store)
+        assert result == 0
+
+    def test_pipeline_includes_orphan_field(self, store):
+        """_run_curator result includes orphan_edges field."""
+        from memory.curator import _run_curator
+        result = _run_curator(None, store)
+        assert "orphan_edges" in result
+        assert isinstance(result["orphan_edges"], int)
+
+
+# ── Phase 6: Report ────────────────────────────────────────────
 
 
 class TestReport:

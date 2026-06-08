@@ -305,3 +305,63 @@ class TestCrossZone:
         assert result["bridge_count"] == 0
         # zone_matrix should be empty (no cross-zone edges)
         assert result["zone_matrix"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Orphan edge cleanup (P2a)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanOrphanEdges:
+    def test_empty_graph(self, temp_graph_index):
+        """clean_orphan_edges on empty graph returns 0."""
+        gi = temp_graph_index
+        assert gi.clean_orphan_edges({"mem-1", "mem-2"}) == 0
+
+    def test_removes_orphan_edges(self, temp_graph_index):
+        """Edges pointing to non-existent memories are deleted."""
+        gi = temp_graph_index
+        gi.ensure_meta("mem-1", zone="general")
+        gi.ensure_meta("mem-2", zone="general")
+        gi.ensure_meta("mem-3", zone="general")
+        gi.associate(["mem-1", "mem-2"])
+        gi.associate(["mem-2", "mem-3"])
+
+        # All 3 exist — nothing to clean
+        assert gi.clean_orphan_edges({"mem-1", "mem-2", "mem-3"}) == 0
+
+        # Now mem-2 is gone — edge mem-1↔mem-2 and mem-2↔mem-3 become orphan
+        cleaned = gi.clean_orphan_edges({"mem-1", "mem-3"})
+        assert cleaned > 0
+
+        # mem-2's meta should also be gone
+        row = gi._get_conn().execute(
+            "SELECT COUNT(*) as cnt FROM graph_meta WHERE memory_id = ?",
+            ("mem-2",),
+        ).fetchone()
+        assert row["cnt"] == 0
+
+    def test_empty_valid_ids_is_noop(self, temp_graph_index):
+        """Passing empty set does nothing."""
+        gi = temp_graph_index
+        gi.ensure_meta("mem-1", zone="general")
+        assert gi.clean_orphan_edges(set()) == 0
+
+    def test_removes_orphan_meta_only(self, temp_graph_index):
+        """graph_meta row for non-existent memory is deleted even without edges."""
+        gi = temp_graph_index
+        gi.ensure_meta("orphan-only", zone="work")
+        row = gi._get_conn().execute(
+            "SELECT COUNT(*) as cnt FROM graph_meta WHERE memory_id = ?",
+            ("orphan-only",),
+        ).fetchone()
+        assert row["cnt"] == 1
+
+        cleaned = gi.clean_orphan_edges({"real-mem"})
+        assert cleaned >= 1
+
+        row = gi._get_conn().execute(
+            "SELECT COUNT(*) as cnt FROM graph_meta WHERE memory_id = ?",
+            ("orphan-only",),
+        ).fetchone()
+        assert row["cnt"] == 0

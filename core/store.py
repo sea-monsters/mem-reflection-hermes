@@ -26,7 +26,7 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import frontmatter as _frontmatter
@@ -1278,6 +1278,7 @@ class MemoryStore:
         self._index_dirty = True
         self._cached_index = ""
         self._last_index_hash = ""
+        self._post_delete_callbacks: List[Callable[[str], None]] = []  # P2a: post-delete hooks
         self._init_db()
         self._sync_from_disk()
 
@@ -1512,6 +1513,12 @@ class MemoryStore:
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
             conn.commit()
             self._mark_changed()
+            # P2a: post-delete callbacks (graph cleanup, etc.)
+            for cb in self._post_delete_callbacks:
+                try:
+                    cb(mem_id)
+                except Exception:
+                    logger.warning("Post-delete callback failed for %s", mem_id, exc_info=True)
             return True
 
     def update(self, mem_id: str, body: Optional[str] = None,
