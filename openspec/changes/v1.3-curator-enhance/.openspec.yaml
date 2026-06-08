@@ -1,0 +1,34 @@
+id: v1.3-curator-enhance
+status: in_progress
+summary: "4-phase curator enhancement: similar memory merge, orphan edge cleanup, supersedes chain compaction, cold restore graph rebuild"
+tasks:
+  - id: p0-merge
+    name: "Similar memory merge/dedup (P0)"
+    status: pending
+    files:
+      - memory/curator.py
+      - tests/test_memory_curator.py
+  - id: p1-compact
+    name: "Supersedes chain compaction (P1)"
+    status: pending
+    files:
+      - memory/curator.py
+      - core/store.py
+      - tests/test_memory_curator.py
+  - id: p2-orphan
+    name: "Orphaned graph edge cleanup (P2)"
+    status: pending
+    files:
+      - core/store.py
+      - core/graph.py
+      - memory/curator.py
+      - tests/test_graph.py
+  - id: p2-restore
+    name: "Cold restore graph edge rebuild (P2)"
+    status: pending
+    files:
+      - memory/curator.py
+      - tests/test_memory_curator.py
+verification:
+  - All tests pass (pytest tests/ -v)
+  - No regressions in curator/dashboard/e2e suites
