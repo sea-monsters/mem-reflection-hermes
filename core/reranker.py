@@ -187,7 +187,8 @@ class CohereReranker(BaseReranker):
             return candidates
         try:
             texts = [_extract_text(c) for c in candidates]
-            resp = self._client.rerank(
+            client = self._get_client()
+            resp = client.rerank(
                 model=self.model,
                 query=query,
                 documents=texts,
