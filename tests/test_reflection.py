@@ -28,7 +28,8 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-import store as _store_mod
+from core import store as _store_mod
+from core import search as _search_mod
 
 # Set up minimal package namespace for reflection.engine's relative imports
 _PKG = "mem_reflection_hermes_reflection_test"
@@ -42,32 +43,68 @@ def _restore_modules(previous: Dict[str, Optional[types.ModuleType]]) -> None:
             sys.modules[name] = module
 
 
-def _load_reflection_engine() -> tuple[object | None, Exception | None, Exception | None]:
+def _setup_pkg_namespace():
+    """Set up package namespace so relative imports in submodules resolve."""
+    pkg = types.ModuleType(_PKG)
+    pkg.__path__ = [str(_REPO)]
+    sys.modules[_PKG] = pkg
+
+    # Register core subpackage with proper __path__
+    core_mod = types.ModuleType(f"{_PKG}.core")
+    core_mod.__path__ = [str(_REPO / "core")]
+    core_mod.__package__ = f"{_PKG}.core"
+    sys.modules[f"{_PKG}.core"] = core_mod
+    sys.modules[f"{_PKG}.core.store"] = _store_mod
+    sys.modules[f"{_PKG}.core.search"] = _search_mod
+    sys.modules[f"{_PKG}.store"] = _store_mod
+
+    # Register reflection subpackage
+    reflection_pkg = types.ModuleType(f"{_PKG}.reflection")
+    reflection_pkg.__path__ = [str(_REPO / "reflection")]
+    reflection_pkg.__package__ = f"{_PKG}.reflection"
+    sys.modules[f"{_PKG}.reflection"] = reflection_pkg
+
+    # Register runtime subpackage
+    runtime_pkg = types.ModuleType(f"{_PKG}.runtime")
+    runtime_pkg.__path__ = [str(_REPO / "runtime")]
+    runtime_pkg.__package__ = f"{_PKG}.runtime"
+    sys.modules[f"{_PKG}.runtime"] = runtime_pkg
+
+
+def _load_reflection_engine() -> tuple[object | None, object | None, Exception | None, Exception | None]:
+    # Modules to keep alive for engine's delegate calls
+    _persistent = [
+        _PKG, f"{_PKG}.core", f"{_PKG}.core.store", f"{_PKG}.core.search",
+        f"{_PKG}.reflection", f"{_PKG}.reflection.runtime",
+    ]
     touched_modules = [
-        _PKG,
-        f"{_PKG}.core",
-        f"{_PKG}.store",
-        f"{_PKG}.search",
-        f"{_PKG}.reflection",
         f"{_PKG}.reflection.engine",
+        f"{_PKG}.runtime", f"{_PKG}.runtime.hooks",
     ]
     previous_modules = {name: sys.modules.get(name) for name in touched_modules}
     engine_load_error = None
     engine = None
+    runtime = None
 
     try:
-        pkg = types.ModuleType(_PKG)
-        pkg.__path__ = [str(_REPO)]
-        sys.modules[_PKG] = pkg
-        sys.modules[f"{_PKG}.core"] = _store_mod
-        sys.modules[f"{_PKG}.store"] = _store_mod
+        _setup_pkg_namespace()
+
+        # Load reflection.runtime (needed by engine's delegate)
+        runtime_path = _REPO / "reflection" / "runtime.py"
+        if runtime_path.exists():
+            rt_spec = importlib.util.spec_from_file_location(
+                f"{_PKG}.reflection.runtime", str(runtime_path))
+            if rt_spec and rt_spec.loader:
+                rt_mod = importlib.util.module_from_spec(rt_spec)
+                rt_mod.__package__ = f"{_PKG}.reflection"
+                sys.modules[f"{_PKG}.reflection.runtime"] = rt_mod
+                # Also register as .runtime for engine's "from . import runtime"
+                sys.modules[f"{_PKG}.reflection.runtime"] = rt_mod
+                rt_spec.loader.exec_module(rt_mod)
+                runtime = rt_mod
 
         engine_path = _REPO / "reflection" / "engine.py"
         if engine_path.exists():
-            reflection_pkg = types.ModuleType(f"{_PKG}.reflection")
-            reflection_pkg.__path__ = [str(_REPO / "reflection")]
-            sys.modules[f"{_PKG}.reflection"] = reflection_pkg
-
             spec = importlib.util.spec_from_file_location(
                 f"{_PKG}.reflection.engine", str(engine_path))
             if spec and spec.loader:
@@ -80,39 +117,44 @@ def _load_reflection_engine() -> tuple[object | None, Exception | None, Exceptio
                     engine = None
                     engine_load_error = exc
 
-        return engine, None, engine_load_error
+        return engine, runtime, None, engine_load_error
     finally:
         _restore_modules(previous_modules)
 
 
 def _load_module_from_repo(module_name: str, relative_path: str) -> object:
     touched_modules = [
-        _PKG,
-        f"{_PKG}.core",
-        f"{_PKG}.store",
-        f"{_PKG}.search",
-        f"{_PKG}.reflection",
-        f"{_PKG}.reflection.engine",
+        _PKG, f"{_PKG}.core", f"{_PKG}.core.store", f"{_PKG}.core.search",
+        f"{_PKG}.store", f"{_PKG}.search",
+        f"{_PKG}.reflection", f"{_PKG}.reflection.engine", f"{_PKG}.reflection.runtime",
+        f"{_PKG}.runtime", f"{_PKG}.runtime.hooks",
     ]
     previous_modules = {name: sys.modules.get(name) for name in touched_modules}
 
     try:
-        pkg = types.ModuleType(_PKG)
-        pkg.__path__ = [str(_REPO)]
-        sys.modules[_PKG] = pkg
-        sys.modules[f"{_PKG}.core"] = _store_mod
-        sys.modules[f"{_PKG}.store"] = _store_mod
+        _setup_pkg_namespace()
 
-        reflection_pkg = types.ModuleType(f"{_PKG}.reflection")
-        reflection_pkg.__path__ = [str(_REPO / "reflection")]
-        sys.modules[f"{_PKG}.reflection"] = reflection_pkg
-        reflection_spec = importlib.util.spec_from_file_location(
-            f"{_PKG}.reflection.engine", str(_REPO / "reflection" / "engine.py"))
-        if reflection_spec and reflection_spec.loader:
-            reflection_module = importlib.util.module_from_spec(reflection_spec)
-            reflection_module.__package__ = f"{_PKG}.reflection"
-            sys.modules[f"{_PKG}.reflection.engine"] = reflection_module
-            reflection_spec.loader.exec_module(reflection_module)
+        # Load reflection.engine first (needed by hooks)
+        engine_path = _REPO / "reflection" / "engine.py"
+        if engine_path.exists():
+            engine_spec = importlib.util.spec_from_file_location(
+                f"{_PKG}.reflection.engine", str(engine_path))
+            if engine_spec and engine_spec.loader:
+                engine_mod = importlib.util.module_from_spec(engine_spec)
+                engine_mod.__package__ = f"{_PKG}.reflection"
+                sys.modules[f"{_PKG}.reflection.engine"] = engine_mod
+                engine_spec.loader.exec_module(engine_mod)
+
+        # Load reflection.runtime
+        runtime_path = _REPO / "reflection" / "runtime.py"
+        if runtime_path.exists():
+            rt_spec = importlib.util.spec_from_file_location(
+                f"{_PKG}.reflection.runtime", str(runtime_path))
+            if rt_spec and rt_spec.loader:
+                rt_mod = importlib.util.module_from_spec(rt_spec)
+                rt_mod.__package__ = f"{_PKG}.reflection"
+                sys.modules[f"{_PKG}.reflection.runtime"] = rt_mod
+                rt_spec.loader.exec_module(rt_mod)
 
         module_spec = importlib.util.spec_from_file_location(
             module_name, str(_REPO / relative_path))
@@ -128,8 +170,8 @@ def _load_module_from_repo(module_name: str, relative_path: str) -> object:
         _restore_modules(previous_modules)
 
 
-_engine, _embed_load_error, _engine_load_error = _load_reflection_engine()
-_lifecycle_mod = _load_module_from_repo(f"{_PKG}.hooks.lifecycle", "hooks/lifecycle.py")
+_engine, _runtime, _embed_load_error, _engine_load_error = _load_reflection_engine()
+_lifecycle_mod = _load_module_from_repo(f"{_PKG}.runtime.hooks", "runtime/hooks.py")
 
 if _engine_load_error is not None:
     raise RuntimeError("Could not load reflection.engine for reflection tests") from _engine_load_error
@@ -347,13 +389,15 @@ class TestHookReflectionCadence:
 class TestReflectionSupersedesRegression:
     def test_full_reflection_excludes_superseded_ids_from_conflict_check(self, monkeypatch):
         mem_store = _RecordingMemStore()
-        monkeypatch.setattr(_engine, "_reflection_mode", lambda: "llm")
-        monkeypatch.setattr(_engine, "_get_mem_store", lambda: mem_store)
-        monkeypatch.setattr(_engine, "_get_skill_store", lambda: _EmptySkillStore())
-        monkeypatch.setattr(_engine, "_validate_supersedes_targets", lambda *_: None)
-        monkeypatch.setattr(_engine, "_append_reflect_log", lambda *_: None)
-        monkeypatch.setattr(_engine, "_save_pending_skill_candidates", lambda *_: None)
-        monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
+        # These functions are called from runtime, so patch runtime module
+        monkeypatch.setattr(_runtime, "_reflection_mode", lambda: "llm")
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_get_skill_store", lambda: _EmptySkillStore())
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_save_pending_skill_candidates", lambda *_: None)
+        # _compute_novelty_score is only in runtime
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
 
         ctx = types.SimpleNamespace(llm=_FakeLLM({
             "summary": "ok",
@@ -376,14 +420,14 @@ class TestReflectionSupersedesRegression:
 
     def test_full_reflection_remembers_new_memory_ids_for_session_exclusion(self, monkeypatch):
         mem_store = _RecordingMemStore()
-        monkeypatch.setattr(_engine, "_reflection_mode", lambda: "llm")
-        monkeypatch.setattr(_engine, "_get_mem_store", lambda: mem_store)
-        monkeypatch.setattr(_engine, "_get_skill_store", lambda: _EmptySkillStore())
-        monkeypatch.setattr(_engine, "_validate_supersedes_targets", lambda *_: None)
-        monkeypatch.setattr(_engine, "_append_reflect_log", lambda *_: None)
-        monkeypatch.setattr(_engine, "_save_pending_skill_candidates", lambda *_: None)
-        monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
-        _engine._reset_current_session_memory_ids()
+        monkeypatch.setattr(_runtime, "_reflection_mode", lambda: "llm")
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_get_skill_store", lambda: _EmptySkillStore())
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_save_pending_skill_candidates", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
+        _runtime._reset_current_session_memory_ids()
 
         ctx = types.SimpleNamespace(llm=_FakeLLM({
             "summary": "ok",
@@ -401,16 +445,16 @@ class TestReflectionSupersedesRegression:
         result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "remember this"}])
 
         accepted_id = result["accepted_memories"][0]["id"]
-        assert accepted_id in _engine._get_current_session_memory_ids()
-        _engine._reset_current_session_memory_ids()
+        assert accepted_id in _runtime._get_current_session_memory_ids()
+        _runtime._reset_current_session_memory_ids()
 
     def test_micro_reflection_excludes_superseded_ids_from_conflict_check(self, monkeypatch):
         mem_store = _RecordingMemStore()
-        monkeypatch.setattr(_engine, "_reflection_mode", lambda: "llm")
-        monkeypatch.setattr(_engine, "_get_mem_store", lambda: mem_store)
-        monkeypatch.setattr(_engine, "_validate_supersedes_targets", lambda *_: None)
-        monkeypatch.setattr(_engine, "_append_reflect_log", lambda *_: None)
-        monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.8)
+        monkeypatch.setattr(_runtime, "_reflection_mode", lambda: "llm")
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.8)
 
         ctx = types.SimpleNamespace(llm=_FakeLLM({
             "summary": "ok",
@@ -433,20 +477,24 @@ class TestReflectionSupersedesRegression:
 
     def test_embedding_reflection_uses_summary_fallback_for_skill_metadata(self, monkeypatch):
         mem_store = _RecordingMemStore()
-        monkeypatch.setattr(_engine, "_get_mem_store", lambda: mem_store)
-        monkeypatch.setattr(_engine, "_get_skill_store", lambda: _EmptySkillStore())
-        monkeypatch.setattr(_engine, "_append_reflect_log", lambda *_: None)
-        monkeypatch.setattr(_engine, "_save_pending_skill_candidates", lambda *_: None)
-        monkeypatch.setattr(_engine, "_extract_facts_from_turn", lambda *_: [])
-        monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.8)
-        monkeypatch.setattr(_engine, "_extract_keywords", lambda text, top_k=3: ["deploy", "cache", "warmup"] if "summary" in text else ["assistant", "steps"])
-        monkeypatch.setattr(_engine, "_generate_session_summary", lambda _text: "summary fallback for session generated memory")
-        monkeypatch.setattr(_engine, "_is_procedure", lambda _text: True)
-        monkeypatch.setattr(_engine, "_generate_skill_name", lambda _text: "deploy-cache-warmup")
-        monkeypatch.setattr(_engine, "_validate_supersedes_targets", lambda *_: None)
-        monkeypatch.setattr(_engine, "_embed_single", lambda *_: [1.0, 0.0])
-        monkeypatch.setattr(_engine, "_cosine_sim", lambda *_: 0.0)
-        _engine._current_session_memory_ids.ids = set()
+        # Patch runtime functions
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_get_skill_store", lambda: _EmptySkillStore())
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_save_pending_skill_candidates", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_extract_facts_from_turn", lambda *_: [])
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.8)
+        # _extract_keywords is imported into runtime from search, so patch it on runtime
+        monkeypatch.setattr(_runtime, "_extract_keywords", lambda text, top_k=3: ["deploy", "cache", "warmup"] if "summary" in text else ["assistant", "steps"])
+        # _is_procedure is imported into runtime from search, so patch it on runtime
+        monkeypatch.setattr(_runtime, "_generate_session_summary", lambda _text: "summary fallback for session generated memory")
+        monkeypatch.setattr(_runtime, "_is_procedure", lambda _text: True)
+        monkeypatch.setattr(_runtime, "_generate_skill_name", lambda _text: "deploy-cache-warmup")
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        # _embed_single and _cosine_sim are imported into runtime from search
+        monkeypatch.setattr(_runtime, "_embed_single", lambda *_: [1.0, 0.0])
+        monkeypatch.setattr(_runtime, "_cosine_sim", lambda *_: 0.0)
+        _runtime._current_session_memory_ids.ids = set()
 
         messages = [
             {"role": "user", "content": "Please summarize the deployment procedure for later reuse."},
@@ -462,18 +510,19 @@ class TestReflectionSupersedesRegression:
 
     def test_embedding_reflection_excludes_session_and_supersedes_ids_from_final_conflict_check(self, monkeypatch):
         mem_store = _RecordingMemStore()
-        monkeypatch.setattr(_engine, "_get_mem_store", lambda: mem_store)
-        monkeypatch.setattr(_engine, "_get_skill_store", lambda: _EmptySkillStore())
-        monkeypatch.setattr(_engine, "_append_reflect_log", lambda *_: None)
-        monkeypatch.setattr(_engine, "_save_pending_skill_candidates", lambda *_: None)
-        monkeypatch.setattr(_engine, "_extract_facts_from_turn", lambda *_: [{
+        # Patch runtime functions
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_get_skill_store", lambda: _EmptySkillStore())
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_save_pending_skill_candidates", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_extract_facts_from_turn", lambda *_: [{
             "text": "I now prefer ripgrep over grep for repository search.",
             "confidence": "high",
             "rationale": "preference",
             "source": "explicit_intent",
         }])
-        monkeypatch.setattr(_engine, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
-        monkeypatch.setattr(_engine, "_find_conflicting_memory", lambda *_args, **_kwargs: (_store_mod.LoadedMemory(
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
+        monkeypatch.setattr(_runtime, "_find_conflicting_memory", lambda *_args, **_kwargs: (_store_mod.LoadedMemory(
             frontmatter=_store_mod.MemoryFrontmatter(
                 id="mem-old",
                 created="2026-06-02T00:00:00+00:00",
@@ -485,12 +534,12 @@ class TestReflectionSupersedesRegression:
             scope="user",
         ), 0.92))
         monkeypatch.setattr(_engine, "_is_correction", lambda _text: True)
-        monkeypatch.setattr(_engine, "_extract_keywords", lambda *_args, **_kwargs: ["ripgrep", "search", "tools"])
-        monkeypatch.setattr(_engine, "_validate_supersedes_targets", lambda *_: None)
-        monkeypatch.setattr(_engine, "_embed_single", lambda *_: [1.0, 0.0])
-        monkeypatch.setattr(_engine, "_cosine_sim", lambda *_: 0.0)
-        monkeypatch.setattr(_engine, "_is_procedure", lambda _text: False)
-        _engine._current_session_memory_ids.ids = {"mem-session"}
+        monkeypatch.setattr(_runtime, "_extract_keywords", lambda *_args, **_kwargs: ["ripgrep", "search", "tools"])
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_embed_single", lambda *_: [1.0, 0.0])
+        monkeypatch.setattr(_runtime, "_cosine_sim", lambda *_: 0.0)
+        monkeypatch.setattr(_runtime, "_is_procedure", lambda _text: False)
+        _runtime._current_session_memory_ids.ids = {"mem-session"}
 
         result = _engine._run_embedding_reflection([
             {"role": "user", "content": "Actually remember that I prefer ripgrep over grep now."},

@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2-beta — Memory Curator + v0.16.0 Telemetry Hooks
+
+### Memory Curator Module
+
+New `memory_curator.py` module (~450 LOC) with 4-phase curation pipeline:
+
+- **Phase 1 — TTL + Staleness** (`scan_for_stale`/`archive_expired`): Automatically detects expired (`valid_until` past) and stale (>90 days no access) memories. Moves them to cold storage JSONL. Exempts pinned/permanent entries.
+- **Phase 2 — Supersedes Archiving** (`archive_superseded`): Deep supersedes chains (depth >= 2) with no recent access are archived as a single cold-storage entry preserving chain lineage.
+- **Phase 3 — Similarity Detection** (`scan_for_similar`): BM25 token-overlap pair scoring (O(n²) clamped to 500 most-recent). Flags candidates above 0.6 threshold for optional LLM merge.
+- **Phase 4 — Cold Storage Engine** (JSONL read/write): Configurable 10MB cap with oldest-entry pruning. Supports restore via `_restore_from_cold()`.
+- **Integration**: Called from `runtime_hooks._on_session_end()` after episode compaction. Fail-open: exceptions caught and logged.
+- **Config**: `curator.*` under plugin config — enabled by default, runs on session end.
+- **Tests**: 15 unit tests covering all phases + full pipeline. 15/15 pass.
+
+### Body Refinement (v1.2)
+
+- **`_refine_body()`**: Strips fenced code blocks, `[Tool:xxx]` markers, tool-result prefixes, and collapses excess whitespace. Applied in both bridge write path and cold-storage archive to keep memory bodies clean.
+
+### v0.16.0 Enhanced Hooks
+
 ## v1.1 — Hermes Agent v0.16.0 Telemetry Hooks + Root-Cause Fixes
 
 ### v0.16.0 Enhanced Hooks
@@ -31,7 +51,7 @@
 - **Episode Compaction** (v1.1): `_compact_episode_zone()` clusters raw episode entries into daily summaries via LLM, running automatically after `on_session_end` reflection.
 - **Dead code cleanup**: Removed `QueryTemplate`/`ResultCache` (~170 lines) from `search.py`, `_classify_intent` embedding prototypes, `_embed_texts`, `_find_plugin_entry_by_content`, `_BUILTIN_MEMORY_DIR_MTIME`, duplicate `_hermes_home`/`_read_builtin_entries` from `context.py`, and legacy singleton functions from `__init__.py`. Net reduction: 625 lines across 9 files.
 - **Hermes Agent v1.1 compat fixes**: `PluginLlmStructuredResult.error` → `.content_type`/`.parsed` check; empty `input=[]` in `complete_structured` → text block; removed stale `test_query_cache.py`.
-- 227/241 tests pass (14 Windows temp dir permission errors, non-code).
+- 257/281 tests pass (24 Windows temp dir permission errors, non-code).
 
 ## v1.0-beta3 — Beta3 Cleanup + Runtime Contract Review
 

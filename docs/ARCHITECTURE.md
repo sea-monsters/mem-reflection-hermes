@@ -34,7 +34,8 @@
 │    ├── Full reflection pipeline                       │
 │    ├── Graph decay                                    │
 │    ├── Generate skill candidates                      │
-│    └── Write session summary + episode compaction     │
+│    ├── Write session summary + episode compaction     │
+│    └── Memory curator (v1.2) — stale/similar/archive  │
 ├──────────────────────────────────────────────────────┤
 │  Background Tasks                                     │
 │    ├── Micro-reflection queue (backpressure)          │
@@ -49,18 +50,20 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout
+## Module Layout (v1.2-beta)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
 | `store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers | — |
-| `search.py` | canonical | SearchIndex, BM25/embedding fusion, intent helpers | store |
+| `search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers | store |
 | `graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
 | `reflect.py` / `runtime_reflection.py` | canonical | ReflectionEngine, micro/full/raw-chunk reflection, audit logging, skill approval helpers | store, search |
-| `runtime_hooks.py` | canonical | Session hooks and slash command registration | store, reflect, search |
+| `memory_curator.py` | canonical (v1.2) | 4-phase curation: TTL/staleness, supersedes archive, similarity detection, cold storage | store, memory_bridge |
+| `memory_bridge.py` | canonical (v1.1) | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
+| `runtime_hooks.py` | canonical | Session hooks and slash command registration | store, reflect, search, memory_curator |
 | `runtime_tools.py` | canonical | 12 base SRH tool handlers and hook registration | store, search, reflect, runtime_hooks |
 | `runtime_graph.py` | canonical | Graph compatibility surface plus 5 graph/health tool registrations | graph, store |
-| `dashboard/plugin_api.py` | canonical | FastAPI dashboard routes backed by store/search/runtime graph APIs | package runtime services |
+| `dashboard/plugin_api.py` | canonical | FastAPI dashboard routes (15 endpoints) backed by store/search/runtime graph/curator APIs | package runtime services |
 | `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, `reflection/engine.py` | deprecated compat | Explicit old import paths forwarding to runtime modules | runtime_* |
 | `__init__.py` | canonical entry | Plugin registration, runtime singletons, package bootstrap | store, search, graph, reflect, runtime_* |
 
@@ -79,9 +82,22 @@ When adding new functionality, respect the module boundaries:
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety
+### Import Order Rules (v1.2)
 
-Key concurrency protections:
+When adding new functionality, respect the module boundaries:
+
+1. **store.py**: Data models, store logic, config — no Hermes dependencies
+2. **search.py**: Search and embedding helpers — imports from store only
+3. **graph.py**: GraphIndex — imports store only where cross-zone analysis needs memory metadata
+4. **reflect.py / runtime_reflection.py**: Reflection pipelines — import store + search
+5. **memory_curator.py**: Curation logic — imports store + memory_bridge (for body refinement)
+6. **memory_bridge.py**: Host sync — imports store only
+7. **runtime_hooks.py / runtime_tools.py / runtime_graph.py**: Host-facing runtime features — depend on canonical services
+8. **__init__.py**: Registration and runtime singletons — imports canonical modules explicitly
+
+### Thread Safety (v1.2-beta)
+
+Key concurrency protections present in v1.2-beta:
 
 | Resource | Protection |
 |----------|-----------|
@@ -93,6 +109,7 @@ Key concurrency protections:
 | `_classify_intent_stats` | `threading.Lock` via `_bump_classify_intent_stat` |
 | `_build_adjacency` | mtime check + DB query + cache update inside `self._lock` |
 | `get_cache()` singleton | Double-checked locking |
+| Cold store writes | `threading.Lock` (`_cold_store_lock`) guards JSONL append/rewrite |
 | Runtime late binding | Package-level explicit runtime delegates; legacy `late_binding.py` is retired |
 
 ## Slash Commands
@@ -134,7 +151,7 @@ all v0.16 hook points with zero-cost when no subscriber is active (`has_hook()` 
 | Hook Name | Handler | Purpose | v0.16+ kwargs Consumed |
 |-----------|---------|---------|----------------------|
 | `on_session_start` | `_on_session_start` | Reset turn counter, clear session exclusion set | — |
-| `on_session_end` | `_on_session_end` | Full reflection, graph decay, episode compaction, session cleanup | `session_id`, `reason` (v0.16: `"shutdown"` \| `"session_expired"` \| `"new_session"`) |
+| `on_session_end` | `_on_session_end` | Full reflection, graph decay, episode compaction, **memory curator**, session cleanup | `session_id`, `reason` (v0.16: `"shutdown"` \| `"session_expired"` \| `"new_session"`) |
 | `on_session_reset` | `_on_session_reset` | Log session rotation, clean per-session state (v0.16) | `reason`, `old_session_id`, `new_session_id` |
 | `pre_llm_call` | `_pre_llm_call` | Inject layered memory context, trigger micro-reflection | `messages`, `user_message`, `session_id`, `ctx` |
 | `post_tool_call` | `_post_tool_call` | Bridge Dir A, record effectiveness, build graph associations | `tool_name`, `args`, `result`, **`status`**, **`duration_ms`**, **`session_id`**, **`turn_id`** (v0.16 enhanced) |

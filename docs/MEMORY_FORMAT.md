@@ -112,31 +112,45 @@ valid and readable.
 │   │       └── SKILL.md
 │   ├── zone-cache/                   # Per-zone summary caches
 │   ├── palace-index.md              # Palace zone index
-│   └── memory-stats.jsonl           # Effectiveness tracking
+│   ├── memory-stats.jsonl           # Effectiveness tracking
+│   └── cold_store.jsonl             # Curator cold storage archive (v1.2)
 ├── plugins/
 │   └── mem-reflection-hermes/
 │       ├── __init__.py              # Plugin registration and runtime singletons
-│       ├── store.py                 # MemoryStore, SkillStore, frontmatter, lineage
-│       ├── search.py                # SearchIndex, embeddings, query templates/cache
-│       ├── graph.py                 # GraphIndex, PageRank, cross-zone analysis
-│       ├── reflect.py               # ReflectionEngine public facade
-│       ├── runtime_tools.py         # 12 base SRH tool handlers
-│       ├── runtime_hooks.py         # Hooks and slash commands
-│       ├── runtime_graph.py         # Graph/health tools and graph compat surface
-│       ├── runtime_reflection.py    # Reflection runtime helpers
-│       ├── reflection/engine.py     # Deprecated explicit old-path compatibility entry
-│       ├── hooks/lifecycle.py       # Deprecated explicit old-path compatibility entry
-│       ├── tools/handlers.py        # Deprecated explicit old-path compatibility entry
-│       ├── graph/compat.py          # Deprecated explicit old-path compatibility entry
 │       ├── plugin.yaml              # Plugin manifest
 │       ├── README.md                # Index document
+│       ├── core/                    # Storage, search, graph
+│       │   ├── store.py             # MemoryStore, SkillStore, frontmatter, lineage
+│       │   ├── search.py            # SearchIndex, BM25/embedding fusion
+│       │   └── graph.py             # GraphIndex, PageRank, cross-zone analysis
+│       ├── reflection/              # Reflection engine and runtime
+│       │   ├── engine.py            # ReflectionEngine, fact extraction
+│       │   └── runtime.py           # Full/micro reflection, audit, compaction
+│       ├── memory/                  # Curation, bridge, context assembly
+│       │   ├── curator.py           # Automated lifecycle curation (v1.2)
+│       │   ├── bridge.py            # Bidirectional host memory sync (v1.1)
+│       │   └── context.py           # 4-layer context assembly
+│       ├── runtime/                 # Tools and lifecycle hooks
+│       │   ├── tools.py             # 7 base SRH tool handlers
+│       │   ├── hooks.py             # Session hooks and slash commands
+│       │   └── graph.py             # 5 graph/health tools + compat surface
+│       ├── web/                     # FastAPI dashboard
+│       │   └── api.py               # 15 API endpoints
 │       ├── scripts/
-│       │   └── bench_latency.py     # Performance benchmark
-│       ├── PERF_REPORT.md           # Optimization report
-│       └── dashboard/
-│           ├── plugin_api.py        # FastAPI routes (14 endpoints)
-│           ├── dist/index.js        # React frontend (Memory Manager)
-│           └── manifest.json         # Dashboard tab registration
+│       │   ├── bench_latency.py     # Performance benchmark
+│       │   ├── smoke_host_contract.py  # Host contract validation
+│       │   └── migrate_memory_index.py # One-time index migration
+│       ├── docs/                    # Documentation
+│       │   ├── ARCHITECTURE.md
+│       │   ├── CHANGELOG.md
+│       │   ├── TOOLS.md
+│       │   ├── DASHBOARD.md
+│       │   ├── DATA_SAFETY.md
+│       │   ├── MEMORY_FORMAT.md
+│       │   └── testing/
+│       │       └── test-coverage.md
+│       └── dashboard/               # Dashboard frontend (built)
+│           └── dist/
 └── models/                          # ONNX model (optional)
     └── all-MiniLM-L6-v2-onnx/
         ├── model.onnx

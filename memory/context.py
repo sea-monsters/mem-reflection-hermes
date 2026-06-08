@@ -7,20 +7,70 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from .store import LoadedMemory, LoadedSkill, _tokenise, estimate_tokens, plugin_config
+    from ..core.store import LoadedMemory, LoadedSkill, _tokenise, _memory_tokens, plugin_config
 except ImportError:
-    import store as _store_mod
+    import sys
+    from pathlib import Path
+    _repo = Path(__file__).resolve().parent.parent
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("store", str(_repo / "core" / "store.py"))
+    _store_mod = importlib.util.module_from_spec(_spec)
+    sys.modules["store"] = _store_mod
+    _spec.loader.exec_module(_store_mod)
     LoadedMemory = _store_mod.LoadedMemory
     LoadedSkill = _store_mod.LoadedSkill
     _tokenise = _store_mod._tokenise
-    estimate_tokens = _store_mod.estimate_tokens
+    _memory_tokens = _store_mod._memory_tokens
     plugin_config = _store_mod.plugin_config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Path helpers (for built-in memory)
+# ---------------------------------------------------------------------------
+
+ENTRY_DELIMITER = "\n\u00a7\n"  # Section sign delimiter, matching memory_tool.py
+
+
+def _hermes_home() -> Path:
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        return Path(env_home)
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def _read_builtin_entries(target: str) -> List[str]:
+    """Read entries from MEMORY.md or USER.md (matches memory_tool.py format)."""
+    fname = "MEMORY.md" if target.lower() == "memory" else "USER.md"
+    path = _hermes_home() / "memories" / fname
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+        return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+    except OSError:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Context assembly
 # ---------------------------------------------------------------------------
+
+def build_context_block(query: str = "") -> str:
+    """Wrapper for build_context that uses global singletons.
+
+    This is the public API exported by memory.__init__.py.
+    """
+    from .. import _get_mem_store, _get_search_index, _get_skill_store
+    store = _get_mem_store()
+    search = _get_search_index()
+    skills = _get_skill_store()
+    return build_context(store, search, skills, query)
+
 
 def build_context(store, search, skills, query: str = "", max_tokens: int = 4000) -> str:
     """Build context block for LLM injection.
@@ -104,13 +154,17 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
 def _build_compacted_episode_block(store) -> str:
     """Load compacted episode summaries from the episode zone.
 
-    Scans episode zone for entries tagged 'compacted' and formats as a digest.
+    Searches for entries tagged 'compacted' and formats as a digest.
     """
     try:
-        all_ep = store.list_by_zone("episode")
-        compacted = [m for m in all_ep if "compacted" in (m.frontmatter.tags or [])]
+        compacted = store.search_by_tags(["compacted"], zone="episode", limit=20)
     except Exception:
-        return ""
+        # Fallback: scan episode zone for compacted entries
+        try:
+            all_ep = store.list_by_zone("episode")
+            compacted = [m for m in all_ep if "compacted" in (m.frontmatter.tags or [])]
+        except Exception:
+            return ""
 
     if not compacted:
         return ""
@@ -131,13 +185,25 @@ def _build_compacted_episode_block(store) -> str:
 # ---------------------------------------------------------------------------
 
 def _format_memory(mem: LoadedMemory, max_tokens: int = 100) -> str:
-    """Format a memory for context injection with token-aware truncation."""
+    """Format a memory for context injection with token-aware truncation.
+
+    Uses a simple heuristic for token estimation when BM25 tokenization
+    returns very few tokens (e.g., for repeated character sequences).
+    """
     body = mem.body.strip()
-    total = estimate_tokens(body)
-    if total > max_tokens:
-        ratio = len(body) / max(total, 1)
-        char_limit = int(max_tokens * ratio)
+    # Use BM25 tokenization first
+    tokens = _tokenise(body)
+    total_tokens = len(tokens)
+
+    # If BM25 tokenization produces unexpectedly few tokens for long text,
+    # use a character-based heuristic (assume ~4 chars per token for Latin)
+    estimated_tokens = max(total_tokens, len(body) // 4)
+
+    if estimated_tokens > max_tokens:
+        # Simple truncation based on character limit
+        char_limit = max_tokens * 4  # Approximate chars for max_tokens
         body = body[:char_limit]
+
     lines = [f"- [{mem.frontmatter.zone or 'general'}] {body}"]
     tags = getattr(mem.frontmatter, "tags", None)
     if tags:

@@ -18,25 +18,38 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-import store as _store_mod
+from core import store as _store_mod
 
 # Set up package namespace for runtime_reflection's relative imports
 _PKG = "mem_reflection_hermes_compaction_test"
 
 
 def _load_runtime_reflection():
-    """Load runtime_reflection.py with proper package context for relative imports."""
+    """Load reflection/runtime.py with proper package context for relative imports."""
     pkg = types.ModuleType(_PKG)
     pkg.__path__ = [str(_REPO)]
+    pkg.__package__ = _PKG
     sys.modules[_PKG] = pkg
-    sys.modules[f"{_PKG}.store"] = _store_mod
 
-    mod_path = _REPO / "runtime_reflection.py"
+    # Register subpackages so relative imports work
+    for sub in ("core", "reflection", "memory", "runtime"):
+        sub_mod = types.ModuleType(f"{_PKG}.{sub}")
+        sub_mod.__path__ = [str(_REPO / sub)]
+        sub_mod.__package__ = f"{_PKG}.{sub}"
+        sys.modules[f"{_PKG}.{sub}"] = sub_mod
+
+    # Register core.store and core.search so ..core.store resolves
+    sys.modules[f"{_PKG}.core.store"] = _store_mod
+    from core import search as _search_mod
+    sys.modules[f"{_PKG}.core.search"] = _search_mod
+
+    mod_path = _REPO / "reflection" / "runtime.py"
     spec = importlib.util.spec_from_file_location(
-        f"{_PKG}.runtime_reflection", str(mod_path))
+        f"{_PKG}.reflection.runtime", str(mod_path))
     if spec and spec.loader:
         mod = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_PKG}.runtime_reflection"] = mod
+        mod.__package__ = f"{_PKG}.reflection"
+        sys.modules[f"{_PKG}.reflection.runtime"] = mod
         spec.loader.exec_module(mod)
         return mod
     return None
@@ -45,7 +58,7 @@ def _load_runtime_reflection():
 _ref_mod = _load_runtime_reflection()
 _compact_episode_zone = _ref_mod._compact_episode_zone if _ref_mod else None
 
-from store import MemoryFrontmatter
+from core.store import MemoryFrontmatter
 
 
 def _seed_episode_entries(store, count: int, base_day: str = "2026-06-05"):

@@ -10,28 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .store import (
+from ..core.store import (
     LoadedMemory, MemoryFrontmatter, SkillFrontmatter, LoadedSkill,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
     serialize_frontmatter, read_memory, record_memory_stat,
     _lineage_latest, _lineage_root, _lineage_depth, _lineage_cycle_check,
     _is_expired, _is_context_mismatch, _classify_update_intent,
 )
-try:
-    from .search import _extract_keywords
-except ImportError:
-    import importlib.util as _i_util
-    from pathlib import Path as _Path
-    _search_path = _Path(__file__).resolve().parent.parent / "search.py"
-    _spec = _i_util.spec_from_file_location(
-        "mem_reflection_hermes.search", str(_search_path))
-    _search_mod = _i_util.module_from_spec(_spec)
-    import sys as _sys
-    _sys.modules["mem_reflection_hermes.search"] = _search_mod
-    _spec.loader.exec_module(_search_mod)
-    _extract_keywords = _search_mod._extract_keywords
-
-from .reflect import (
+from ..core.search import _extract_keywords
+from ..reflection.runtime import (
     _append_reflect_log, _recent_reflect_outcomes,
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_reflection, _run_embedding_micro_reflection,
@@ -128,7 +115,6 @@ def _serialize_frontmatter(data, body):
 def _read_memory(path):
     return read_memory(path)
 
-from . import match_skills  # noqa: E402
 
 # Tool handlers
 # ---------------------------------------------------------------------------
@@ -313,6 +299,7 @@ def _tool_srh_skill_search(args: dict, **kwargs) -> str:
     query = args.get("query", "")
     k = int(args.get("k", 3))
     skill_store = _get_skill_store()
+    from .. import match_skills
     skills = match_skills(skill_store.list(), query, k)
     out = []
     for s in skills:
@@ -986,8 +973,21 @@ def register(ctx) -> None:
 
 
 # Hooks imported from the public runtime facade for backward compat.
-from .runtime_hooks import _on_session_start, _on_session_end, _pre_llm_call, _post_tool_call  # noqa: F401
+from .hooks import _on_session_start, _on_session_end, _pre_llm_call, _post_tool_call  # noqa: F401
 
 
 register_tools = register
 __all__ = list(__all__) + ["register_tools"]
+
+
+
+# Public aliases for runtime/__init__.py exports
+# Map public names to internal implementation
+srh_memory_write = _tool_srh_memory_write
+srh_memory_search = _tool_srh_memory_search
+srh_memory_delete = _tool_srh_memory_delete
+srh_palace_navigate = _tool_srh_palace_recall  # palace_navigate maps to palace_recall
+srh_reflect_now = _tool_srh_reflect_now
+srh_skill_query = _tool_srh_skill_search  # skill_query maps to skill_search
+srh_compile_profile = _tool_srh_compile_profile
+

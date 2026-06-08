@@ -16,7 +16,7 @@ if str(_REPO) not in sys.path:
 
 # Use store.py dataclasses directly (leaf module, no relative imports).
 # core.py's MemoryFrontmatter lacks to_dict() needed by store.py's write_memory_atomic.
-from store import LoadedMemory, MemoryFrontmatter, MemoryEffectiveness
+from core.store import LoadedMemory, MemoryFrontmatter, MemoryEffectiveness
 
 
 def make_memory(

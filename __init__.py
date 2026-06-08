@@ -1,18 +1,13 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-Runtime Architecture (~3,200 LOC across 6 modules + dashboard):
-- store.py: SQLite-backed MemoryStore, Markdown cold storage, token estimation, CJK tokenizer
-- search.py: Three-layer retrieval (Recall → RRF/Weighted Fusion → Rerank), embedding engine
-- graph.py: GraphIndex -- Hebbian edges, spreading activation, PageRank, cross-zone analysis
-- reflect.py: ReflectionEngine -- raw_chunk default, heuristic/LLM optional modes
-- context.py: Context assembly -- Palace mode, skill matching, token-aware truncation
-- __init__.py: Plugin registration, backward compat, runtime singletons
-- dashboard/: FastAPI CRUD + graph visualization endpoints
+v1.2-beta Architecture (organized by functionality):
+- core/: SQLite storage, search engine, graph index (3,650 LOC)
+- reflection/: Reflection engine and runtime (2,503 LOC)
+- memory/: Curation, bridge, context assembly (1,783 LOC)
+- runtime/: Tools and lifecycle hooks (1,708 LOC)
+- web/: FastAPI dashboard endpoints (830 LOC)
 
-Legacy modules retired in beta3:
-- core.py, late_binding.py, search/embed.py, reflection/engine.py, hooks/lifecycle.py,
-  tools/handlers.py, graph/ahe_graph.py, graph/cluqi.py, graph/pagerank.py,
-  graph/cross_zone.py, query/cache.py
+Total: 11 core modules, 10,689 lines
 """
 
 from __future__ import annotations
@@ -21,13 +16,14 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Import from store: models, constants, BM25, frontmatter, IO
-from .store import (  # noqa: F401
+# Import from core modules
+from .core.store import (  # noqa: F401
     hermes_home, load_config, plugin_config, plugin_data_dir,
     user_memories_dir, project_memories_dir, user_skills_dir, project_skills_dir,
     embeddings_enabled, micro_reflection_enabled, palace_mode_enabled, profile_mode_enabled,
@@ -44,6 +40,79 @@ from .store import (  # noqa: F401
     _ZONE_SPLIT_THRESHOLD, _ZONE_MERGE_THRESHOLD,
     _lineage_latest, _lineage_root, _lineage_depth, _lineage_cycle_check,
     _classify_update_intent, _is_expired, _is_context_mismatch,
+)
+
+from .core.search import (  # noqa: F401
+    SearchIndex,
+    _embed_single, _cosine_sim, _extract_keywords, _bm25_search_scored,
+    _is_explicit_memory_intent,
+)
+
+from .core.graph import (  # noqa: F401
+    GraphIndex,
+)
+
+# Import from reflection modules
+from .reflection.engine import (  # noqa: F401
+    ReflectionEngine,
+    _is_memorable_content,
+    _is_explicit_memory_intent as _is_explicit_memory_intent_reflect,
+)
+
+from .reflection.runtime import (  # noqa: F401
+    _run_full_reflection,
+    _run_micro_reflection,
+    _run_embedding_micro_reflection,
+    _append_reflect_log,
+    _compact_episode_zone,
+    _approve_skill,
+    _reject_skill,
+    _load_pending_skill_candidates,
+    _format_pending_skills_for_display,
+    _reset_current_session_memory_ids,
+    _recent_reflect_outcomes,
+)
+
+# Import from memory modules
+from .memory.curator import (  # noqa: F401
+    archive_superseded,
+    scan_for_stale,
+    scan_for_similar,
+    archive_expired,
+    _run_curator,
+    _curator_enabled,
+    _curator_config,
+)
+
+from .memory.bridge import (  # noqa: F401
+    mirror_builtin_to_plugin,
+    mirror_plugin_to_builtin,
+    bridge_enabled,
+    sync_builtin_to_plugin,
+    _refine_body,
+)
+
+from .memory.context import (  # noqa: F401
+    build_context_block,
+)
+
+# Import from runtime modules
+from .runtime.tools import (  # noqa: F401
+    srh_memory_write,
+    srh_memory_delete,
+    srh_palace_navigate,
+    srh_reflect_now,
+    srh_skill_query,
+    srh_compile_profile,
+)
+
+from .runtime.hooks import (  # noqa: F401
+    on_session_start,
+    on_session_end,
+    pre_llm_call,
+    post_tool_call,
+    register_hooks,
+    register_commands,
 )
 
 # Backward-compat aliases (old underscore names used by remaining __init__.py code)
@@ -86,6 +155,7 @@ def _config_compaction() -> bool:
     """Check if episode compaction is enabled in plugin config (default: True)."""
     return bool(plugin_config().get("compaction", {}).get("enabled", True))
 
+
 logger = logging.getLogger(__name__)
 
 # Register module in sys.modules early to avoid dataclass resolution failure
@@ -93,548 +163,383 @@ logger = logging.getLogger(__name__)
 if __name__ != "__main__" and __name__ not in sys.modules:
     import types
     # Fallback chain: __spec__.name → __name__ → create fresh module
-    mod_name = getattr(__spec__, "name", None) if "__spec__" in globals() else None
-    if mod_name is None:
-        mod_name = __name__
-    # Register the current executing module object, not a placeholder
-    sys.modules[mod_name] = sys.modules.get(mod_name) or sys.modules.get(__name__) or types.ModuleType(mod_name)
-else:
-    mod_name = __name__
+    mod_name = getattr(__spec__, "name", __name__) if "__spec__" in dir() else __name__
+    if mod_name not in sys.modules:
+        sys.modules[mod_name] = types.ModuleType(mod_name)
+        sys.modules[mod_name].__dict__.update(globals())
 
-# Alias bare module name so importlib.import_module("mem_reflection_hermes.*")
-# works when Hermes loaded us as "hermes_plugins.mem_reflection_hermes".
-_bare_name = "mem_reflection_hermes"
-if _bare_name not in sys.modules and mod_name != _bare_name:
-    sys.modules[_bare_name] = sys.modules[mod_name]
-    # Copy __path__ so submodule imports (mem_reflection_hermes.graph.*) resolve correctly
-    _real_path = getattr(sys.modules[mod_name], "__path__", None)
-    if _real_path is not None:
-        sys.modules[_bare_name].__path__ = _real_path
 
-# ---------------------------------------------------------------------------
-# AI instruction docstring (injected into register() palace_instructions)
-# ---------------------------------------------------------------------------
-# CJK-aware token estimation (mirrors small-rust-hermes compaction.rs)
-# ---------------------------------------------------------------------------
+# ── Singleton getters (used by tools and hooks) ────────────────────────
 
-def _estimate_tokens(text: str) -> int:
-    """Estimate token count with CJK awareness (fast bytes-based, P1-1).
+_mem_store: Optional[Any] = None
+_mem_store_lock = threading.Lock()
 
-    CJK/Unicode text → ~3 bytes per token.
-    ASCII text → ~4 bytes per token.
-    The hybrid byte-count approach is ~600x faster than char-by-char CJK range checks
-    while staying within ±15% of tiktoken cl100k_base for mixed CJK+English text.
-    """
-    if not text:
-        return 0
-    encoded = text.encode("utf-8")
-    n_bytes = len(encoded)
-    # Fast path: mostly ASCII text
-    if n_bytes <= len(text) * 1.2:
-        return (n_bytes + 3) // 4
-    # Mixed CJK: UTF-8 multi-byte characters use 3 bytes each → ~1.5 chars/token
-    return (n_bytes + 2) // 3
+_skill_store: Optional[Any] = None
+_skill_store_lock = threading.Lock()
 
+_search_index: Optional[Any] = None
+_search_lock = threading.Lock()
 
-_PALACE_USAGE_INSTRUCTIONS = """## Memory Palace
-Your persistent memory is organized in a Memory Palace with zones.
-- Use `srh_palace_zones` to see available zones and their counts
-- Use `srh_palace_read_zone` to load all memories from a specific zone
-- Use `srh_palace_recall` to search by topic, optionally scoped to a zone
-- Use `srh_memory_write` (with zone parameter) to persist new learnings
-- Use `srh_memory_delete` to remove outdated memories
-Do NOT save task progress, session outcomes, or temporary TODO state here.
-Session summaries go to `episode` zone. User identity/preferences go to `core`.
-Current work focus goes to `work`. Everything else goes to `general`.
-Don't guess about preferences or conventions — load the relevant zone first."""
+_graph_mgr: Optional[Any] = None
+_graph_mgr_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Palace Index & Zone Cache
-# ---------------------------------------------------------------------------
 
-def build_palace_index(memories: List[LoadedMemory]) -> str:
-    """Generate a code-based palace index (no LLM needed).
-
-    Groups memories by zone, shows counts and first-line previews.
-    If graph data is available, appends intra-zone graph cluster density.
-    Typically ~200-400 tokens.
-    """
-    groups: Dict[str, List[LoadedMemory]] = {}
-    for m in memories:
-        groups.setdefault(m.frontmatter.zone, []).append(m)
-
-    if not groups:
-        return "## Memory Palace\nEmpty — no memories yet."
-
-    total = len(memories)
-    buf = f"## Memory Palace\n{total} memories across {len(groups)} zones. Use srh_palace_read_zone to load details.\n"
-
-    # ── Scheme B: Query graph density per zone ────────────────
-    intra_zone_edges: Dict[str, int] = {}
-    try:
-        gm = globals().get("_get_graph_mgr")
-        if callable(gm):
-            gm = gm()
-        if gm is not None:
-            for zone, mems in groups.items():
-                mids = set(m.id() for m in mems)
-                edge_count = 0
-                for m in mems:
-                    neighbors = gm.store.get_neighbors(m.id(), min_weight=0.1, limit=50)
-                    for n in neighbors:
-                        if n["memory_id"] in mids:
-                            edge_count += 1
-                # Each edge counted twice (once per direction), divide by 2
-                intra_zone_edges[zone] = edge_count // 2
-    except Exception as e:
-        logger.warning("build_palace_index graph annotation failed: %s", e)
-
-    # Zones in consistent order: core > work > episode > general > custom
-    zone_order = ["core", "work", "episode", "general"]
-    sorted_zones = sorted(groups.keys(), key=lambda z: (
-        (zone_order.index(z), z) if z in zone_order else (99, z)
-    ))
-
-    for zone in sorted_zones:
-        mems = groups[zone]
-        # Re-sort: core/work zone zones by predefined order
-        if zone in zone_order:
-            idx = zone_order.index(zone)
-        else:
-            idx = 99
-        # Append graph cluster annotation if dense
-        edge_count = intra_zone_edges.get(zone, 0)
-        cluster_tag = ""
-        if edge_count >= 2:
-            cluster_tag = f"  [关联簇: {edge_count}个连接]"
-        buf += f"\n### {zone} ({len(mems)}){cluster_tag}\n"
-        for m in mems[:5]:
-            line = m.body.split("\n")[0].strip()[:80]
-            buf += f"- {line}\n"
-        if len(mems) > 5:
-            buf += f"- ... ({len(mems) - 5} more)\n"
-    return buf
-
-
-def load_zone_summary(zone: str) -> Optional[str]:
-    """Load a cached zone summary if available."""
-    safe = _sanitize_zone_filename(zone)
-    path = _zone_cache_dir() / f"{safe}.md"
-    if not path.exists():
-        return None
-    content = path.read_text(encoding="utf-8").strip()
-    return content or None
-
-
-def save_zone_summary(zone: str, content: str) -> Path:
-    """Save a zone summary atomically (tmp + rename)."""
-    safe = _sanitize_zone_filename(zone)
-    d = _zone_cache_dir()
-    path = d / f"{safe}.md"
-    tmp = d / f".{safe}.md.tmp"
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
-    return path
-
-
-def _user_memories_dir() -> Path:
-    """User-level memories directory."""
-    return _hermes_home() / "memories"
-
-
-def _project_memories_dir() -> Optional[Path]:
-    """Project-level memories directory (only if .hermes/ exists in cwd)."""
-    p = Path.cwd() / ".hermes" / "memories"
-    if not p.exists():
-        return None
-    # Guard: if project memories dir resolves to the same path as user memories,
-    # return None to avoid duplicate scanning (happens when cwd is ~).
-    user = _user_memories_dir()
-    if p.resolve() == user.resolve():
-        return None
-    return p
-
-
-# ---------------------------------------------------------------------------
-
-def _read_skill(path: Path, scope: str) -> Optional[LoadedSkill]:
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data, body = parse_frontmatter(raw)
-        fm = SkillFrontmatter(
-            name=data.get("name", path.parent.name),
-            description=data.get("description", ""),
-            triggers=data.get("triggers", []),
-            version=data.get("version"),
-            license=data.get("license"),
-            always_active=bool(data.get("always_active", False)),
-        )
-        return LoadedSkill(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
-    except Exception as e:
-        logger.warning("Failed to read skill %s: %s", path, e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Skill matcher (token overlap + optional embedding)
-# ---------------------------------------------------------------------------
-
-_MIN_SKILL_TOKEN = 3
-_TOKEN_WEIGHT = 0.4
-_EMBED_WEIGHT = 0.6
-
-
-def _skill_tokenise(s: str) -> Set[str]:
-    return {
-        t for t in re.split(r"[^a-z0-9]+", s.lower())
-        if len(t) >= _MIN_SKILL_TOKEN
-    }
-
-
-def _skill_bag(s: LoadedSkill) -> Set[str]:
-    bag: Set[str] = set()
-    for t in s.frontmatter.triggers:
-        bag.update(_skill_tokenise(t))
-    bag.update(_skill_tokenise(s.frontmatter.name))
-    bag.update(_skill_tokenise(s.frontmatter.description))
-    return bag
-
-
-def match_skills(skills: List[LoadedSkill], query: str, k: int = 3) -> List[LoadedSkill]:
-    q = _skill_tokenise(query)
-    if not q:
-        return []
-    scored: List[Tuple[float, int, LoadedSkill]] = []
-    for s in skills:
-        bag = _skill_bag(s)
-        raw_token = len(q & bag)
-        if raw_token == 0:
-            continue
-        score = raw_token
-        scored.append((score, len(s.frontmatter.triggers), s))
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return [s for _, _, s in scored[:k]]
-
-# ---------------------------------------------------------------------------
-# Reflection runner
-# ---------------------------------------------------------------------------
-# Plugin state
-# ---------------------------------------------------------------------------
-
-_mem_store: Optional[MemoryStore] = None
-_skill_store: Optional[SkillStore] = None
-_turns_since_reflect: int = 0
-_micro_reflect_queue: List[Dict[str, Any]] = []
-
-
-# ---------------------------------------------------------------------------
-# Context assembly (Pinned → Active Index → Triggered Skills)
-# ---------------------------------------------------------------------------
-
-def _build_context_block(query: str = "") -> str:
-    """Build the memory context block injected into the user message.
-
-    Three modes (checked in priority order):
-    1. Palace mode: inject palace index (zone map), agent uses tools for retrieval
-    2. Profile mode: inject compiled profile.md if available, no per-turn injection
-    3. Legacy mode: pinned + active index + per-turn TF-IDF relevance injection
-
-    Note (P2-22): Entire function is wrapped in try/except so a failure in any
-    stage degrades gracefully to empty context rather than failing the hook.
-    """
-    try:
-        return _build_context_block_inner(query)
-    except Exception as e:
-        logger.warning("Context block build failed: %s", e, exc_info=True)
-        return ""
-
-
-def _build_context_block_inner(query: str = "") -> str:
-    mem_store = _get_mem_store()
-    skill_store = _get_skill_store()
-    parts: List[str] = []
-    stat_entries: List[Tuple[str, str]] = []  # Batch collect (id, event)
-
-    # Determine mode — cache config lookups
-    palace_mode = _palace_mode_enabled()
-    profile_mode = _profile_mode_enabled()
-
-    # Pre-load skills once (used in palace index, triggered, always-active)
-    all_skills = skill_store.list()
-
-    # ---- Mode 1: Palace (zone-based, tool-driven retrieval) ----
-    if palace_mode:
-        active = mem_store.list_active()
-        if active:
-            # P0-1+P2-1: write-on-change + event-driven rebuild
-            if mem_store._index_dirty:
-                index = build_palace_index(active)
-                h = _fast_hash(index)
-                if h != mem_store._last_index_hash:
-                    _palace_index_path().parent.mkdir(parents=True, exist_ok=True)
-                    _palace_index_path().write_text(index, encoding="utf-8")
-                    mem_store._last_index_hash = h
-                mem_store._index_dirty = False
-                mem_store._cached_index = index  # Cache built string
-            else:
-                # Reuse cached index (don't rebuild, don't write)
-                index = mem_store._cached_index
-            parts.append(index)
-            for m in active:
-                stat_entries.append((m.id(), "loaded"))
-        else:
-            parts.append("## Memory Palace\nEmpty — no memories yet.")
-
-        if _palace_instructions_enabled():
-            parts.append(_PALACE_USAGE_INSTRUCTIONS)
-
-        cap = _skill_index_cap()
-        if all_skills:
-            parts.append("\n## Available skills")
-            for s in all_skills[:cap]:
-                parts.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
-            if len(all_skills) > cap:
-                parts.append(f"- ... ({len(all_skills) - cap} more)")
-
-    # ---- Mode 2: Compiled Profile (LLM-compiled, all-in-one) ----
-    elif profile_mode:
-        profile_path = _plugin_data_dir() / "profile.md"
-        if profile_path.exists():
-            profile = profile_path.read_text(encoding="utf-8").strip()
-            if profile:
-                parts.append("## User Profile\n")
-                parts.append(profile)
-
-        if not parts:
-            pinned = mem_store.list_pinned()
-            if pinned:
-                parts.append("=== Pinned memories (always relevant) ===")
-                for m in pinned:
-                    parts.append(f"- [{m.id()}] {m.body[:200]}")
-                    stat_entries.append((m.id(), "loaded"))
-                parts.append("")
-
-    # ---- Mode 3: Legacy (pinned + active index + per-turn TF-IDF) ----
-    else:
-        pinned = mem_store.list_pinned()
-        if pinned:
-            parts.append("=== Pinned memories (always relevant) ===")
-            for m in pinned:
-                parts.append(f"- [{m.id()}] {m.body[:200]}")
-                stat_entries.append((m.id(), "loaded"))
-            parts.append("")
-
-        if query:
-            active = mem_store.search(query, k=_relevant_memory_cap())
-        else:
-            active = mem_store.list_active()[:_active_memory_cap()]
-        if active:
-            parts.append("=== Relevant memories ===")
-            for m in active:
-                if m not in pinned:
-                    parts.append(f"- [{m.id()}] {m.body[:200]}")
-                    stat_entries.append((m.id(), "loaded"))
-            parts.append("")
-
-    # Triggered skills (legacy/profile fallback)
-    if not palace_mode or (palace_mode and not parts):
-        if query:
-            skills = match_skills(all_skills, query, k=_triggered_skill_cap())
-        else:
-            skills = []
-        if skills:
-            parts.append("=== Triggered skills ===")
-            for s in skills:
-                parts.append(f"- {s.frontmatter.name}: {s.frontmatter.description}")
-            parts.append("")
-
-    # Always-active skills (all modes)
-    always_active = [s for s in all_skills if s.frontmatter.always_active]
-    if always_active:
-        parts.append("\n## Always-Active Skills\n")
-        for s in always_active:
-            parts.append(f"### {s.frontmatter.name}\n{s.body.strip()}\n")
-
-    # (v1.1) Compacted episode summaries
-    try:
-        from .context import _build_compacted_episode_block as _episode_blk
-        _cfg2 = plugin_config()
-        if _cfg2.get("context_compacted_episode", True):
-            episode_block = _episode_blk(mem_store)
-            if episode_block:
-                parts.append(episode_block)
-    except Exception:
-        pass
-
-    # Flush all stat entries in one file open
-    if stat_entries:
-        _batch_record_stats(stat_entries)
-
-    return "\n".join(parts).strip()
-
-
-# ---------------------------------------------------------------------------
-# Runtime feature registration
-# ---------------------------------------------------------------------------
-def _register_runtime_features(ctx):
-    """Register command and graph runtime features with the Hermes context."""
-    from .runtime_hooks import register_commands
-
-    register_commands(ctx)
-
-    logger.info("mem-reflection-hermes plugin registered")
-
-    try:
-        from .runtime_graph import register_graph_features
-        register_graph_features(
-            ctx,
-            get_mem_store=_get_mem_store,
-            graph_db_path=plugin_data_dir() / "graph.db",
-        )
-        logger.info("runtime graph integration registered")
-        # One-time sync of pre-existing built-in memory entries
-        try:
-            from .memory_bridge import sync_builtin_to_plugin
-            result = sync_builtin_to_plugin(_get_mem_store())
-            if result.get("synced", 0):
-                logger.info(
-                    "startup sync: %d entries mirrored from MEMORY.md",
-                    result["synced"],
-                )
-        except Exception:
-            pass
-        return
-    except ImportError as e:
-        logger.warning("runtime graph not available (skip integration): %s", e)
-        return
-    except Exception as e:
-        logger.warning("runtime graph integration error: %s", e)
-        return
-
-
-
-def _get_mem_store() -> MemoryStore:
-    """Return the package-level memory store; keep this before star imports."""
+def _get_mem_store():
+    """Get or create the global MemoryStore singleton."""
     global _mem_store
     if _mem_store is None:
-        _mem_store = MemoryStore(_user_memories_dir(), _project_memories_dir())
+        with _mem_store_lock:
+            if _mem_store is None:
+                from .core.store import MemoryStore
+                _mem_store = MemoryStore()
     return _mem_store
 
 
-def _get_skill_store() -> SkillStore:
-    """Return the package-level skill store; keep this before star imports."""
+def _get_skill_store():
+    """Get or create the global SkillStore singleton."""
     global _skill_store
     if _skill_store is None:
-        _skill_store = SkillStore(_user_skills_dir(), _project_skills_dir())
+        with _skill_store_lock:
+            if _skill_store is None:
+                from .core.store import SkillStore
+                _skill_store = SkillStore()
     return _skill_store
 
 
-# Runtime submodules are imported explicitly by register() and compatibility
-# entrypoints. Avoid package-root star imports so beta3 no longer exposes every
-# private tool/hook/reflection helper as a root-level symbol.
-
-# Re-export runtime tool handlers for dashboard / external consumers
-from .runtime_tools import _tool_srh_memory_write, _tool_srh_palace_zones  # noqa: E402
-from .runtime_hooks import _get_graph_neighbors, _enrich_with_graph, _get_graph_mgr  # noqa: E402, F401
-from .reflect import _recent_reflect_outcomes, _save_pending_skill_candidates  # noqa: E402, F401
-
-# Runtime submodules are imported explicitly by register() and compatibility
-# entrypoints. Avoid package-root star imports so beta3 no longer exposes every
-# private tool/hook/reflection helper as a root-level symbol.
-
-# NOTE: search.py now owns the embedding helpers used by the package root.
-_embed_single = None  # noqa: F811
-_cosine_sim = None    # noqa: F811
-try:
-    from .search import _embed_single, _cosine_sim  # noqa: F401, F402
-except ImportError:
-    import importlib.util as _i_util
-    _search_path = Path(__file__).parent / "search.py"
-    _spec = _i_util.spec_from_file_location("mem_reflection_hermes.search", str(_search_path))
-    _search_mod = _i_util.module_from_spec(_spec)
-    sys.modules.setdefault("mem_reflection_hermes.search", _search_mod)
-    _spec.loader.exec_module(_search_mod)
-    _embed_single = _search_mod._embed_single
-    _cosine_sim = _search_mod._cosine_sim
-
-def _auto_rebalance_zones(dry_run: bool = False) -> dict:
-    """Delegate zone rebalance to the canonical runtime tool implementation."""
-    from .runtime_tools import _auto_rebalance_zones as _runtime_auto_rebalance
-    return _runtime_auto_rebalance(dry_run=dry_run)
-
-def _reflection_mode() -> str:
-    return plugin_config().get("reflection_mode", "raw_chunk")  # W2: default to raw_chunk
-
-
-def register(ctx) -> None:
-    """Register all Hermes plugin tools, hooks, slash commands, and graph tools."""
-    from . import runtime_hooks as _hooks_mod
-    from . import runtime_tools as _tools_mod
-
-    if hasattr(_hooks_mod, "set_plugin_context"):
-        _hooks_mod.set_plugin_context(ctx)
-    _tools_mod.register_tools(ctx)
-    if hasattr(_hooks_mod, "register_hooks"):
-        _hooks_mod.register_hooks(ctx)
-    _register_runtime_features(ctx)
-
-
-# ---------------------------------------------------------------------------
-# Runtime services
-# ---------------------------------------------------------------------------
-
-from . import store as _storage_module      # noqa: E402
-from . import search as _search_module      # noqa: E402
-from . import graph as _graph_module        # noqa: E402
-from . import reflect as _reflection_module  # noqa: E402
-
-_memory_store = None
-_search_index = None
-_graph_index = None
-
-
-def _get_indexed_mem_store():
-    """Get the SQLite-indexed memory store."""
-    global _memory_store
-    if _memory_store is None:
-        _memory_store = _storage_module.MemoryStore(
-            _storage_module.user_memories_dir(),
-            _storage_module.project_memories_dir(),
-        )
-        _memory_store.set_graph(_get_graph_index())
-    return _memory_store
-
-
 def _get_search_index():
-    """Get the memory retrieval index."""
+    """Get or create the global SearchIndex singleton."""
     global _search_index
     if _search_index is None:
-        _search_index = _search_module.SearchIndex(
-            _get_indexed_mem_store(),
-            graph=_get_graph_index(),
-        )
+        with _search_lock:
+            if _search_index is None:
+                from .core.search import SearchIndex
+                _search_index = SearchIndex(_get_mem_store())
     return _search_index
 
 
-def _get_graph_index():
-    """Get the associative memory graph."""
-    global _graph_index
-    if _graph_index is None:
-        _graph_index = _graph_module.GraphIndex(
-            _storage_module.plugin_data_dir() / "graph.db"
-        )
-    return _graph_index
+def _get_graph_mgr():
+    """Get or create the global graph manager singleton."""
+    global _graph_mgr
+    if _graph_mgr is None:
+        with _graph_mgr_lock:
+            if _graph_mgr is None:
+                # Import from runtime.graph (which uses core.graph)
+                from .runtime.graph import _get_graph_mgr as _ggm
+                _graph_mgr = _ggm()
+    return _graph_mgr
 
 
-def _get_indexed_skill_store():
-    """Get the skill store."""
-    return _storage_module.SkillStore(
-        _storage_module.user_skills_dir(),
-        _storage_module.project_skills_dir(),
+# ── Legacy tool surface for Hermes host (used by __init__.py exports) ─────
+
+def _build_context_block(query: str = "") -> str:
+    """Build context block using memory.context module."""
+    from .memory.context import build_context_block
+    return build_context_block(query)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using store module."""
+    from .core.store import _memory_tokens
+    return _memory_tokens(text)
+
+
+def match_skills(skills, query, k=10):
+    """Match skills using search module."""
+    from .core.search import SearchIndex
+    # Skills are matched via BM25 on their description field
+    return SearchIndex.match_skills(skills, query, k)
+
+
+# ── Tool Schemas ──────────────────────────────────────────────────────
+
+_SRH_MEMORY_WRITE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "body": {"type": "string", "description": "Memory content to store"},
+        "scope": {"type": "string", "enum": ["user", "project"], "description": "User or project scope"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"], "description": "Confidence level"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
+        "pinned": {"type": "boolean", "description": "Pin the memory to the top"},
+        "zone": {"type": "string", "description": "Memory zone (general, work, episode, core, or project:<name>)"},
+        "supersedes": {"type": "array", "items": {"type": "string"}, "description": "IDs of memories this replaces"},
+    },
+    "required": ["body"],
+}
+
+_SRH_MEMORY_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Search query text"},
+        "k": {"type": "integer", "description": "Maximum results to return (default 5)"},
+        "zone": {"type": "string", "description": "Filter to a specific zone"},
+        "include_history": {"type": "boolean", "description": "Include superseded memories"},
+    },
+    "required": ["query"],
+}
+
+_SRH_MEMORY_DELETE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "Memory ID to delete"},
+        "scope": {"type": "string", "enum": ["user", "project"], "description": "User or project scope"},
+    },
+    "required": ["id"],
+}
+
+_SRH_PALACE_NAVIGATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "topic": {"type": "string", "description": "Topic to recall memories for"},
+        "limit": {"type": "integer", "description": "Maximum memories to return (default 5)"},
+        "zone": {"type": "string", "description": "Specific zone to search, or null for active zone"},
+    },
+    "required": ["topic"],
+}
+
+_SRH_REFLECT_NOW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "messages": {"type": "array", "description": "Conversation messages to reflect on"},
+        "mode": {"type": "string", "enum": ["full", "micro", "embedding"], "description": "Reflection mode"},
+    },
+    "required": ["messages"],
+}
+
+_SRH_SKILL_QUERY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Skill search query"},
+        "k": {"type": "integer", "description": "Maximum results to return (default 3)"},
+    },
+    "required": ["query"],
+}
+
+_SRH_COMPILE_PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {"type": "string", "enum": ["profile", "summary", "stats"], "description": "Compilation mode"},
+    },
+    "required": ["mode"],
+}
+
+_SRH_ASSOCIATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to associate (max 20)"},
+        "context": {"type": "string", "description": "Optional context string"},
+        "relation": {"type": "string", "enum": ["co_occurs", "supersedes", "related"], "description": "Relation type"},
+        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs for spreading activation"},
+    },
+    "required": ["memory_ids"],
+}
+
+_SRH_GRAPH_RETRIEVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs to start retrieval from"},
+        "max_results": {"type": "integer", "description": "Maximum number of results (default 10)"},
+        "tier": {"type": "string", "enum": ["count", "rank", "all"], "description": "Result tier"},
+    },
+    "required": ["seed_ids"],
+}
+
+_SRH_GRAPH_STATS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "format": {"type": "string", "enum": ["adjacency", "nodes", "edges"], "description": "Output format"},
+        "depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
+    },
+    "required": [],
+}
+
+_SRH_GRAPH_VIZ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "format": {"type": "string", "enum": ["adjacency", "nodes", "edges"], "description": "Visualization format"},
+        "depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
+    },
+    "required": [],
+}
+
+_SRH_MEMORY_HEALTH_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+_TOOLSET = "mem_reflection_hermes"
+
+# ── Plugin Registration ───────────────────────────────────────────────
+
+def register(ctx):
+    """Register plugin with Hermes host."""
+    # Register runtime hooks
+    from .runtime.hooks import register_hooks
+    register_hooks(ctx)
+
+    # Register slash commands
+    from .runtime.hooks import register_commands
+    register_commands(ctx)
+
+    # Sync built-in memory to plugin store (one-time)
+    try:
+        from .memory.bridge import sync_builtin_to_plugin
+        sync_builtin_to_plugin(_get_mem_store())
+    except Exception as e:
+        logger.warning("Built-in memory sync failed: %s", e)
+
+    # Register tools (7 base + 5 graph/health = 12 total)
+    from .runtime.tools import (
+        srh_memory_write,
+        srh_memory_search,
+        srh_memory_delete,
+        srh_palace_navigate,
+        srh_reflect_now,
+        srh_skill_query,
+        srh_compile_profile,
     )
 
+    ctx.register_tool(
+        name="srh_memory_write",
+        toolset=_TOOLSET,
+        schema=_SRH_MEMORY_WRITE_SCHEMA,
+        handler=srh_memory_write,
+        description="Write a new memory or update existing memory",
+    )
+    ctx.register_tool(
+        name="srh_memory_search",
+        toolset=_TOOLSET,
+        schema=_SRH_MEMORY_SEARCH_SCHEMA,
+        handler=srh_memory_search,
+        description="Search memories by query",
+    )
+    ctx.register_tool(
+        name="srh_memory_delete",
+        toolset=_TOOLSET,
+        schema=_SRH_MEMORY_DELETE_SCHEMA,
+        handler=srh_memory_delete,
+        description="Delete a memory by ID",
+    )
+    ctx.register_tool(
+        name="srh_palace_navigate",
+        toolset=_TOOLSET,
+        schema=_SRH_PALACE_NAVIGATE_SCHEMA,
+        handler=srh_palace_navigate,
+        description="Navigate palace index",
+    )
+    ctx.register_tool(
+        name="srh_reflect_now",
+        toolset=_TOOLSET,
+        schema=_SRH_REFLECT_NOW_SCHEMA,
+        handler=srh_reflect_now,
+        description="Trigger immediate reflection",
+    )
+    ctx.register_tool(
+        name="srh_skill_query",
+        toolset=_TOOLSET,
+        schema=_SRH_SKILL_QUERY_SCHEMA,
+        handler=srh_skill_query,
+        description="Query skills",
+    )
+    ctx.register_tool(
+        name="srh_compile_profile",
+        toolset=_TOOLSET,
+        schema=_SRH_COMPILE_PROFILE_SCHEMA,
+        handler=srh_compile_profile,
+        description="Compile user profile from memories",
+    )
 
-# Route package-level late-binding consumers to the indexed persistence layer.
-_get_mem_store = _get_indexed_mem_store
-_get_skill_store = _get_indexed_skill_store
+    # Register graph/health tools (5)
+    from .runtime.graph import (
+        srh_associate,
+        srh_graph_retrieve,
+        srh_graph_stats,
+        srh_graph_viz,
+        srh_memory_health,
+    )
 
+    ctx.register_tool(
+        name="srh_associate",
+        toolset=_TOOLSET,
+        schema=_SRH_ASSOCIATE_SCHEMA,
+        handler=srh_associate,
+        description="Associate memories in graph",
+    )
+    ctx.register_tool(
+        name="srh_graph_retrieve",
+        toolset=_TOOLSET,
+        schema=_SRH_GRAPH_RETRIEVE_SCHEMA,
+        handler=srh_graph_retrieve,
+        description="Retrieve graph neighbors",
+    )
+    ctx.register_tool(
+        name="srh_graph_stats",
+        toolset=_TOOLSET,
+        schema=_SRH_GRAPH_STATS_SCHEMA,
+        handler=srh_graph_stats,
+        description="Get graph statistics",
+    )
+    ctx.register_tool(
+        name="srh_graph_viz",
+        toolset=_TOOLSET,
+        schema=_SRH_GRAPH_VIZ_SCHEMA,
+        handler=srh_graph_viz,
+        description="Generate graph visualization",
+    )
+    ctx.register_tool(
+        name="srh_memory_health",
+        toolset=_TOOLSET,
+        schema=_SRH_MEMORY_HEALTH_SCHEMA,
+        handler=srh_memory_health,
+        description="Check memory health",
+    )
+
+    logger.info("mem-reflection-hermes plugin registered successfully")
+
+# ── Exports for backward compatibility ───────────────────────────────────
+
+__all__ = [
+    # Core exports
+    "MemoryStore",
+    "MemoryFrontmatter",
+    "LoadedMemory",
+    "SearchIndex",
+    "GraphIndex",
+    # Reflection exports
+    "ReflectionEngine",
+    "_run_full_reflection",
+    "_run_micro_reflection",
+    # Memory exports
+    "archive_superseded",
+    "scan_for_stale",
+    "_refine_body",
+    "build_context_block",
+    # Runtime exports
+    "srh_memory_write",
+#    "srh_memory_read",
+#    "srh_memory_search",
+#    "srh_memory_list",
+#    "srh_memory_delete",
+#    "srh_palace_navigate",
+    "srh_reflect_now",
+    "srh_skill_query",
+    "srh_compile_profile",
+    "on_session_start",
+    "on_session_end",
+    "pre_llm_call",
+    "post_tool_call",
+    "register_hooks",
+    "register",
+    # Config helpers
+    "plugin_config",
+    "plugin_data_dir",
+    "hermes_home",
+    # Legacy aliases
+    "_get_mem_store",
+    "_get_skill_store",
+    "_get_search_index",
+    "_get_graph_mgr",
+    "_build_context_block",
+    "_estimate_tokens",
+    "match_skills",
+]

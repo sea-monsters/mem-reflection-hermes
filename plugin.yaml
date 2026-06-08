@@ -1,19 +1,14 @@
 name: mem-reflection-hermes
-version: 1.0-beta3
-description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, runtime graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis, and dashboard graph/query APIs."
+version: 1.2-beta
+description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, runtime graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis, dashboard graph/query APIs, and memory curator (TTL/staleness/supersedes/similarity/auto-archive)."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:
-  - srh_memory_search
   - srh_memory_write
+  - srh_memory_search
   - srh_memory_delete
-  - srh_memory_history
-  - srh_skill_search
+  - srh_palace_navigate
   - srh_reflect_now
-  - srh_palace_zones
-  - srh_palace_read_zone
-  - srh_palace_recall
-  - srh_palace_search
-  - srh_palace_rebalance
+  - srh_skill_query
   - srh_compile_profile
   - srh_associate
   - srh_graph_retrieve

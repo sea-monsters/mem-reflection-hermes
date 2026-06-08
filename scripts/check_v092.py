@@ -23,8 +23,8 @@ if "mem_reflection_hermes" not in sys.modules:
     sys.modules["mem_reflection_hermes"] = mod
     spec.loader.exec_module(mod)
 
-from mem_reflection_hermes.runtime_graph import GraphStore
-from store import MemoryStore, MemoryFrontmatter
+from mem_reflection_hermes.runtime.graph import GraphStore
+from core.store import MemoryStore, MemoryFrontmatter
 
 
 def test_runtime_graph_surface():
@@ -139,13 +139,13 @@ def test_version():
     import yaml
     with open(Path(__file__).parent.parent / "plugin.yaml") as f:
         data = yaml.safe_load(f)
-    assert data['version'] == '1.0-beta3', f"Expected 1.0-beta3, got {data['version']}"
-    print("  PASS: Version is 1.0-beta3")
+    assert data['version'] == '1.2-beta', f"Expected 1.2-beta, got {data['version']}"
+    print("  PASS: Version is 1.2-beta")
 
 
 def main():
     print("=" * 60)
-    print("v1.0-beta3 Runtime Verification")
+    print("v1.2-beta Runtime Verification")
     print("=" * 60)
 
     tests = [

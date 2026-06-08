@@ -20,12 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from store import (
+from core.store import (
     LoadedMemory, _tokenise,
     _CJK_STOPWORDS, _STOPWORDS,
 )
-from graph.compat import GraphStore
-from store import MemoryFrontmatter
+from mem_reflection_hermes.runtime.graph import GraphStore
+from core.store import MemoryFrontmatter
 
 
 # ---------------------------------------------------------------------------

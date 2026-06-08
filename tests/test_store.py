@@ -18,7 +18,7 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_store", str(_REPO / "core" / "store.py"))
 _store = importlib.util.module_from_spec(_spec_store)
 sys.modules["_store"] = _store
 _spec_store.loader.exec_module(_store)

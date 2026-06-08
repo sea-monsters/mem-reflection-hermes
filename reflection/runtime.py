@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .store import (
+from ..core.store import (
     LoadedMemory, MemoryFrontmatter,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
     user_skills_dir as _user_skills_dir,
@@ -22,25 +22,11 @@ from .store import (
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
 )
-try:
-    from .search import (
-        _embed_single, _cosine_sim, _extract_keywords,
-        _is_explicit_memory_intent, _is_correction, _is_procedure,
-    )
-except ImportError:
-    import importlib.util as _i_util
-    from pathlib import Path as _Path
-    _search_path = _Path(__file__).resolve().parent / "search.py"
-    _spec = _i_util.spec_from_file_location(
-        "mem_reflection_hermes.search", str(_search_path))
-    _search_mod = _i_util.module_from_spec(_spec)
-    _spec.loader.exec_module(_search_mod)
-    _embed_single = _search_mod._embed_single
-    _cosine_sim = _search_mod._cosine_sim
-    _extract_keywords = _search_mod._extract_keywords
-    _is_explicit_memory_intent = _search_mod._is_explicit_memory_intent
-    _is_correction = _search_mod._is_correction
-    _is_procedure = _search_mod._is_procedure
+from ..core.search import (
+    _embed_single, _cosine_sim, _extract_keywords,
+    _is_explicit_memory_intent, _is_correction, _is_procedure,
+    _classify_intent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1022,15 +1008,33 @@ def _compute_novelty_score(new_text: str, existing_memories: List[LoadedMemory],
         filtered = [m for m in existing_memories if m.id() not in exclude_ids]
         return 1.0 - _tfidf_max_similarity(new_text, filtered)
 
-    # Encode each memory on demand (SearchIndex manages its own embed array)
+    # Try to use store's embed_index for fast vector lookup
+    store = _get_mem_store()
     max_sim = 0.0
-    for m in existing_memories:
-        if m.id() in exclude_ids:
-            continue
-        m_emb = _embed_single(m.body)
-        if m_emb is not None:
-            sim = _cosine_sim(new_emb, m_emb)
-            max_sim = max(max_sim, sim)
+    if store._embed_index is not None:
+        vectors = store._embed_index.get("vectors", {})
+        for m in existing_memories:
+            if m.id() in exclude_ids:
+                continue
+            m_emb = vectors.get(m.id())
+            if m_emb is not None:
+                sim = _cosine_sim(new_emb, m_emb)
+                max_sim = max(max_sim, sim)
+            else:
+                # Fallback: encode on demand
+                m_emb = _embed_single(m.body)
+                if m_emb is not None:
+                    sim = _cosine_sim(new_emb, m_emb)
+                    max_sim = max(max_sim, sim)
+    else:
+        # No embed index: encode each memory on demand
+        for m in existing_memories:
+            if m.id() in exclude_ids:
+                continue
+            m_emb = _embed_single(m.body)
+            if m_emb is not None:
+                sim = _cosine_sim(new_emb, m_emb)
+                max_sim = max(max_sim, sim)
 
     # Scale: 0.9 similarity = 0.1 novelty, 0.0 similarity = 1.0 novelty
     novelty = max(0.0, 1.0 - max_sim)
@@ -1048,17 +1052,32 @@ def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], thresh
     if new_emb is None:
         return None
 
+    store = _get_mem_store()
     best: Optional[Tuple[LoadedMemory, float]] = None
 
-    for m in existing:
-        if m.id() in exclude_ids:
-            continue
-        m_emb = _embed_single(m.body)
-        if m_emb is not None:
-            sim = _cosine_sim(new_emb, m_emb)
-            if sim > threshold:
-                if best is None or sim > best[1]:
-                    best = (m, sim)
+    if store._embed_index is not None:
+        vectors = store._embed_index.get("vectors", {})
+        for m in existing:
+            if m.id() in exclude_ids:
+                continue
+            m_emb = vectors.get(m.id())
+            if m_emb is None:
+                m_emb = _embed_single(m.body)
+            if m_emb is not None:
+                sim = _cosine_sim(new_emb, m_emb)
+                if sim > threshold:
+                    if best is None or sim > best[1]:
+                        best = (m, sim)
+    else:
+        for m in existing:
+            if m.id() in exclude_ids:
+                continue
+            m_emb = _embed_single(m.body)
+            if m_emb is not None:
+                sim = _cosine_sim(new_emb, m_emb)
+                if sim > threshold:
+                    if best is None or sim > best[1]:
+                        best = (m, sim)
     return best
 
 
@@ -1848,23 +1867,13 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
 
         bodies = [m.body.strip() for m in mems]
 
-        # Build summary: LLM if available, otherwise extractive
+        # Build summary: LLM if available, otherwise longest
         if ctx is not None and llm_summary_enabled and hasattr(ctx, "llm"):
             summary = _llm_summarize_cluster(day, bodies, ctx)
         else:
-            # No LLM: concatenate all unique facts so nothing is lost.
-            # De-duplicate near-identical bodies, then join with " | "
-            # and truncate to stay within reasonable token budget.
-            seen: set[str] = set()
-            unique: list[str] = []
-            for b in bodies:
-                if b not in seen:
-                    seen.add(b)
-                    unique.append(b)
-            joined = " | ".join(unique)
-            if len(joined) > 800:
-                joined = joined[:797] + "..."
-            summary = joined
+            summary = max(bodies, key=len)
+            if len(summary) > 300:
+                summary = summary[:297] + "..."
 
         fm = MemoryFrontmatter.new(
             source="system",
@@ -1910,26 +1919,10 @@ def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
         fallback = fallback[:297] + "..."
 
     try:
-        if hasattr(ctx, "llm") and hasattr(ctx.llm, "complete_structured") and callable(ctx.llm.complete_structured):
-            schema = {
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            }
-            result = ctx.llm.complete_structured(
-                instructions=prompt,
-                input=[{"type": "text", "text": prompt}],
-                json_schema=schema,
-                json_mode=True,
-                max_tokens=256,
-                timeout=15,
-            )
-            if result and result.parsed and isinstance(result.parsed, dict):
-                text = result.parsed.get("summary", "").strip()
-                if text:
-                    return text[:500]
-            elif result and isinstance(result.text, str) and result.text.strip():
-                text = result.text.strip()
+        if hasattr(ctx, "llm") and callable(ctx.llm):
+            response = ctx.llm(prompt)
+            if response and isinstance(response, str) and response.strip():
+                text = response.strip()
                 return text[:500]
     except Exception as e:
         logger.debug("LLM summary failed for %s: %s", day, e)

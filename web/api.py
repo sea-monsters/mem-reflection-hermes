@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from .. import __dict__ as _srh_dict
@@ -686,6 +689,109 @@ async def get_stats():
         "cache": cache_stats,
         "health": health,
     }
+
+
+# ---------------------------------------------------------------------------
+# Curator Dashboard (v1.2)
+# ---------------------------------------------------------------------------
+
+@router.get("/curator")
+async def get_curator():
+    """Return memory curator status and latest run report."""
+    store = _get_store()
+    result: Dict[str, Any] = {"available": False}
+
+    # Try to load the curator module
+    curator = None
+    try:
+        # Try relative import first (works when loaded as part of package)
+        from ..memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+        curator = True
+    except (ImportError, ValueError):
+        # ValueError: attempted relative import beyond top-level package
+        # This happens when web/api.py is loaded standalone (e.g., in test fixtures)
+        # Try absolute import as fallback, but only if the package is properly registered
+        try:
+            import sys
+            # Only use absolute import if the memory package is already in sys.modules
+            # (i.e., the package namespace was explicitly set up)
+            if "mem_reflection_hermes.memory.curator" in sys.modules:
+                from mem_reflection_hermes.memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
+                curator = True
+            else:
+                # Module not available
+                logger.debug("memory_curator module not available")
+                curator = None
+        except ImportError:
+            # Module genuinely not available
+            logger.debug("memory_curator module not available")
+            curator = None
+    except Exception as e:
+        logger.warning("Failed to load memory_curator module: %s", e)
+        curator = None
+
+    if curator is None:
+        result["error"] = "memory_curator module not available"
+        return result
+
+    try:
+        result["enabled"] = _curator_enabled(store)
+    except Exception:
+        result["enabled"] = False
+
+    try:
+        result["config"] = _curator_config(store)
+    except Exception:
+        result["config"] = {}
+
+    # Cold storage stats
+    try:
+        cold_path = _cold_store_path(store)
+        if cold_path.exists():
+            size_mb = round(cold_path.stat().st_size / (1024 * 1024), 2)
+            entries = _load_cold_store(store)
+
+            # Sanitize path for display (avoid leaking user home directory)
+            path_str = str(cold_path)
+            try:
+                # Try to replace user home with $HOME
+                import os
+                home = os.environ.get("HOME") or os.environ.get("USERPROFILE", "")
+                if home and path_str.startswith(home):
+                    display_path = path_str.replace(home, "$HOME", 1)
+                else:
+                    # Fall back to showing only the filename
+                    display_path = cold_path.name
+            except Exception:
+                display_path = cold_path.name
+
+            result["cold_storage"] = {
+                "path": display_path,
+                "size_mb": size_mb,
+                "entry_count": len(entries),
+                "cap_mb": result.get("config", {}).get("cold_storage", {}).get("max_archive_size_mb", 10),
+            }
+            if entries:
+                result["cold_storage"]["oldest_entry"] = entries[0].get("archived_at", "unknown")
+                result["cold_storage"]["newest_entry"] = entries[-1].get("archived_at", "unknown")
+        else:
+            result["cold_storage"] = {"path": str(cold_path), "size_mb": 0, "entry_count": 0}
+    except Exception as e:
+        result["cold_storage"] = {"error": str(e)}
+
+    # Last run report
+    try:
+        report_path = _cold_store_path(store).with_suffix(".report.json")
+        if report_path.exists():
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            result["last_run"] = report_data
+        else:
+            result["last_run"] = None
+    except Exception:
+        result["last_run"] = None
+
+    result["available"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------

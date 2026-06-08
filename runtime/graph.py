@@ -332,15 +332,15 @@ class GraphManagerCompat:
     def __init__(self, db_path: Path):
         # Import lazily to avoid circular imports at module load time
         try:
-            from .graph import GraphIndex  # type: ignore
+            from ..core.graph import GraphIndex
         except Exception:
             import importlib.util
             import sys
-            graph_path = Path(__file__).resolve().parent / "graph.py"
-            spec = importlib.util.spec_from_file_location("mem_reflection_hermes.graph_runtime", graph_path)
+            graph_path = Path(__file__).resolve().parent.parent / "core" / "graph.py"
+            spec = importlib.util.spec_from_file_location("mem_reflection_hermes.core.graph", graph_path)
             module = importlib.util.module_from_spec(spec)
             assert spec is not None and spec.loader is not None
-            sys.modules.setdefault("mem_reflection_hermes.graph_runtime", module)
+            sys.modules.setdefault("mem_reflection_hermes.core.graph", module)
             spec.loader.exec_module(module)
             GraphIndex = module.GraphIndex
         self._gi = GraphIndex(db_path)
@@ -717,3 +717,55 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
     )
 
     return {"graph_db_path": graph_db_path, "get_graph_manager": get_graph_manager_compat}
+
+
+# Public aliases for __init__.py register() to import
+def srh_associate(args: dict, **kwargs) -> str:
+    from .. import _get_mem_store, _get_graph_mgr
+    gm = _get_graph_mgr()
+    mids = args.get("memory_ids", [])[:20]
+    mem_store = _get_mem_store()
+    valid_mids = [mid for mid in mids if mem_store.get(mid) is not None]
+    if len(valid_mids) < 2:
+        return json.dumps({"error": "At least 2 valid memory IDs required", "valid_ids": valid_mids})
+    result = gm.associate_memories(valid_mids, args.get("context", ""), args.get("relation", "co_occurs"))
+    return json.dumps({**result, "validated_ids": valid_mids})
+
+
+def srh_graph_retrieve(args: dict, **kwargs) -> str:
+    from .. import _get_graph_mgr
+    gm = _get_graph_mgr()
+    seed_ids = args.get("seed_ids", [])
+    max_results = int(args.get("max_results", 10))
+    tier = args.get("tier", "count")
+    results = gm.retrieve(seed_ids, max_results=max_results, tier=tier)
+    return json.dumps({"results": results}, ensure_ascii=False)
+
+
+def srh_graph_stats(args: dict, **kwargs) -> str:
+    from .. import _get_graph_mgr
+    gm = _get_graph_mgr()
+    stats = gm.stats()
+    return json.dumps(stats, ensure_ascii=False)
+
+
+def srh_graph_viz(args: dict, **kwargs) -> str:
+    from .. import _get_graph_mgr
+    gm = _get_graph_mgr()
+    fmt = args.get("format", "adjacency")
+    depth = int(args.get("depth", 2))
+    viz = gm.visualize(format=fmt, depth=depth)
+    return json.dumps(viz, ensure_ascii=False)
+
+
+def srh_memory_health(args: dict, **kwargs) -> str:
+    from .. import _get_mem_store, _get_graph_mgr
+    mem_store = _get_mem_store()
+    gm = _get_graph_mgr()
+    stats = gm.stats()
+    total = stats.get("total_edges", 0)
+    return json.dumps({
+        "graph_edges": total,
+        "memories_indexed": len(mem_store.list_active()),
+        "status": "healthy" if total > 0 else "empty",
+    }, ensure_ascii=False)

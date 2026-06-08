@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import frontmatter
-from store import (
+from core.store import (
     MemoryFrontmatter,
     LoadedMemory,
     user_memories_dir,

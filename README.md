@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version** — see `plugin.yaml` for the canonical version. This release includes v0.16.0 telemetry hooks, episode compaction, dead code cleanup, and Hermes Agent interface compatibility fixes.
+**Current version: v1.2-beta** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive with tool-noise stripping), v0.16.0 telemetry hooks, episode compaction, and bidirectional memory bridge. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
@@ -22,6 +22,7 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **PageRank**: Centrality scores for hub memory identification
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
 - **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
+- **Memory Curator** (v1.2): Automated lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, cold storage with tool-noise stripping
 - **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + runtime search + zone analysis
 - **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
 - **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
@@ -37,18 +38,11 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
 | [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
-| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
-| [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
-| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
-| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 13 API endpoints |
+| [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 15 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
 | [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Test coverage map and host-contract smoke status |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
-| [docs/PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
-| [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
-| [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
+| [docs/PERF_REPORT.md](docs/PERF_REPORT.md) | Performance benchmark results |
 
 ## Quick Start
 

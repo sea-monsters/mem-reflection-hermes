@@ -17,13 +17,14 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from memory_bridge import (
+from memory.bridge import (
     _append_to_builtin,
     _char_count_builtin,
     _get_builtin_memory_dir,
     _is_duplicate_in_builtin,
     _is_duplicate_in_plugin,
     _read_builtin_entries,
+    _refine_body,
     bridge_enabled,
     get_bridge_stats,
     mirror_builtin_to_plugin,
@@ -179,7 +180,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_core_zone_and_short_body(self, tmp_path, monkeypatch):
         """Zone=core with short body should write to MEMORY.md."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "Testing is essential for software quality"
@@ -197,7 +198,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_non_core_zone_skipped(self, tmp_path, monkeypatch):
         """Non-core zones should not trigger Dir B."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "This is a work-related note"
@@ -210,7 +211,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_long_body_skipped(self, tmp_path, monkeypatch):
         """Bodies longer than DIR_B_MAX_CHARS should not sync."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "A" * 300  # > 200 char limit
@@ -223,7 +224,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_duplicate_skipped(self, tmp_path, monkeypatch):
         """Already-existing content should not be duplicated."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         body = "This entry already exists"
@@ -240,7 +241,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_empty_body_noop(self, tmp_path, monkeypatch):
         """Empty body should not write anything."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         result = mirror_plugin_to_builtin(body="", zone="core")
@@ -249,7 +250,7 @@ class TestMirrorPluginToBuiltin:
     def test_mirror_capacity_check(self, tmp_path, monkeypatch):
         """When MEMORY.md is near capacity, new entries should be rejected."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         # Fill MEMORY.md over capacity (memory limit is 2200 chars)
@@ -272,7 +273,7 @@ class TestBuiltinFileOps:
     def test_read_builtin_entries_missing_file(self, tmp_path, monkeypatch):
         """Non-existent file returns empty list."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         entries = _read_builtin_entries("memory")
@@ -281,7 +282,7 @@ class TestBuiltinFileOps:
     def test_read_builtin_entries_parses_delimiter(self, tmp_path, monkeypatch):
         """Entries separated by § should be correctly parsed."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         mem_path = tmp_path / "MEMORY.md"
@@ -295,7 +296,7 @@ class TestBuiltinFileOps:
     def test_is_duplicate_in_builtin_exists(self, tmp_path, monkeypatch):
         """Should detect existing entry."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "test dupe")
@@ -304,7 +305,7 @@ class TestBuiltinFileOps:
     def test_is_duplicate_in_builtin_missing(self, tmp_path, monkeypatch):
         """Should return False for non-existent entry."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         assert _is_duplicate_in_builtin("nonexistent") is False
@@ -312,7 +313,7 @@ class TestBuiltinFileOps:
     def test_append_to_builtin_adds_entry(self, tmp_path, monkeypatch):
         """Appending should write to the file."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         result = _append_to_builtin("memory", "new entry")
@@ -324,7 +325,7 @@ class TestBuiltinFileOps:
     def test_append_to_builtin_duplicate(self, tmp_path, monkeypatch):
         """Duplicate append should be rejected."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "dupe entry")
@@ -334,7 +335,7 @@ class TestBuiltinFileOps:
     def test_char_count_calculation(self, tmp_path, monkeypatch):
         """Char count should reflect total delimited size."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("memory", "hello")
@@ -344,7 +345,7 @@ class TestBuiltinFileOps:
     def test_user_target_ops(self, tmp_path, monkeypatch):
         """USER.md operations should work independently."""
         monkeypatch.setattr(
-            "memory_bridge._get_builtin_memory_dir",
+            "memory.bridge._get_builtin_memory_dir",
             lambda: tmp_path,
         )
         _append_to_builtin("user", "user detail")
@@ -417,5 +418,77 @@ class TestStats:
         stats = get_bridge_stats()
         for v in stats.values():
             assert v == 0
+
+
+# =====================================================================
+# Body Refinement (v1.2)
+# =====================================================================
+
+
+class TestRefineBody:
+    """Test _refine_body tool-call noise stripping + truncation."""
+
+    def test_strips_fenced_code_block(self):
+        body = 'User likes Python\n```json\n{"key": "value"}\n```\nThis is fine'
+        result = _refine_body(body)
+        assert "```json" not in result
+        assert '{"key": "value"}' not in result
+        assert "User likes Python" in result
+        assert "This is fine" in result
+
+    def test_strips_tool_marker(self):
+        body = "[Tool: search] found the answer"
+        result = _refine_body(body)
+        assert "[Tool:" not in result
+        assert "found the answer" in result
+
+    def test_strips_tool_output_tag(self):
+        body = "Before [tool_output]lots of noise[/tool_output] After"
+        result = _refine_body(body)
+        assert "[tool_output]" not in result
+        assert "Before" in result
+        assert "After" in result
+
+    def test_collapses_excess_whitespace(self):
+        body = "Line 1\n\n\n\nLine 2\n   \nLine 3"
+        result = _refine_body(body, max_chars=2000)
+        assert "\n\n\n" not in result
+        assert "Line 1" in result
+        assert "Line 2" in result
+
+    def test_truncates_long_body(self):
+        body = "A." + "x" * 600 + " B."
+        result = _refine_body(body, max_chars=100)
+        assert len(result) < 150
+        assert result.endswith("..")
+
+    def test_strips_tool_result_prefix(self):
+        body = "Tool search result: the sky is blue"
+        result = _refine_body(body)
+        assert "the sky is blue" in result
+        assert "Tool search" not in result
+
+    def test_preserves_clean_body(self):
+        body = "User prefers dark mode in all applications"
+        result = _refine_body(body)
+        assert result == body
+
+    def test_empty_body(self):
+        assert _refine_body("") == ""
+        assert _refine_body("   ") == ""
+
+    def test_strips_multiple_code_blocks(self):
+        body = (
+            "Summary:\n"
+            '```json\n{"a": 1}\n```\n'
+            "More:\n"
+            '```python\nx = 1\n```\n'
+            "Done"
+        )
+        result = _refine_body(body)
+        assert "```json" not in result
+        assert "```python" not in result
+        assert "Summary:" in result
+        assert "Done" in result
 
 

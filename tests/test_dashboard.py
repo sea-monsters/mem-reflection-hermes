@@ -15,6 +15,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -30,7 +31,7 @@ except ImportError:
 _REPO = Path(__file__).resolve().parent.parent
 
 # Load store module
-_spec_store = importlib.util.spec_from_file_location("_memory_store_module", str(_REPO / "store.py"))
+_spec_store = importlib.util.spec_from_file_location("_memory_store_module", str(_REPO / "core" / "store.py"))
 _store_module = importlib.util.module_from_spec(_spec_store)
 sys.modules["_memory_store_module"] = _store_module
 _spec_store.loader.exec_module(_store_module)
@@ -38,7 +39,7 @@ MemoryStore = _store_module.MemoryStore
 MemoryFrontmatter = _store_module.MemoryFrontmatter
 
 # Load graph module
-_spec_graph = importlib.util.spec_from_file_location("_memory_graph_module", str(_REPO / "graph.py"))
+_spec_graph = importlib.util.spec_from_file_location("_memory_graph_module", str(_REPO / "core" / "graph.py"))
 _graph_module = importlib.util.module_from_spec(_spec_graph)
 sys.modules["_memory_graph_module"] = _graph_module
 _spec_graph.loader.exec_module(_graph_module)
@@ -50,7 +51,7 @@ def _make_dashboard_app(store, graph, data_dir=None):
     from fastapi import FastAPI
     # Import dashboard router
     spec_api = importlib.util.spec_from_file_location(
-        "dashboard_api", str(_REPO / "dashboard" / "plugin_api.py")
+        "dashboard_api", str(_REPO / "web" / "api.py")
     )
     mod = importlib.util.module_from_spec(spec_api)
     sys.modules["dashboard_api"] = mod
@@ -68,6 +69,10 @@ def _make_dashboard_app(store, graph, data_dir=None):
     mock_srh.MemoryFrontmatter = _store_module.MemoryFrontmatter
 
     sys.modules["mem_reflection_hermes"] = mock_srh
+
+    # Ensure memory.curator is NOT in sys.modules (for test_curator_not_available)
+    sys.modules.pop("mem_reflection_hermes.memory.curator", None)
+    sys.modules.pop("mem_reflection_hermes.memory", None)
     # Also register submodules needed by dashboard
     for sub in ["graph", "query"]:
         sub_fqn = f"mem_reflection_hermes.{sub}"
@@ -256,6 +261,127 @@ class TestStatsEndpoint:
         assert data["memory_count"] == 1
         assert "zones" in data
         assert "health" in data
+
+
+# ---------------------------------------------------------------------------
+# Curator Dashboard (v1.2)
+# ---------------------------------------------------------------------------
+
+class TestCuratorEndpoint:
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_not_available(self, temp_dashboard):
+        """When memory_curator module is missing, curator returns available=False."""
+        client, store, graph = temp_dashboard
+        resp = client.get("/api/curator")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is False
+        assert "error" in data
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_available(self, temp_dashboard):
+        """With memory_curator loaded, return config + cold storage stats."""
+        client, store, graph = temp_dashboard
+
+        # Set up package namespace for relative imports in curator
+        _PKG = "mem_reflection_hermes"
+        if _PKG not in sys.modules:
+            pkg = types.ModuleType(_PKG)
+            pkg.__path__ = [str(_REPO)]
+            sys.modules[_PKG] = pkg
+
+        # Register core subpackage
+        if f"{_PKG}.core" not in sys.modules:
+            core_mod = types.ModuleType(f"{_PKG}.core")
+            core_mod.__path__ = [str(_REPO / "core")]
+            sys.modules[f"{_PKG}.core"] = core_mod
+
+        # Register core.store
+        if f"{_PKG}.core.store" not in sys.modules:
+            sys.modules[f"{_PKG}.core.store"] = _store_module
+
+        # Register memory subpackage
+        if f"{_PKG}.memory" not in sys.modules:
+            memory_mod = types.ModuleType(f"{_PKG}.memory")
+            memory_mod.__path__ = [str(_REPO / "memory")]
+            sys.modules[f"{_PKG}.memory"] = memory_mod
+
+        # Register memory.curator
+        _spec_cur = importlib.util.spec_from_file_location(
+            f"{_PKG}.memory.curator",
+            str(_REPO / "memory" / "curator.py"),
+        )
+        _cur_mod = importlib.util.module_from_spec(_spec_cur)
+        sys.modules[f"{_PKG}.memory.curator"] = _cur_mod
+        _spec_cur.loader.exec_module(_cur_mod)  # type: ignore
+
+        try:
+            resp = client.get("/api/curator")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["available"] is True
+            assert "enabled" in data
+            assert "config" in data
+            assert "cold_storage" in data
+            assert "last_run" in data
+        finally:
+            sys.modules.pop(f"{_PKG}.memory.curator", None)
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_curator_report_persisted(self, temp_dashboard):
+        """When _run_curator has saved a report, last_run populates."""
+        client, store, graph = temp_dashboard
+
+        # Set up package namespace for relative imports in curator
+        _PKG = "mem_reflection_hermes"
+        if _PKG not in sys.modules:
+            pkg = types.ModuleType(_PKG)
+            pkg.__path__ = [str(_REPO)]
+            sys.modules[_PKG] = pkg
+
+        if f"{_PKG}.core" not in sys.modules:
+            core_mod = types.ModuleType(f"{_PKG}.core")
+            core_mod.__path__ = [str(_REPO / "core")]
+            sys.modules[f"{_PKG}.core"] = core_mod
+
+        if f"{_PKG}.core.store" not in sys.modules:
+            sys.modules[f"{_PKG}.core.store"] = _store_module
+
+        if f"{_PKG}.memory" not in sys.modules:
+            memory_mod = types.ModuleType(f"{_PKG}.memory")
+            memory_mod.__path__ = [str(_REPO / "memory")]
+            sys.modules[f"{_PKG}.memory"] = memory_mod
+
+        # Register memory.curator
+        _spec_cur = importlib.util.spec_from_file_location(
+            f"{_PKG}.memory.curator",
+            str(_REPO / "memory" / "curator.py"),
+        )
+        _cur_mod = importlib.util.module_from_spec(_spec_cur)
+        sys.modules[f"{_PKG}.memory.curator"] = _cur_mod
+        _spec_cur.loader.exec_module(_cur_mod)  # type: ignore
+        try:
+            # Write a cached report
+            cold_path = _cur_mod._cold_store_path(store)
+            report_path = cold_path.with_suffix(".report.json")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps({
+                "timestamp": "2026-06-07T00:00:00Z",
+                "report": "curator: stale: 5 archived",
+                "stale": 5,
+                "archived": 3,
+                "superseded": 1,
+                "similar": 0,
+                "errors": [],
+            }), encoding="utf-8")
+            resp = client.get("/api/curator")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["last_run"] is not None
+            assert data["last_run"]["report"] == "curator: stale: 5 archived"
+            assert data["last_run"]["stale"] == 5
+        finally:
+            sys.modules.pop("mem_reflection_hermes.memory.curator", None)
 
 
 # ---------------------------------------------------------------------------

@@ -8,11 +8,11 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .store import (
+from ..core.store import (
     LoadedMemory, MemoryFrontmatter, record_memory_stat,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
 )
-from .reflect import (
+from ..reflection.engine import (
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_micro_reflection,
     _approve_skill, _reject_skill,
@@ -20,19 +20,7 @@ from .reflect import (
     _format_pending_skills_for_display,
     _reset_current_session_memory_ids,
 )
-try:
-    from .search import _is_explicit_memory_intent
-except ImportError:
-    import importlib.util as _i_util
-    from pathlib import Path as _Path
-    _search_path = _Path(__file__).resolve().parent.parent / "search.py"
-    _spec = _i_util.spec_from_file_location(
-        "mem_reflection_hermes.search", str(_search_path))
-    _search_mod = _i_util.module_from_spec(_spec)
-    import sys as _sys
-    _sys.modules["mem_reflection_hermes.search"] = _search_mod
-    _spec.loader.exec_module(_search_mod)
-    _is_explicit_memory_intent = _search_mod._is_explicit_memory_intent
+from ..core.search import _is_explicit_memory_intent
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +51,7 @@ __all__ = [
 
 _plugin_ctx: Any = None
 _session_messages: Dict[str, List[Dict[str, Any]]] = {}
-_session_messages_lock = threading.Lock()  # H20: protect concurrent session access
+_session_messages_lock = threading.Lock()
 
 # ── Session lifecycle tracking (v0.16.0 enhanced hooks) ─────────
 _SessionState = dict  # lightweight runtime state bag
@@ -207,6 +195,17 @@ def _on_session_end(**kwargs) -> None:
                     )
         except Exception as _ce:
             logger.debug("Episode compaction skipped: %s", _ce)
+
+        # ── Memory curator (v1.2) — runs after compaction ─────
+        try:
+            from .memory_curator import _curator_enabled, _run_curator
+            mem_store = _lb("_get_mem_store")()
+            if _curator_enabled(mem_store):
+                cur_result = _run_curator(ctx, mem_store)
+                if cur_result.get("archived", 0) or cur_result.get("superseded", 0) or cur_result.get("similar", 0):
+                    logger.info("Memory curator: %s", cur_result.get("report", "done"))
+        except Exception as _cue:
+            logger.warning("Memory curator failed: %s", _cue)
 
         _reset_current_session_memory_ids()
         _cleanup_session_state(session_id)
