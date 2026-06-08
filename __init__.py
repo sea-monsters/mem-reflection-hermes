@@ -503,6 +503,20 @@ def register(ctx):
 
     logger.info("mem-reflection-hermes plugin registered successfully")
 
+    # P2a: Register post-delete callback for graph cleanup
+    try:
+        ms = _get_mem_store()
+        gm = _get_graph_mgr()
+        if ms is not None and gm is not None:
+            def _on_memory_delete(mem_id: str) -> None:
+                try:
+                    gm.store.remove_memory(mem_id)
+                except Exception:
+                    logger.warning("Graph cleanup failed for deleted memory %s", mem_id, exc_info=True)
+            ms._post_delete_callbacks.append(_on_memory_delete)
+    except Exception as e:
+        logger.warning("Failed to register post-delete graph callback: %s", e)
+
 # ── Exports for backward compatibility ───────────────────────────────────
 
 __all__ = [

@@ -245,3 +245,45 @@ class TestLineageBoundaries:
 
         assert latest is not None
         assert latest.id() == "newer-successor"
+
+
+# ---------------------------------------------------------------------------
+# Post-delete callbacks (P2a)
+# ---------------------------------------------------------------------------
+
+
+class TestPostDeleteCallbacks:
+    def test_callbacks_invoked_on_delete(self, temp_store):
+        """Registered callbacks are called with the deleted memory's id."""
+        store = temp_store
+        called: list = []
+
+        def cb(mem_id: str) -> None:
+            called.append(mem_id)
+
+        store._post_delete_callbacks.append(cb)
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        store.put("user", fm, "delete me")
+        mid = fm.id
+
+        result = store.delete("user", mid)
+        assert result is True
+        assert mid in called
+
+    def test_callback_failure_does_not_block_delete(self, temp_store):
+        """A failing callback does not prevent the delete from succeeding."""
+        store = temp_store
+
+        def failing_cb(mem_id: str) -> None:
+            raise RuntimeError("callback failed")
+
+        store._post_delete_callbacks.append(failing_cb)
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        store.put("user", fm, "delete me anyway")
+        mid = fm.id
+
+        result = store.delete("user", mid)
+        assert result is True
+        assert store.get(mid) is None

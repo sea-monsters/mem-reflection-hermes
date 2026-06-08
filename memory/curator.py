@@ -290,7 +290,10 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
 
     # Restore to active store FIRST (idempotent, safe to retry)
     try:
-        from ..core.store import MemoryFrontmatter
+        try:
+            from ..core.store import MemoryFrontmatter
+        except ImportError:
+            from core.store import MemoryFrontmatter  # fallback for direct imports
         zone = found.get("zone", "general")
         orig_fm = found.get("original_frontmatter", {})
         fm = MemoryFrontmatter(
@@ -305,6 +308,14 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
             supersedes_reason=orig_fm.get("supersedes_reason", ""),
         )
         mem_store.put("user", fm, found.get("body", ""))
+        # P2b: Graph ensure_meta after successful restore (fail-open)
+        try:
+            from ..runtime.graph import get_graph_manager_compat
+            gm = get_graph_manager_compat()
+            if gm is not None:
+                gm.store.ensure_meta(fm.id, zone=zone)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Cold restore failed to write active memory: %s", e)
         return False
@@ -889,7 +900,37 @@ def merge_similar(mem_store) -> int:
 # ── Phase 4: Cold Storage (already implemented above via helpers) ─
 
 
-# ── Phase 5: Report ────────────────────────────────────────────
+# ── Phase 5: Orphan Edge Cleanup (P2a) ─────────────────────────
+
+def clean_orphan_edges(mem_store) -> int:
+    """Delete graph edges pointing to non-existent memories.
+
+    Periodic sweep (Path B) — complements immediate cleanup via
+    store.py post-delete callback.  Runs once per curator cycle.
+
+    Returns number of orphan rows deleted (edges + graph_meta).
+    Fail-open: if graph manager is unavailable or SQL fails, returns 0.
+    """
+    try:
+        from ..runtime.graph import get_graph_manager_compat
+        gm = get_graph_manager_compat()
+    except Exception:
+        gm = None
+    if gm is None:
+        return 0
+
+    try:
+        # Collect all currently valid memory IDs
+        all_ids = {m.id() for m in mem_store.list_active()}
+        if not all_ids:
+            return 0
+        return gm.store._gi.clean_orphan_edges(all_ids)
+    except Exception as e:
+        logger.warning("Curator orphan edge cleanup failed: %s", e)
+        return 0
+
+
+# ── Phase 6: Report ────────────────────────────────────────────
 
 def generate_report(
     detected_stale: int,
@@ -899,18 +940,9 @@ def generate_report(
     errors: List[str],
     merged_count: int = 0,
     compacted_count: int = 0,  # v1.3: chain compaction count
+    orphan_count: int = 0,     # P2a: orphan edge cleanup count
 ) -> str:
-    """Generate a text summary of curator actions for the reflection log.
-
-    Parameters:
-        detected_stale: Number of stale/expired memories detected
-        archived_stale: Number of stale/expired memories actually archived
-        archived_superseded: Number of superseded memories archived
-        similar_pairs: Number of similar memory pairs detected
-        merged_count: Number of memories archived during merge (v1.3)
-        compacted_count: Number of memories archived during chain compaction (v1.3)
-        errors: List of error messages
-    """
+    """Generate a text summary of curator actions for the reflection log."""
     parts: List[str] = []
     if detected_stale:
         parts.append(f"stale: {detected_stale} detected, {archived_stale} archived")
@@ -924,6 +956,8 @@ def generate_report(
         parts.append(f"similar: {similar_pairs} candidate pair(s) found")
     if merged_count:
         parts.append(f"merged: {merged_count} archived")
+    if orphan_count:
+        parts.append(f"orphan edges: {orphan_count} cleaned")
     if errors:
         parts.append(f"errors: {len(errors)}")
     if not parts:
@@ -947,6 +981,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         "compacted": 0,  # v1.3: chain compaction
         "similar": 0,
         "merged": 0,  # v1.3: memories archived during merge
+        "orphan_edges": 0,  # P2a: orphan edge cleanup
         "total_archived": 0,
         "errors": [],
     }
@@ -1001,6 +1036,14 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
     # Recalculate total archived including merge
     result["total_archived"] = result["archived"] + result["superseded"] + result["merged"]
 
+    # Phase 5: Orphan Edge Cleanup (P2a)
+    try:
+        orphan_cleaned = clean_orphan_edges(mem_store)
+        result["orphan_edges"] = orphan_cleaned
+    except Exception as e:
+        errors.append(f"orphan_edges: {e}")
+        logger.warning("Curator orphan edge cleanup failed: %s", e)
+
     result["errors"] = errors
     report_text = generate_report(
         detected_stale=result["stale"],
@@ -1009,6 +1052,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         similar_pairs=result["similar"],
         merged_count=result["merged"],
         compacted_count=result["compacted"],
+        orphan_count=result["orphan_edges"],
         errors=errors,
     )
     result["report"] = report_text
@@ -1026,6 +1070,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "compacted": result["compacted"],
             "similar": result["similar"],
             "merged": result["merged"],
+            "orphan_edges": result["orphan_edges"],
             "total_archived": result["total_archived"],
             "errors": result["errors"],
         }, ensure_ascii=False, default=str), encoding="utf-8")
@@ -1045,6 +1090,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "compacted": result["compacted"],
             "similar": result["similar"],
             "merged": result["merged"],
+            "orphan_edges": result["orphan_edges"],
             "errors": result["errors"],
         })
     except Exception:

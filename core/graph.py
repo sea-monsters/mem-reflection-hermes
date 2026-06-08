@@ -518,6 +518,33 @@ class GraphIndex:
             )
             conn.commit()
 
+    def clean_orphan_edges(self, valid_ids: Set[str]) -> int:
+        """Delete edges + meta where memory no longer exists in *valid_ids*.
+
+        Returns total count of rows deleted (edges + graph_meta).
+        Fail-open: on SQL error, logs warning and returns 0.
+        """
+        if not valid_ids:
+            return 0
+        placeholders = ",".join("?" * len(valid_ids))
+        ids_list = list(valid_ids)
+        deleted = 0
+        try:
+            with self._lock:
+                conn = self._get_conn()
+                deleted += conn.execute(
+                    f"DELETE FROM edges WHERE source_id NOT IN ({placeholders}) OR target_id NOT IN ({placeholders})",
+                    ids_list + ids_list,
+                ).rowcount
+                deleted += conn.execute(
+                    f"DELETE FROM graph_meta WHERE memory_id NOT IN ({placeholders})",
+                    ids_list,
+                ).rowcount
+                conn.commit()
+        except Exception as e:
+            logger.warning("Graph orphan edge cleanup failed: %s", e)
+        return deleted
+
     def close(self) -> None:
         """Checkpoint WAL and close connection."""
         if hasattr(self._local, "conn") and self._local.conn is not None:
