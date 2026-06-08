@@ -94,6 +94,23 @@ class MockStore:
     def list_active_effectiveness(self) -> Dict[str, Dict[str, Any]]:
         return self.eff_data
 
+    def update(self, mem_id, body=None, zone=None, confidence=None, tags=None, pinned=None):
+        """Mock for MemoryStore.update."""
+        mem = self.memories.get(mem_id)
+        if mem is None:
+            return None
+        if body is not None:
+            mem.body = body
+        if zone is not None:
+            mem.frontmatter.zone = zone
+        if confidence is not None:
+            mem.frontmatter.confidence = confidence
+        if tags is not None:
+            mem.frontmatter.tags = tags
+        if pinned is not None:
+            mem.frontmatter.pinned = pinned
+        return mem
+
 
 # Import curator module under test
 import sys
@@ -103,6 +120,7 @@ from memory.curator import (  # noqa: E402
     archive_expired,
     archive_superseded,
     scan_for_similar,
+    merge_similar,
     _cold_store_path,
     _load_cold_store,
     _run_curator,
@@ -209,6 +227,66 @@ class TestScanForSimilar:
         assert scan_for_similar(store) == []
 
 
+# ── Phase 3b: Similarity Merge ─────────────────────────────
+
+
+class TestMergeSimilar:
+    def test_merges_similar_pair(self):
+        """Two similar memories: one archived, keeper updated with merged body+tags."""
+        store = MockStore()
+        store.memories["keeper"] = MockMemory(
+            "keeper", "The user prefers OpenSpec SDD for development workflow and design patterns",
+            tags=["sdd"],
+        )
+        store.memories["dup"] = MockMemory(
+            "dup", "The user prefers OpenSpec SDD for development workflow design",
+            tags=["sdd", "workflow"],
+        )
+        result = merge_similar(store)
+        assert result == 1
+        # Keeper should still exist with updated body
+        assert "keeper" in store.memories
+        # Archived should be deleted
+        assert "dup" in store.deleted
+
+    def test_exact_dedup(self):
+        """Identical bodies: one archived deterministically."""
+        store = MockStore()
+        store.memories["a"] = MockMemory("a", "exact same content", tags=["x"])
+        store.memories["b"] = MockMemory("b", "exact same content", tags=["y"])
+        result = merge_similar(store)
+        assert result == 1
+        # Only one should remain (the one with smaller id alphabetically)
+        assert "a" in store.memories or "b" in store.memories
+        assert len(store.deleted) == 1
+
+    def test_skip_already_superseded(self):
+        """Memories already part of a supersedes chain are skipped."""
+        store = MockStore()
+        store.memories["a"] = MockMemory("a", "content alpha", supersedes=["old"])
+        store.memories["b"] = MockMemory("b", "content beta which is quite similar to alpha")
+        result = merge_similar(store)
+        assert result == 0  # 'a' has supersedes, skipped
+        assert "a" in store.memories
+        assert "b" in store.memories
+
+    def test_merge_updates_tags_union(self):
+        """Keeper's tags become union of both memories' tags."""
+        store = MockStore()
+        store.memories["x"] = MockMemory("x", "the user likes python programming for development work", tags=["python"])
+        store.memories["y"] = MockMemory("y", "the user likes python programming for development tasks and devops", tags=["python", "dev"])
+        merge_similar(store)
+        keeper = store.memories.get("x") or store.memories.get("y")
+        assert keeper is not None
+        assert "python" in keeper.frontmatter.tags
+        assert "dev" in keeper.frontmatter.tags
+        assert len(keeper.frontmatter.tags) == 2  # union, not duplicate
+
+    def test_merge_empty_store(self):
+        """No memories = no merge."""
+        assert merge_similar(MockStore()) == 0
+
+
 # ── Phase 4: Cold Storage ──────────────────────────────────────
 
 
@@ -227,10 +305,11 @@ class TestColdStorage:
 
 class TestReport:
     def test_generates_summary(self):
-        report = generate_report(2, 2, 1, 1, [])
+        report = generate_report(2, 2, 1, 1, [], merged_count=2)
         assert "stale: 2" in report
         assert "superseded: 1" in report
         assert "similar: 1" in report
+        assert "merged: 2" in report
 
     def test_empty_when_nothing(self):
         assert generate_report(0, 0, 0, 0, []) == "No curator actions"
