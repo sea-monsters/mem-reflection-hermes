@@ -666,6 +666,123 @@ def scan_for_similar(mem_store) -> List[Tuple[str, str, float]]:
     return candidates
 
 
+# ── Phase 3b: Similarity Merge ────────────────────────────
+
+
+def merge_similar(mem_store) -> int:
+    """Merge near-duplicate memories via supersedes chain.
+
+    Uses scan_for_similar() candidates, then for each pair:
+    - Exact duplicates: archive one, keep one
+    - Near-duplicates: merge body+tags, supersedes-link the older one
+    - Already-superseded memories are skipped
+
+    Returns count of memories archived during merge.
+    """
+    cfg = _curator_config(mem_store)
+    merge_threshold = cfg.get("similarity", {}).get("merge_threshold", 0.7)
+    candidates = scan_for_similar(mem_store)
+    if not candidates:
+        return 0
+
+    merged = 0
+    for id_a, id_b, score in candidates:
+        if score < merge_threshold:
+            continue
+        try:
+            mem_a = mem_store.get(id_a)
+            mem_b = mem_store.get(id_b)
+            if mem_a is None or mem_b is None:
+                continue
+
+            # Skip if either memory has already been superseded
+            fm_a = mem_a.frontmatter
+            fm_b = mem_b.frontmatter
+            if fm_a.supersedes or fm_b.supersedes:
+                continue
+
+            # Determine keeper (longer body) and archived (shorter)
+            if len(mem_a.body) >= len(mem_b.body):
+                keeper, archived = mem_a, mem_b
+            else:
+                keeper, archived = mem_b, mem_a
+
+            # Exact dedup: bodies are identical
+            if mem_a.body.strip() == mem_b.body.strip():
+                # Archive the one with shorter id (deterministic)
+                if id_a < id_b:
+                    to_archive = mem_a
+                else:
+                    to_archive = mem_b
+                # Archive directly without merge
+                entry = {
+                    "id": to_archive.id(),
+                    "body": _refine_body(to_archive.body),
+                    "zone": to_archive.frontmatter.zone,
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                    "tags": list(to_archive.frontmatter.tags or []) + ["archived", "cold", "dedup"],
+                    "original_frontmatter": {
+                        "created": to_archive.frontmatter.created,
+                        "confidence": to_archive.frontmatter.confidence,
+                        "pinned": to_archive.frontmatter.pinned,
+                        "supersedes": list(to_archive.frontmatter.supersedes or []),
+                    },
+                }
+                if _append_to_cold_store(mem_store, entry):
+                    try:
+                        mem_store.delete(to_archive.scope, to_archive.id())
+                        merged += 1
+                    except Exception:
+                        pass
+                continue
+
+            # Merge: combine bodies (dedup last-200 chars overlap)
+            keeper_body = keeper.body.strip()
+            archived_body = archived.body.strip()
+            # Simple overlap dedup: if keeper ends with archived's start, skip
+            overlap_len = 0
+            for i in range(min(200, len(archived_body)), 0, -1):
+                if keeper_body.endswith(archived_body[:i]):
+                    overlap_len = i
+                    break
+            merged_body = keeper_body
+            if overlap_len > 0:
+                merged_body += "\n---\n" + archived_body[overlap_len:]
+            else:
+                merged_body += "\n---\n" + archived_body
+
+            # Merge tags (union)
+            merged_tags = list(set((keeper.frontmatter.tags or []) + (archived.frontmatter.tags or [])))
+
+            # Update keeper
+            mem_store.update(keeper.id(), body=merged_body, tags=merged_tags)
+
+            # Archive the other via supersedes + cold storage
+            entry = {
+                "id": archived.id(),
+                "body": _refine_body(archived.body),
+                "zone": archived.frontmatter.zone,
+                "archived_at": datetime.now(timezone.utc).isoformat(),
+                "tags": list(archived.frontmatter.tags or []) + ["archived", "cold", "merged"],
+                "supersedes": [keeper.id()],  # Mark as superseded by keeper
+                "original_frontmatter": {
+                    "created": archived.frontmatter.created,
+                    "confidence": archived.frontmatter.confidence,
+                    "pinned": archived.frontmatter.pinned,
+                    "supersedes": list(archived.frontmatter.supersedes or []),
+                },
+            }
+            if _append_to_cold_store(mem_store, entry):
+                try:
+                    mem_store.delete(archived.scope, archived.id())
+                    merged += 1
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return merged
+
+
 # ── Phase 4: Cold Storage (already implemented above via helpers) ─
 
 
@@ -677,6 +794,7 @@ def generate_report(
     archived_superseded: int,
     similar_pairs: int,
     errors: List[str],
+    merged_count: int = 0,  # v1.3: merged memory count
 ) -> str:
     """Generate a text summary of curator actions for the reflection log.
 
@@ -685,18 +803,20 @@ def generate_report(
         archived_stale: Number of stale/expired memories actually archived
         archived_superseded: Number of superseded memories archived
         similar_pairs: Number of similar memory pairs detected
+        merged_count: Number of memories archived during merge (v1.3)
         errors: List of error messages
     """
     parts: List[str] = []
     if detected_stale:
         parts.append(f"stale: {detected_stale} detected, {archived_stale} archived")
     elif archived_stale:
-        # Edge case: archived_stale > 0 but detected_stale = 0 (shouldn't happen, but defensive)
         parts.append(f"stale: {archived_stale} archived")
     if archived_superseded:
         parts.append(f"superseded: {archived_superseded} archived")
     if similar_pairs:
         parts.append(f"similar: {similar_pairs} candidate pair(s) found")
+    if merged_count:
+        parts.append(f"merged: {merged_count} archived")
     if errors:
         parts.append(f"errors: {len(errors)}")
     if not parts:
@@ -718,7 +838,8 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         "archived": 0,
         "superseded": 0,
         "similar": 0,
-        "total_archived": 0,  # Sum of archived + superseded
+        "merged": 0,  # v1.3: memories archived during merge
+        "total_archived": 0,
         "errors": [],
     }
     errors: List[str] = []
@@ -753,12 +874,24 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         errors.append(f"similar: {e}")
         logger.warning("Curator similarity scan failed: %s", e)
 
+    # Phase 3b: Similarity Merge (v1.3)
+    try:
+        merged = merge_similar(mem_store)
+        result["merged"] = merged
+    except Exception as e:
+        errors.append(f"merge: {e}")
+        logger.warning("Curator similarity merge failed: %s", e)
+
+    # Recalculate total archived including merge
+    result["total_archived"] = result["archived"] + result["superseded"] + result["merged"]
+
     result["errors"] = errors
     report_text = generate_report(
         detected_stale=result["stale"],
         archived_stale=result["archived"],
         archived_superseded=result["superseded"],
         similar_pairs=result["similar"],
+        merged_count=result["merged"],
         errors=errors,
     )
     result["report"] = report_text
@@ -774,6 +907,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "archived": result["archived"],
             "superseded": result["superseded"],
             "similar": result["similar"],
+            "merged": result["merged"],
             "total_archived": result["total_archived"],
             "errors": result["errors"],
         }, ensure_ascii=False, default=str), encoding="utf-8")
@@ -791,6 +925,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
             "archived": result["archived"],
             "superseded": result["superseded"],
             "similar": result["similar"],
+            "merged": result["merged"],
             "errors": result["errors"],
         })
     except Exception:
