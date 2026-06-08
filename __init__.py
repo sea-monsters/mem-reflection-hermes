@@ -213,10 +213,13 @@ def _get_search_index():
         with _search_lock:
             if _search_index is None:
                 from .core.search import SearchIndex
-                from .core.reranker import _build_reranker
-                from .core.store import plugin_config, CONFIG_KEY_RERANKER
-                cfg = plugin_config()
-                reranker = _build_reranker(cfg.get(CONFIG_KEY_RERANKER, {}))
+                try:
+                    from .core.reranker import _build_reranker
+                    from .core.store import plugin_config, CONFIG_KEY_RERANKER
+                    cfg = plugin_config()
+                    reranker = _build_reranker(cfg.get(CONFIG_KEY_RERANKER, {}))
+                except Exception:
+                    reranker = None
                 _search_index = SearchIndex(_get_mem_store(), reranker=reranker)
     return _search_index
 

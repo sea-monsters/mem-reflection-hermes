@@ -562,8 +562,11 @@ def archive_superseded(mem_store) -> int:
                     try:
                         mem_store.delete(mem.scope, mid)
                         archived += 1
-                    except Exception:
-                        pass
+                    except Exception as _de:
+                        logger.warning(
+                            "Failed to delete memory %s after archiving to cold store: %s",
+                            mid, _de,
+                        )
 
     return archived
 
