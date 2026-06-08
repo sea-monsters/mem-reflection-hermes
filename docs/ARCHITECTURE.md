@@ -50,7 +50,7 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.2-beta)
+## Module Layout (v1.2-beta2)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
@@ -95,9 +95,9 @@ When adding new functionality, respect the module boundaries:
 7. **runtime_hooks.py / runtime_tools.py / runtime_graph.py**: Host-facing runtime features — depend on canonical services
 8. **__init__.py**: Registration and runtime singletons — imports canonical modules explicitly
 
-### Thread Safety (v1.2-beta)
+### Thread Safety (v1.2-beta2)
 
-Key concurrency protections present in v1.2-beta:
+Key concurrency protections present in v1.2-beta2:
 
 | Resource | Protection |
 |----------|-----------|

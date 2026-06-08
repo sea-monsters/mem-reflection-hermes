@@ -1,8 +1,8 @@
 # Test Coverage Documentation
 
-> Version: v1.2-beta
-> Last updated: 2026-06-07
-> Total tests: **257** (plus 24 Windows temp-dir permission errors, non-code)
+> Version: v1.2-beta2
+> Last updated: 2026-06-08
+> Total tests: **294** (plus 24 Windows temp-dir permission errors, non-code)
 > All tests pass on Python 3.14 / Windows 11
 
 ---
@@ -30,6 +30,7 @@
 | wave3 retrieval | test_wave3_retrieval.py | 10 | spreading activation, hub detection, BM25 CJK, fusion |
 | memory bridge | test_bridge.py | 9 | Dir A/B sync, dedup, zone filter, stats |
 | episode compaction | test_compaction.py | 8 | clustering, empty store, dry run, LLM fallback |
+| reranker | test_reranker.py | 13 | interface, factory, lazy load, SearchIndex integration |
 
 ---
 

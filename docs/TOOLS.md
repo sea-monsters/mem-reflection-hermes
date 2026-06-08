@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: **12 registered tools** (v1.2-beta).
+Current SRH tool surface: **12 registered tools** (v1.2-beta2).
 
 The 12 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 

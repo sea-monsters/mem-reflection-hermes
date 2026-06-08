@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.2-beta** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive with tool-noise stripping), v0.16.0 telemetry hooks, episode compaction, and bidirectional memory bridge. See [CHANGELOG](docs/CHANGELOG.md) for full history.
+**Current version: v1.2-beta2** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive with tool-noise stripping), v0.16.0 telemetry hooks, episode compaction, and bidirectional memory bridge. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
