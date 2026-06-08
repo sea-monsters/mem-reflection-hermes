@@ -6,7 +6,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,10 @@ class _GraphStoreShim:
     def remove_memory(self, memory_id: str) -> None:
         """Remove all edges and meta for *memory_id*."""
         self._gi.remove_memory(memory_id)
+
+    def clean_orphan_edges(self, valid_ids: Set[str]) -> int:
+        """Delete orphan edges + graph_meta for IDs not in *valid_ids*."""
+        return self._gi.clean_orphan_edges(valid_ids)
 
     def get_meta(self, memory_id: str) -> Optional[dict]:
         conn = self._conn()
