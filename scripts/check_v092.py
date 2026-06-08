@@ -61,7 +61,7 @@ def test_pagerank():
 def test_query_cache():
     """Test query cache and templates."""
     import importlib.util
-    search_path = Path(repo_root) / "search.py"
+    search_path = Path(repo_root) / "core" / "search.py"
     search_spec = importlib.util.spec_from_file_location("_search", str(search_path))
     search_mod = importlib.util.module_from_spec(search_spec)
     assert search_spec is not None and search_spec.loader is not None
@@ -139,13 +139,13 @@ def test_version():
     import yaml
     with open(Path(__file__).parent.parent / "plugin.yaml") as f:
         data = yaml.safe_load(f)
-    assert data['version'] == '1.2-beta', f"Expected 1.2-beta, got {data['version']}"
-    print("  PASS: Version is 1.2-beta")
+    assert data['version'] == '1.2-beta2', f"Expected 1.2-beta2, got {data['version']}"
+    print("  PASS: Version is 1.2-beta2")
 
 
 def main():
     print("=" * 60)
-    print("v1.2-beta Runtime Verification")
+    print("v1.2-beta2 Runtime Verification")
     print("=" * 60)
 
     tests = [
