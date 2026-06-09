@@ -264,6 +264,26 @@ class TestCompactChains:
         assert "v1" in store.memories
         assert "v2" in store.memories
 
+    def test_skips_pinned_intermediate(self, store):
+        """Pinned intermediate nodes are preserved, others archived."""
+        store.memories["v1"] = MockMemory("v1", "oldest", zone="core",
+                                           supersedes=[])
+        store.memories["v2"] = MockMemory("v2", "pinned body", zone="core",
+                                           supersedes=["v1"], pinned=True)
+        store.memories["v3"] = MockMemory("v3", "v3 body", zone="core",
+                                           supersedes=["v2"])
+        store.memories["v4"] = MockMemory("v4", "newest", zone="core",
+                                           supersedes=["v3"])
+        result = compact_superseded_chains(store)
+        # v3 is archived (only non-pinned intermediate), v2 is kept
+        assert result == 1
+        assert "v1" in store.memories
+        assert "v2" in store.memories  # pinned, preserved
+        assert "v3" in store.deleted
+        assert "v4" in store.memories
+        # v4.supersedes should point to v1 (skip v2,v3; v2 kept, v3 gone)
+        assert store.memories["v4"].frontmatter.supersedes == ["v1"]
+
 
 # ── Phase 3: Similarity Detection ──────────────────────────────
 
@@ -323,14 +343,18 @@ class TestMergeSimilar:
         assert len(store.deleted) == 1
 
     def test_skip_already_superseded(self):
-        """Memories already part of a supersedes chain are skipped."""
+        """Memories that have been superseded by another are skipped."""
         store = MockStore()
-        store.memories["a"] = MockMemory("a", "content alpha", supersedes=["old"])
+        # 'a' is the OLD memory, 'c' is the NEW memory that supersedes it
+        store.memories["a"] = MockMemory("a", "content alpha")
+        store.memories["c"] = MockMemory("c", "content gamma", supersedes=["a"])
         store.memories["b"] = MockMemory("b", "content beta which is quite similar to alpha")
         result = merge_similar(store)
-        assert result == 0  # 'a' has supersedes, skipped
+        # 'a' is superseded by 'c', so skipped; 'b' remains
+        assert result == 0
         assert "a" in store.memories
         assert "b" in store.memories
+        assert "c" in store.memories
 
     def test_merge_updates_tags_union(self):
         """Keeper's tags become union of both memories' tags."""

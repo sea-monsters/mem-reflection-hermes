@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -386,9 +387,25 @@ class GraphIndex:
         try:
             from .store import MemoryFrontmatter, _tokenise
         except ImportError:
-            import store as _store_mod
-            MemoryFrontmatter = _store_mod.MemoryFrontmatter
-            _tokenise = _store_mod._tokenise
+            # Fallback for direct loading (e.g., via importlib.util.spec_from_file_location)
+            if "_store" in sys.modules:
+                _store_mod = sys.modules["_store"]
+                MemoryFrontmatter = _store_mod.MemoryFrontmatter
+                _tokenise = _store_mod._tokenise
+            elif "_store_fallback" in sys.modules:
+                _store_mod = sys.modules["_store_fallback"]
+                MemoryFrontmatter = _store_mod.MemoryFrontmatter
+                _tokenise = _store_mod._tokenise
+            else:
+                _repo = Path(__file__).resolve().parent.parent
+                _store_spec = __import__("importlib.util").util.spec_from_file_location(
+                    "_store", str(_repo / "core" / "store.py")
+                )
+                _store_mod = __import__("importlib.util").util.module_from_spec(_store_spec)
+                sys.modules["_store"] = _store_mod
+                _store_spec.loader.exec_module(_store_mod)
+                MemoryFrontmatter = _store_mod.MemoryFrontmatter
+                _tokenise = _store_mod._tokenise
 
         pr = self.pagerank()
         if not pr:
@@ -524,22 +541,25 @@ class GraphIndex:
         Returns total count of rows deleted (edges + graph_meta).
         Fail-open: on SQL error, logs warning and returns 0.
         """
-        if not valid_ids:
-            return 0
-        placeholders = ",".join("?" * len(valid_ids))
-        ids_list = list(valid_ids)
         deleted = 0
         try:
             with self._lock:
                 conn = self._get_conn()
-                deleted += conn.execute(
-                    f"DELETE FROM edges WHERE source_id NOT IN ({placeholders}) OR target_id NOT IN ({placeholders})",
-                    ids_list + ids_list,
-                ).rowcount
-                deleted += conn.execute(
-                    f"DELETE FROM graph_meta WHERE memory_id NOT IN ({placeholders})",
-                    ids_list,
-                ).rowcount
+                if not valid_ids:
+                    # Empty set means all rows are orphaned
+                    deleted += conn.execute("DELETE FROM edges").rowcount
+                    deleted += conn.execute("DELETE FROM graph_meta").rowcount
+                else:
+                    placeholders = ",".join("?" * len(valid_ids))
+                    ids_list = list(valid_ids)
+                    deleted += conn.execute(
+                        f"DELETE FROM edges WHERE source_id NOT IN ({placeholders}) OR target_id NOT IN ({placeholders})",
+                        ids_list + ids_list,
+                    ).rowcount
+                    deleted += conn.execute(
+                        f"DELETE FROM graph_meta WHERE memory_id NOT IN ({placeholders})",
+                        ids_list,
+                    ).rowcount
                 conn.commit()
         except Exception as e:
             logger.warning("Graph orphan edge cleanup failed: %s", e)
