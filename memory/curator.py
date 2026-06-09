@@ -999,21 +999,21 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         errors.append(f"stale: {e}")
         logger.warning("Curator stale scan failed: %s", e)
 
-    # Phase 2: Supersedes Archiving
-    try:
-        superseded = archive_superseded(mem_store)
-        result["superseded"] = superseded
-    except Exception as e:
-        errors.append(f"superseded: {e}")
-        logger.warning("Curator supersedes archiving failed: %s", e)
-
-    # Phase 2b: Chain Compaction (v1.3)
+    # Phase 2: Chain Compaction (v1.3) — compress BEFORE deep-chain archive
     try:
         compacted = compact_superseded_chains(mem_store)
         result["compacted"] = compacted
     except Exception as e:
         errors.append(f"compacted: {e}")
         logger.warning("Curator chain compaction failed: %s", e)
+
+    # Phase 2a: Supersedes Archiving (remaining deep chains)
+    try:
+        superseded = archive_superseded(mem_store)
+        result["superseded"] = superseded
+    except Exception as e:
+        errors.append(f"superseded: {e}")
+        logger.warning("Curator supersedes archiving failed: %s", e)
 
     # Recalculate total archived
     result["total_archived"] = result["archived"] + result["superseded"] + result["compacted"]
@@ -1034,8 +1034,8 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         errors.append(f"merge: {e}")
         logger.warning("Curator similarity merge failed: %s", e)
 
-    # Recalculate total archived including merge
-    result["total_archived"] = result["archived"] + result["superseded"] + result["merged"]
+    # Recalculate total archived including merge + compact
+    result["total_archived"] = result["archived"] + result["superseded"] + result["compacted"] + result["merged"]
 
     # Phase 5: Orphan Edge Cleanup (P2a)
     try:
