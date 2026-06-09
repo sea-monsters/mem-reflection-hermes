@@ -341,11 +341,19 @@ class TestCleanOrphanEdges:
         ).fetchone()
         assert row["cnt"] == 0
 
-    def test_empty_valid_ids_is_noop(self, temp_graph_index):
-        """Passing empty set does nothing."""
+    def test_empty_valid_ids_clears_all(self, temp_graph_index):
+        """Passing empty set clears all graph rows (all are orphaned)."""
         gi = temp_graph_index
         gi.ensure_meta("mem-1", zone="general")
-        assert gi.clean_orphan_edges(set()) == 0
+        gi.ensure_meta("mem-2", zone="general")
+        gi.associate(["mem-1", "mem-2"])
+        # Both rows exist — empty valid set means all orphaned
+        cleaned = gi.clean_orphan_edges(set())
+        assert cleaned >= 2  # 2 meta + 1 edge
+        row = gi._get_conn().execute(
+            "SELECT COUNT(*) as cnt FROM graph_meta"
+        ).fetchone()
+        assert row["cnt"] == 0
 
     def test_removes_orphan_meta_only(self, temp_graph_index):
         """graph_meta row for non-existent memory is deleted even without edges."""

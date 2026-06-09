@@ -663,10 +663,15 @@ def compact_superseded_chains(mem_store) -> int:
             tail_id = chain[0]
             inter_ids = chain[1:-1]  # skip oldest and newest
 
-            # Archive intermediate nodes
+            # Archive intermediate nodes (skip pinned/kept)
             for mid in inter_ids:
                 mem = mem_store.get(mid)
                 if mem is None:
+                    continue
+                mem_fm = mem.frontmatter
+                if mem_fm.pinned:
+                    continue
+                if mem_fm.tags and any(t in ("keep", "permanent") for t in mem_fm.tags):
                     continue
                 entry = {
                     "id": mid,
@@ -810,10 +815,9 @@ def merge_similar(mem_store) -> int:
             if mem_a is None or mem_b is None:
                 continue
 
-            # Skip if either memory has already been superseded
-            fm_a = mem_a.frontmatter
-            fm_b = mem_b.frontmatter
-            if fm_a.supersedes or fm_b.supersedes:
+            # Skip if either memory has already been superseded by another
+            is_superseded = getattr(mem_store, "is_superseded", lambda _: False)
+            if is_superseded(id_a) or is_superseded(id_b):
                 continue
 
             # Determine keeper (longer body) and archived (shorter)
