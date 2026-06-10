@@ -18,36 +18,51 @@ logger = logging.getLogger(__name__)
 _COLD_STORE_FILENAME = "cold_store.jsonl"
 _cold_store_lock = threading.Lock()
 
+# Resolve the shared late-binding helper safely for both package and standalone
+# module loading.
+try:
+    from mem_reflection_hermes.runtime._lb import _lb as _lb_fn
+except ImportError:
+    _lb_fn = None
+if _lb_fn is None:
+    try:
+        from runtime._lb import _lb as _lb_fn
+    except ImportError:
+        _lb_fn = None
+
 
 def _resolve_plugin_data_dir():
-    try:
-        from ...core.store import plugin_data_dir
-        return plugin_data_dir()
-    except Exception:
-        return None
+    core_store = _lb_fn("mem_reflection_hermes.core.store") if _lb_fn is not None else None
+    if core_store is None:
+        core_store = _lb_fn("core.store") if _lb_fn is not None else None
+    if core_store is not None and hasattr(core_store, "plugin_data_dir"):
+        return core_store.plugin_data_dir()
+    return None
 
 
 def _resolve_memory_frontmatter(*args, **kwargs):
-    try:
-        from ...core.store import MemoryFrontmatter
-        return MemoryFrontmatter(*args, **kwargs)
-    except Exception:
-        # Fallback dataclass for standalone tests
-        from dataclasses import dataclass, field
+    core_store = _lb_fn("mem_reflection_hermes.core.store") if _lb_fn is not None else None
+    if core_store is None:
+        core_store = _lb_fn("core.store") if _lb_fn is not None else None
+    if core_store is not None and hasattr(core_store, "MemoryFrontmatter"):
+        return core_store.MemoryFrontmatter(*args, **kwargs)
 
-        @dataclass
-        class _FallbackFM:
-            id: str
-            created: str
-            source: str
-            confidence: str
-            zone: str = "general"
-            tags: list = field(default_factory=list)
-            pinned: bool = False
-            supersedes: list = field(default_factory=list)
-            supersedes_reason: str = ""
+    # Fallback dataclass for standalone tests
+    from dataclasses import dataclass, field
 
-        return _FallbackFM(*args, **kwargs)
+    @dataclass
+    class _FallbackFM:
+        id: str
+        created: str
+        source: str
+        confidence: str
+        zone: str = "general"
+        tags: list = field(default_factory=list)
+        pinned: bool = False
+        supersedes: list = field(default_factory=list)
+        supersedes_reason: str = ""
+
+    return _FallbackFM(*args, **kwargs)
 
 
 def _cold_store_path(mem_store) -> Path:
@@ -107,16 +122,22 @@ def _curator_config_for_cold(mem_store) -> Dict[str, Any]:
         },
         "cold_storage": {"enabled": True, "max_archive_size_mb": 10},
     }
-    try:
-        from ...core.store import plugin_config
-        cfg = plugin_config().get("curator", {})
-    except Exception:
-        cfg = {}
+    cfg: Dict[str, Any] = {}
+    if mem_store is not None and hasattr(mem_store, "_plugin_config_override"):
+        cfg = mem_store._plugin_config_override.get("curator", {})
+    else:
+        core_store = _lb_fn("mem_reflection_hermes.core.store") if _lb_fn is not None else None
+        if core_store is None:
+            core_store = _lb_fn("core.store") if _lb_fn is not None else None
+        if core_store is not None and hasattr(core_store, "plugin_config"):
+            cfg = core_store.plugin_config().get("curator", {})
+        else:
+            cfg = {}
     merged = dict(_DEFAULT_CFG)
     merged.update(cfg)
     for key in ("ttl", "stale", "episode", "similarity", "cold_storage"):
         if key in cfg and isinstance(cfg[key], dict):
-            merged[key] = dict(merged.get(key, {}))
+            merged[key] = dict(_DEFAULT_CFG.get(key, {}))
             merged[key].update(cfg[key])
     return merged
 
@@ -212,16 +233,20 @@ def _restore_from_cold(mem_store, memory_id: str) -> bool:
     )
     try:
         mem_store.put("user", fm, found.get("body", ""))
-        try:
-            from ...runtime.graph import get_graph_manager_compat
-            gm = get_graph_manager_compat()
-            if gm is not None:
-                gm.store.ensure_meta(fm.id, zone=zone)
-        except Exception:
-            pass
     except Exception as e:
         logger.warning("Cold restore failed to write active memory: %s", e)
         return False
+
+    graph_mod = _lb_fn("mem_reflection_hermes.runtime.graph") if _lb_fn is not None else None
+    if graph_mod is None:
+        graph_mod = _lb_fn("runtime.graph") if _lb_fn is not None else None
+    if graph_mod is not None and hasattr(graph_mod, "get_graph_manager_compat"):
+        try:
+            gm = graph_mod.get_graph_manager_compat()
+            if gm is not None:
+                gm.store.ensure_meta(fm.id, zone=zone)
+        except Exception as e:
+            logger.debug("Cold restore graph meta update skipped: %s", e)
 
     path = _cold_store_path(mem_store)
     try:

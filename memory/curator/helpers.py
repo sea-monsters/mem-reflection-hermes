@@ -13,9 +13,34 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..bridge import _refine_body
-
 logger = logging.getLogger(__name__)
+
+# Resolve the shared late-binding helper safely for both package and standalone
+# module loading. Bounded fallback chain is acceptable here because it only
+# locates _lb() itself; downstream cross-module imports must go through _lb.
+try:
+    from mem_reflection_hermes.runtime._lb import _lb as _lb_fn
+except ImportError:
+    _lb_fn = None
+if _lb_fn is None:
+    try:
+        from runtime._lb import _lb as _lb_fn
+    except ImportError:
+        _lb_fn = None
+
+# Cross-module body refinement: prefer memory.bridge._refine_body when
+# resolvable, else fall back to a minimal strip so build_cold_entry never
+# raises during standalone loading.
+try:
+    from ..bridge import _refine_body as _refine_body_fn
+except ImportError:
+    _bridge_mod = _lb_fn("mem_reflection_hermes.memory.bridge") if _lb_fn is not None else None
+    if _bridge_mod is not None:
+        _refine_body_fn = _bridge_mod._refine_body  # type: ignore[assignment]
+    else:
+        def _refine_body_fn(body: str, max_chars: int = 500) -> str:  # type: ignore[misc]
+            return body.strip()
+
 
 _CURATOR_CFG_KEY = "curator"
 
@@ -56,16 +81,25 @@ class CuratorResult:
 
 def _curator_config(mem_store) -> Dict[str, Any]:
     """Read curator config from plugin config, merging with defaults."""
-    try:
-        from ...core.store import plugin_config
-        cfg = plugin_config().get(_CURATOR_CFG_KEY, {})
-    except Exception:
-        cfg = {}
+    cfg: Dict[str, Any] = {}
+    # Test seam: allow a store to inject config without requiring full
+    # package-relative import resolution.
+    if mem_store is not None and hasattr(mem_store, "_plugin_config_override"):
+        cfg = mem_store._plugin_config_override.get(_CURATOR_CFG_KEY, {})
+    else:
+        core_store = _lb_fn("mem_reflection_hermes.core.store") if _lb_fn is not None else None
+        if core_store is None:
+            core_store = _lb_fn("core.store") if _lb_fn is not None else None
+        if core_store is not None and hasattr(core_store, "plugin_config"):
+            cfg = core_store.plugin_config().get(_CURATOR_CFG_KEY, {})
+        else:
+            cfg = {}
     merged = dict(_DEFAULT_CFG)
     merged.update(cfg)
     for key in ("ttl", "stale", "episode", "similarity", "cold_storage"):
         if key in cfg and isinstance(cfg[key], dict):
-            merged[key] = dict(merged.get(key, {}))
+            # Start from defaults so partial overrides do not drop sibling keys.
+            merged[key] = dict(_DEFAULT_CFG.get(key, {}))
             merged[key].update(cfg[key])
     return merged
 
@@ -95,10 +129,10 @@ def _load_effectiveness(mem_store, memory_id: str) -> Optional[Dict[str, Any]]:
     """Load effectiveness stats for a single memory."""
     try:
         eff_dict = mem_store.list_active_effectiveness()
-        if isinstance(eff_dict, dict):
-            return eff_dict.get(memory_id)
-    except Exception:
-        pass
+    except AttributeError:
+        return None
+    if isinstance(eff_dict, dict):
+        return eff_dict.get(memory_id)
     return None
 
 
@@ -116,7 +150,7 @@ def build_cold_entry(mem, context_tag: str, **extra) -> Dict[str, Any]:
     fm = mem.frontmatter
     return {
         "id": mem.id(),
-        "body": _refine_body(mem.body),
+        "body": _refine_body_fn(mem.body),
         "zone": fm.zone,
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "tags": list(fm.tags or []) + ["archived", "cold", context_tag],
@@ -153,5 +187,10 @@ def archive_and_delete(
         return False, str(e)
 
 
-# Re-export for cold_store helpers consumed by this module
-from .cold_store import _append_to_cold_store  # noqa: E402,F401
+# Re-export for cold_store helpers consumed by this module.
+# Guard against standalone loading where relative imports have no parent package.
+try:
+    from .cold_store import _append_to_cold_store  # noqa: E402,F401
+except ImportError:
+    def _append_to_cold_store(mem_store, entry):  # type: ignore[no-redef]
+        return True

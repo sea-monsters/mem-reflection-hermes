@@ -5,6 +5,21 @@ This package contains:
 - hooks.py: Lifecycle hooks and slash commands
 """
 
+from .schemas import (
+    _SRH_ASSOCIATE_SCHEMA,
+    _SRH_COMPILE_PROFILE_SCHEMA,
+    _SRH_GRAPH_RETRIEVE_SCHEMA,
+    _SRH_GRAPH_STATS_SCHEMA,
+    _SRH_GRAPH_VIZ_SCHEMA,
+    _SRH_MEMORY_DELETE_SCHEMA,
+    _SRH_MEMORY_HEALTH_SCHEMA,
+    _SRH_MEMORY_SEARCH_SCHEMA,
+    _SRH_MEMORY_WRITE_SCHEMA,
+    _SRH_PALACE_NAVIGATE_SCHEMA,
+    _SRH_REFLECT_NOW_SCHEMA,
+    _SRH_SKILL_QUERY_SCHEMA,
+)
+
 from .tools import (
     srh_memory_write,
     srh_memory_search,
@@ -24,7 +39,22 @@ from .hooks import (
     register_commands,
 )
 
+from ._lb import _lb
+
 __all__ = [
+    # Schemas
+    "_SRH_MEMORY_WRITE_SCHEMA",
+    "_SRH_MEMORY_SEARCH_SCHEMA",
+    "_SRH_MEMORY_DELETE_SCHEMA",
+    "_SRH_PALACE_NAVIGATE_SCHEMA",
+    "_SRH_REFLECT_NOW_SCHEMA",
+    "_SRH_SKILL_QUERY_SCHEMA",
+    "_SRH_COMPILE_PROFILE_SCHEMA",
+    "_SRH_ASSOCIATE_SCHEMA",
+    "_SRH_GRAPH_RETRIEVE_SCHEMA",
+    "_SRH_GRAPH_STATS_SCHEMA",
+    "_SRH_GRAPH_VIZ_SCHEMA",
+    "_SRH_MEMORY_HEALTH_SCHEMA",
     # Tools exports
     "srh_memory_write",
     "srh_memory_search",
@@ -40,4 +70,6 @@ __all__ = [
     "post_tool_call",
     "register_hooks",
     "register_commands",
+    # Late-binding helper
+    "_lb",
 ]

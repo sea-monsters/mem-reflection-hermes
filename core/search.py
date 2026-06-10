@@ -91,9 +91,16 @@ except ImportError:
     _repo = Path(__file__).resolve().parent.parent
     import importlib.util
 
-    _store_spec = importlib.util.spec_from_file_location("_store_fallback", str(_repo / "core" / "store.py"))
+    _core_pkg = types.ModuleType("mem_reflection_hermes.core")
+    _core_pkg.__path__ = [str(_repo / "core")]
+    sys.modules["mem_reflection_hermes.core"] = _core_pkg
+    _store_spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes.core.store",
+        str(_repo / "core" / "store.py"),
+    )
     _store_mod = importlib.util.module_from_spec(_store_spec)
-    sys.modules["_store_fallback"] = _store_mod
+    _store_mod.__package__ = "mem_reflection_hermes.core"
+    sys.modules["mem_reflection_hermes.core.store"] = _store_mod
     _store_spec.loader.exec_module(_store_mod)
 
     LoadedMemory = _store_mod.LoadedMemory

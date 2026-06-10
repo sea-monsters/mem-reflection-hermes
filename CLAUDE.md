@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mem-reflection-hermes** is a self-evolving memory & reflection system plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It provides structured memory persistence, semantic search, reflection pipelines, skill auto-matching, graph memory (Hebbian co-activation), and a dashboard UI. Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes).
 
-Current version: **v1.4-beta** (plugin.yaml version field).
+Current version: **v1.5** (plugin.yaml version field).
 
 ### Architecture (functional packages)
 
@@ -14,18 +14,34 @@ The codebase is organized into five functional packages:
 
 ```
 core/
-  store.py          # MemoryStore, SkillStore, frontmatter I/O, config, paths, lineage, entity index
+  store.py          # MemoryStore, SkillStore, config, paths, BM25 helpers
+  store_methods.py  # Thin method bodies extracted from MemoryStore (entity boosts, etc.)
+  models.py         # MemoryFrontmatter, LoadedMemory, SkillFrontmatter, LoadedSkill, parse/serialize
   search.py         # SearchIndex: BM25 + embedding + fusion + Hebbian boost, explain, CJK tokenizer
   graph.py          # GraphIndex: SQLite Hebbian graph, PageRank, spreading activation
   config.py         # Typed config models, diagnostics, validation (v1.4)
   backend.py        # SearchBackendLike protocol + capability flags (v1.4)
+  entities.py       # Entity extraction pipeline (regex-first + optional spaCy)
+  tokenization.py   # CJK-aware tokenizer, token estimation
+  utils.py          # normalize_zone, sanitize_zone_filename, is_cjk, etc.
+  async_writer.py   # Background file I/O thread for memory writes
+  skill_store.py    # SkillStore implementation
+  store_health.py   # Store health checks
+  lineage.py        # Supersedes chain helpers (_lineage_latest, _lineage_depth, etc.)
+  intent.py         # Intent classification helpers
+  reranker.py       # Optional second-stage reranker (cross_encoder / cohere)
 
 reflection/
   engine.py         # ReflectionEngine: raw_chunk default, fact extraction
   runtime.py        # _run_full_reflection, _run_micro_reflection, audit logging, compaction
 
 memory/
-  curator.py        # 5-phase curation: TTL/staleness, supersedes, similarity, orphan cleanup, cold storage
+  curator/          # Composable action pipeline (v1.3 refactor)
+    __init__.py     # _run_curator() entrypoint, backward-compat wrappers
+    actions.py      # CuratorAction base + ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport
+    helpers.py      # is_protected, build_cold_entry, archive_and_delete, load_last_access, config
+    cold_store.py   # JSONL cold storage: append, load, prune, restore
+    report.py       # Report generation and persistence
   bridge.py         # Bidirectional sync between plugin MemoryStore and host builtin memory
   context.py        # Context assembly: stable/dynamic split, token budget, skill matching, graded compression (v1.4)
 
@@ -34,11 +50,16 @@ runtime/
   hooks.py          # Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands
   graph.py          # 5 graph/health tools + graph manager singleton
   checkpoint.py     # Atomic session checkpoint, pending-stage recovery, corrupt backup (v1.4)
+  registration.py   # register(ctx): wires hooks, commands, tools, post-delete callbacks
+  schemas.py        # 12 Hermes tool JSON schemas
+  state.py          # Singleton getters (_get_mem_store, _get_search_index, _get_graph_mgr, etc.)
+  helpers.py        # _build_context_block, _build_context_bundle, _estimate_tokens, match_skills
+  _lb.py            # Late-binding helper: resolves modules/symbols without circular imports
 
 web/
   api.py            # FastAPI dashboard (15 endpoints)
 
-__init__.py         # Plugin registration, 12 tool schemas, runtime singletons
+__init__.py         # Exports public API, backward-compat aliases, delegates register() to runtime.registration
 ```
 
 Full architecture documentation: `docs/ARCHITECTURE.md`
@@ -79,6 +100,12 @@ pytest tests/test_checkpoint.py -v      # v1.4: checkpoint persistence/recovery
 pytest tests/test_config.py -v          # v1.4: typed config diagnostics
 pytest tests/test_backend.py -v         # v1.4: backend capability abstraction
 pytest tests/test_bm25.py -v            # v1.4: CJK tokenizer + BM25 scoring
+pytest tests/test_entity_extraction.py -v   # v1.4: entity regex + spaCy pipeline
+pytest tests/test_curator_pipeline.py -v    # v1.3: composable curator action pipeline
+pytest tests/test_store_module_split.py -v  # v1.4: core/store.py module split
+pytest tests/test_async_writer.py -v        # v1.4: async file writer
+pytest tests/test_lb.py -v                  # v1.4: late-binding helper
+pytest tests/test_schema_module.py -v       # v1.4: runtime schemas
 
 # Run a specific test class or test
 pytest tests/test_store.py::TestRebuildIndex -v
@@ -103,15 +130,22 @@ python scripts/migrate_memory_index.py
 
 ```
 core/store.py              ← leaf module, no project imports
-core/search.py             ← imports core.store
+core/models.py             ← imports core.utils only
+core/utils.py              ← leaf module
+core/search.py             ← imports core.store + core.tokenization + core.models
 core/graph.py              ← imports core.store (cross_zone only)
 core/config.py             ← imports core.store
 core/backend.py            ← no project imports
+core/entities.py           ← imports core.utils + core.tokenization
+core/store_methods.py      ← imports core.entities + core.tokenization + core.models + core.store (TYPE_CHECKING)
+core/skill_store.py        ← imports core.store
+core/lineage.py            ← imports core.store (TYPE_CHECKING)
+core/intent.py             ← imports core.store (TYPE_CHECKING)
 
 reflection/engine.py       ← imports core.store + core.search
 reflection/runtime.py      ← imports core.store + core.search + reflection.engine
 
-memory/curator.py          ← imports core.store + memory.bridge
+memory/curator/*           ← imports core.store + memory/bridge (helpers)
 memory/bridge.py           ← imports core.store only
 memory/context.py          ← imports core.store + core.search + core.config
 
@@ -119,10 +153,15 @@ runtime/tools.py           ← imports core.store + core.search + reflection.eng
 runtime/hooks.py           ← imports core.store + reflection.* + core.search + memory.* + runtime.checkpoint
 runtime/graph.py           ← imports core.graph + core.store
 runtime/checkpoint.py      ← imports core.store
+runtime/registration.py    ← imports runtime.hooks + runtime.schemas + runtime.tools + runtime.graph + memory.bridge
+runtime/state.py           ← imports core.store + core.search + core.graph + runtime.graph
+runtime/helpers.py         ← imports memory.context + core.store
+runtime/schemas.py         ← no project imports
+runtime/_lb.py             ← no project imports (stdlib only)
 
 web/api.py                 ← imports package runtime services via sys.modules fallback
 
-__init__.py                ← explicit imports from all packages, registers 12 tools
+__init__.py                ← explicit imports from all packages, delegates register() to runtime.registration
 ```
 
 No circular imports. All deprecated compat files are thin forwarders and must not regain implementation logic.
@@ -131,14 +170,18 @@ No circular imports. All deprecated compat files are thin forwarders and must no
 
 Respect the layer boundaries when adding new functionality:
 
-1. `core/store.py` — data models, store logic, config, no Hermes dependencies
-2. `core/search.py` — search and embedding helpers, imports core.store only
-3. `core/graph.py` — GraphIndex, imports core.store only where cross-zone needs memory metadata
-4. `reflection/engine.py`, `reflection/runtime.py` — reflection pipelines, import core.store + core.search
-5. `memory/curator.py`, `memory/bridge.py` — curation and host sync, import core.store (+ memory.bridge for curator)
-6. `memory/context.py` — context assembly, imports core.store + core.search
-7. `runtime/tools.py`, `runtime/hooks.py`, `runtime/graph.py` — host-facing runtime features
-8. `__init__.py` — registration and runtime singletons
+1. `core/store.py` — data models, store logic, config, paths — no Hermes dependencies
+2. `core/models.py`, `core/utils.py`, `core/tokenization.py`, `core/entities.py` — leaf modules (models import utils; entities import utils + tokenization)
+3. `core/search.py` — search and embedding helpers — imports core.store + core.tokenization + core.models
+4. `core/graph.py` — GraphIndex — imports core.store only where cross-zone needs memory metadata
+5. `core/config.py`, `core/backend.py` — typed config and backend abstraction — import core.store
+6. `reflection/engine.py`, `reflection/runtime.py` — reflection pipelines — import core.store + core.search
+7. `memory/curator/` — composable action pipeline — imports core.store + memory.bridge (helpers); `memory/bridge.py` imports core.store only
+8. `memory/context.py` — context assembly — imports core.store + core.search + core.config
+9. `runtime/tools.py`, `runtime/hooks.py`, `runtime/graph.py`, `runtime/checkpoint.py` — host-facing runtime features — depend on canonical services
+10. `runtime/registration.py`, `runtime/schemas.py`, `runtime/state.py`, `runtime/helpers.py`, `runtime/_lb.py` — registration, schemas, singletons, late-binding
+11. `web/api.py` — dashboard — imports package runtime services via sys.modules fallback
+12. `__init__.py` — exports public API, backward-compat aliases, delegates register() to runtime.registration
 
 ### Thread Safety
 
@@ -182,7 +225,17 @@ Context injection priority (subject to `max_context_token_preference`):
 
 - 7 base tools in `runtime/tools.py` (write, search, delete, palace, reflect, skill, compile)
 - 5 graph/health tools in `runtime/graph.py` (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`)
-- All 12 registered through `__init__.py::register(ctx)`
+- All 12 schemas in `runtime/schemas.py`
+- All 12 registered through `runtime/registration.py::register(ctx)` (called from `__init__.py`)
+
+### Late Binding (`runtime/_lb.py`)
+
+Runtime modules use `_lb(name)` to resolve modules or symbols without hard imports that would create circular dependencies:
+- Dotted module names (e.g. `"core.store"`) → `importlib.import_module` with caching
+- Bare symbols (no dots) → looked up from `mem_reflection_hermes` package `__dict__`
+- Returns `None` on failure so callers remain fail-open
+
+Used by `runtime/tools.py` and `runtime/hooks.py` for cross-module resolution at call time rather than import time.
 
 ## Key Patterns
 
@@ -278,16 +331,21 @@ Token estimation is CJK-aware (3 bytes/token for CJK, 4 bytes/token for Latin). 
 
 Newly created memory IDs during reflection are tracked in a session-local set (`_current_session_memory_ids`). This prevents the feedback loop where reflection sees its own just-written output as a duplicate or conflict. The set is cleared on session start and session end.
 
-### Memory Curator (v1.2 → v1.3)
+### Memory Curator (v1.2 → v1.3 → subpackage refactor)
 
-The 5-phase curation pipeline runs automatically at `on_session_end`:
-1. **TTL + Staleness** — archive expired (`valid_until` past) and stale (>90 days no access) memories
-2. **Supersedes Archiving** — deep supersedes chains (depth >= 2) with no recent access
-3. **Similarity Detection** — BM25 token-overlap pair scoring, flags candidates above 0.6 threshold
-4. **Orphan Graph Edge Cleanup** — remove dangling edges after memory deletion (v1.3)
-5. **Cold Storage** — JSONL with 10MB cap and oldest-entry pruning; restore via `_restore_from_cold()`
+The 5-phase curation pipeline was refactored from `memory/curator.py` into `memory/curator/` (composable action pipeline):
+1. **ArchiveStale** — TTL expiry + staleness detection
+2. **CompactChains** — compact intermediates before archiving
+3. **ArchiveSuperseded** — remaining deep chains (depth >= 2)
+4. **MergeSimilar** — BM25 overlap detection + optional merge
+5. **CleanOrphanEdges** — remove dangling graph edges
+6. **GenerateReport** — persist human-readable summary
+
+The pipeline runs automatically at `on_session_end`. All actions implement `CuratorAction(name, should_run(ctx), execute(ctx))`. Results are aggregated in `_run_curator()` and a report is persisted to cold storage. Fail-open: exceptions in any action are caught and logged.
 
 Body refinement (`_refine_body`) strips fenced code blocks, `[Tool:xxx]` markers, tool-result prefixes, and collapses excess whitespace before bridge writes and cold-storage archive.
+
+**Legacy API preserved**: `scan_for_stale`, `archive_expired`, `archive_superseded`, `compact_superseded_chains`, `scan_for_similar`, `merge_similar`, `clean_orphan_edges` remain as thin wrappers in `memory/curator/__init__.py`.
 
 ### v1.4 New Features
 
@@ -299,6 +357,15 @@ Body refinement (`_refine_body`) strips fenced code blocks, `[Tool:xxx]` markers
 - **Entity index**: SQLite-backed `entities` and `entity_links` tables with lifecycle hooks on write, delete, rebuild.
 - **Backend capability abstraction**: `core/backend.py` exposes `SearchBackendLike` protocol and `SearchBackendCapabilities`.
 - **Typed config diagnostics**: `core/config.py` validates types, warns on unknown keys, falls back to safe defaults.
+
+### Reranker Integration (v1.2)
+
+Optional second-stage reranking (`core/reranker.py`) inserted after Hebbian boost and before MMR in `SearchIndex.search()`:
+- **Providers**: `cross_encoder` (local, default) or `cohere` (API-based).
+- **Lazy loading**: Model/client initialized on first `rerank()` call.
+- **Graceful fallback**: On any failure returns original order with `logger.warning`.
+- **Config**: `reranker.*` under plugin config — disabled when absent.
+- Wired into `_get_search_index()` in `runtime/state.py`.
 
 ### v0.16.0 Enhanced Hooks
 
@@ -355,7 +422,7 @@ Implement the SDD design. Run `pytest tests/test_<feature>.py` iteratively until
 
 ### 5. Verify Full Suite
 
-Run `pytest tests/ -v` — all 413+ tests must pass. No regressions.
+Run `pytest tests/ -v` — all 523 tests must pass. No regressions.
 
 ### Exceptions
 

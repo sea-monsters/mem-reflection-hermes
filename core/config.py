@@ -1,16 +1,153 @@
-"""Typed configuration helpers for mem-reflection-hermes."""
+"""Configuration helpers for mem-reflection-hermes.
+
+This module owns Hermes config discovery, plugin config access, path helpers,
+and feature flags. It sits above core.utils in the DAG so it can depend on
+zone/path utilities without cycles.
+"""
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
-    from .store import plugin_config as _plugin_config
-except Exception:  # pragma: no cover - fallback for direct loading
-    def _plugin_config() -> Dict[str, Any]:
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration keys
+# ---------------------------------------------------------------------------
+CONFIG_SECTION = "mem_reflection_hermes"
+CONFIG_KEY_EMBEDDINGS = "embeddings"
+CONFIG_KEY_MICRO_REFLECTION = "micro_reflection"
+CONFIG_KEY_PALACE_MODE = "palace_mode"
+CONFIG_KEY_PROFILE_MODE = "profile_mode"
+CONFIG_KEY_PALACE_INSTRUCTIONS = "palace_instructions"
+CONFIG_KEY_ACTIVE_MEMORY_CAP = "active_memory_index_cap"
+CONFIG_KEY_SKILL_INDEX_CAP = "skill_index_cap"
+CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
+CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
+CONFIG_KEY_INTENT_PROTOTYPES = "intent_prototypes"
+CONFIG_KEY_RERANKER = "reranker"
+CONFIG_KEY_ENTITY = "entity"
+
+# ---------------------------------------------------------------------------
+# Config & paths (with mtime-aware caching)
+# ---------------------------------------------------------------------------
+_cached_config: Optional[Dict[str, Any]] = None
+_cached_config_mtime: float = 0.0
+
+
+def hermes_home() -> Path:
+    """Resolve Hermes home directory."""
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        return Path(env_home)
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def load_config() -> Dict[str, Any]:
+    """Load Hermes config.yaml with caching (reloads if file changed)."""
+    global _cached_config, _cached_config_mtime
+    cfg_path = hermes_home() / "config.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        mtime = cfg_path.stat().st_mtime
+        if _cached_config is not None and mtime == _cached_config_mtime:
+            return _cached_config
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            _cached_config = yaml.safe_load(fh) or {}
+        _cached_config_mtime = mtime
+        return _cached_config
+    except Exception:
         return {}
 
 
+def plugin_config() -> Dict[str, Any]:
+    """Get the plugin-specific configuration section."""
+    cfg = load_config()
+    return cfg.get("plugins", {}).get(CONFIG_SECTION, {})
+
+
+def plugin_data_dir() -> Path:
+    """Path to plugin data directory (~/.hermes/memory/)."""
+    d = hermes_home() / "memory"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def user_memories_dir() -> Path:
+    """User-level memories directory."""
+    d = hermes_home() / "memories"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def project_memories_dir() -> Optional[Path]:
+    """Project-level memories directory (optional, CWD-based)."""
+    p = Path.cwd() / ".hermes" / "memories"
+    return p if p.exists() else None
+
+
+def user_skills_dir() -> Path:
+    """User-level skills directory."""
+    d = hermes_home() / "memory" / "skills"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def project_skills_dir() -> Optional[Path]:
+    """Project-level skills directory (optional)."""
+    p = Path.cwd() / ".hermes" / "memory" / "skills"
+    return p if p.exists() else None
+
+
+def _plugin_data_dir_legacy() -> Path:
+    """Legacy plugin data directory kept for compatibility."""
+    return hermes_home() / "plugins" / "mem-reflection-hermes"
+
+
+def embeddings_enabled() -> bool:
+    """Check if embedding-based search is enabled in config."""
+    return plugin_config().get(CONFIG_KEY_EMBEDDINGS, True)
+
+
+def micro_reflection_enabled() -> bool:
+    """Check if micro-reflection is enabled in config."""
+    return bool(plugin_config().get(CONFIG_KEY_MICRO_REFLECTION, False))
+
+
+def palace_mode_enabled() -> bool:
+    """Check if palace mode is enabled in config."""
+    return bool(plugin_config().get(CONFIG_KEY_PALACE_MODE, True))
+
+
+def profile_mode_enabled() -> bool:
+    """Check if profile mode is enabled in config."""
+    return bool(plugin_config().get(CONFIG_KEY_PROFILE_MODE, False))
+
+
+def palace_index_path() -> Path:
+    """Path to palace-index.md cache file."""
+    return _plugin_data_dir_legacy() / "palace-index.md"
+
+
+def zone_cache_dir() -> Path:
+    """Path to zone-cache directory for per-zone summaries."""
+    d = _plugin_data_dir_legacy() / "zone-cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Typed configuration models
+# ---------------------------------------------------------------------------
 @dataclass
 class SearchConfig:
     cjk_tokenizer: str = "auto"
@@ -122,7 +259,7 @@ def _as_choice(value: Any, default: str, path: str, warnings: List[str], allowed
 
 def get_plugin_config_model(raw: Optional[Dict[str, Any]] = None) -> PluginConfigModel:
     """Return a typed config model with default fallback and diagnostics."""
-    source = _as_mapping(_plugin_config() if raw is None else raw)
+    source = _as_mapping(plugin_config() if raw is None else raw)
     warnings: List[str] = []
     unknown: List[str] = []
 

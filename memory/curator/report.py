@@ -7,9 +7,42 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .helpers import CuratorContext, CuratorResult
-
 logger = logging.getLogger(__name__)
+
+# Resolve the shared late-binding helper safely for both package and standalone
+# module loading.
+try:
+    from mem_reflection_hermes.runtime._lb import _lb as _lb_fn
+except ImportError:
+    _lb_fn = None
+if _lb_fn is None:
+    try:
+        from runtime._lb import _lb as _lb_fn
+    except ImportError:
+        _lb_fn = None
+
+# Intra-curator imports: use normal relative imports in package mode; provide
+# minimal standalone fallbacks so the module can still be loaded directly.
+try:
+    from .helpers import CuratorContext, CuratorResult
+except ImportError:
+    from dataclasses import dataclass, field
+    from typing import Any as _AnyT
+
+    @dataclass
+    class CuratorContext:  # type: ignore[no-redef]
+        mem_store: _AnyT
+        errors: List[str] = field(default_factory=list)
+
+    @dataclass
+    class CuratorResult:  # type: ignore[no-redef]
+        action_name: str
+        archived: int = 0
+        compacted: int = 0
+        merged: int = 0
+        similar_pairs: int = 0
+        orphan_edges: int = 0
+        errors: List[str] = field(default_factory=list)
 
 
 def generate_report(
@@ -78,9 +111,18 @@ def _persist_report(
     except Exception as e:
         logger.warning("Failed to write curator report file: %s", e)
 
+    reflect_rt = (
+        _lb_fn("mem_reflection_hermes.reflection.runtime") if _lb_fn is not None else None
+    )
+    if reflect_rt is None:
+        reflect_rt = _lb_fn("reflection.runtime") if _lb_fn is not None else None
+
+    if reflect_rt is None or not hasattr(reflect_rt, "_append_reflect_log"):
+        logger.debug("Reflection runtime unavailable; skipping curator log append")
+        return
+
     try:
-        from ...reflection.runtime import _append_reflect_log
-        _append_reflect_log(
+        reflect_rt._append_reflect_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "mode": "curator",
@@ -95,5 +137,5 @@ def _persist_report(
                 "errors": results.get("errors", []),
             }
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to append curator report to reflection log: %s", e)

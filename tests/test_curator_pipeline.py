@@ -1,20 +1,25 @@
 """Tests for v1.5 Curator Action Pipeline refactor.
 
-These tests verify the refactored curator package structure:
+These tests verify the refactored curator package against the design intent
+in docs/design/1.5/sprint1-curator-pipeline-sdd.md:
 - CuratorAction base class and execute() contract
 - CuratorContext and CuratorResult data structures
-- Individual action isolation (6 actions)
-- Helper function edge cases
-- Pipeline ordering and error isolation
+- Individual action isolation (6 actions) and boundary conditions
+- Shared helper edge cases
+- Pipeline ordering and error isolation via observable state
+- Backward-compatible public API behaviour
+- Cold store I/O directly
 
-These tests are written BEFORE the refactor (RED phase) and will initially fail.
+These tests are intent-facing: they exercise public/internal contracts from
+the SDD, not implementation details of the legacy curator.py.
 """
 from __future__ import annotations
 
+import ast
 import json
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,10 +33,18 @@ _MOCK_TIME = time.time()
 
 
 class MockFrontmatter:
-    def __init__(self, mem_id: str, body: str, zone: str = "general",
-                 created: str = "", confidence: str = "medium",
-                 pinned: bool = False, tags: list = None,
-                 supersedes: list = None, valid_until: str = ""):
+    def __init__(
+        self,
+        mem_id: str,
+        body: str,
+        zone: str = "general",
+        created: str = "",
+        confidence: str = "medium",
+        pinned: bool = False,
+        tags: list = None,
+        supersedes: list = None,
+        valid_until: str = "",
+    ):
         self.id_val = mem_id
         self.zone = zone
         self.created = created or datetime.now(timezone.utc).isoformat()
@@ -47,16 +60,23 @@ class MockFrontmatter:
 
 
 class MockMemory:
-    def __init__(self, mid: str, body: str, zone: str = "general",
-                 created: str = "", confidence: str = "medium",
-                 pinned: bool = False, tags: list = None,
-                 supersedes: list = None, valid_until: str = ""):
+    def __init__(
+        self,
+        mid: str,
+        body: str,
+        zone: str = "general",
+        created: str = "",
+        confidence: str = "medium",
+        pinned: bool = False,
+        tags: list = None,
+        supersedes: list = None,
+        valid_until: str = "",
+    ):
         self.id_val = mid
         self.body = body
         self.scope = "user"
         self.frontmatter = MockFrontmatter(
-            mid, body, zone, created, confidence,
-            pinned, tags, supersedes, valid_until,
+            mid, body, zone, created, confidence, pinned, tags, supersedes, valid_until
         )
 
     def id(self) -> str:
@@ -69,6 +89,7 @@ class MockStore:
         self.deleted: List[str] = []
         self.eff_data: Dict[str, Dict[str, Any]] = {}
         self._cold_store: List[Dict[str, Any]] = []
+        self._plugin_config_override: Dict[str, Any] = {}
 
     def list_active(self) -> List[MockMemory]:
         return list(self.memories.values())
@@ -78,11 +99,15 @@ class MockStore:
 
     def put(self, scope: str, fm, body: str):
         self.memories[fm.id] = MockMemory(
-            fm.id, body, zone=getattr(fm, 'zone', 'general'),
-            tags=getattr(fm, 'tags', []),
+            fm.id,
+            body,
+            zone=getattr(fm, "zone", "general"),
+            tags=getattr(fm, "tags", []),
         )
 
-    def list(self, *, zone=None, active_only=False, sort="rank", limit=None):
+    def list(
+        self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None
+    ):
         mems = list(self.memories.values())
         if zone:
             mems = [m for m in mems if m.frontmatter.zone == zone]
@@ -100,7 +125,16 @@ class MockStore:
     def list_active_effectiveness(self) -> Dict[str, Dict[str, Any]]:
         return self.eff_data
 
-    def update(self, mem_id, body=None, zone=None, confidence=None, tags=None, pinned=None, supersedes=None):
+    def update(
+        self,
+        mem_id,
+        body=None,
+        zone=None,
+        confidence=None,
+        tags=None,
+        pinned=None,
+        supersedes=None,
+    ):
         mem = self.memories.get(mem_id)
         if mem is None:
             return None
@@ -152,8 +186,9 @@ def stale_store():
     s = MockStore()
     s.memories["fresh"] = MockMemory("fresh", "recent", confidence="high")
     s.memories["stale"] = MockMemory("stale", "old and unused", confidence="low")
-    s.memories["expired"] = MockMemory("expired", "past valid_until",
-                                        valid_until="2020-01-01T00:00:00Z")
+    s.memories["expired"] = MockMemory(
+        "expired", "past valid_until", valid_until="2020-01-01T00:00:00Z"
+    )
     s.eff_data = {
         "fresh": {"last_accessed": _MOCK_TIME, "effectiveness": 0.9},
         "stale": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.05},
@@ -246,10 +281,25 @@ class TestIsProtected:
         assert is_protected(fm) is True
 
     def test_no_protection_returns_false(self):
-        """Unpinned, no keep/permanent tags → not protected."""
+        """Unpinned, no keep/permanent tags -> not protected."""
         from memory.curator.helpers import is_protected
 
         fm = MockFrontmatter("test", "body", tags=["other"])
+        assert is_protected(fm) is False
+
+    def test_none_tags_is_not_protected(self):
+        """None tags does not raise and returns False."""
+        from memory.curator.helpers import is_protected
+
+        fm = MockFrontmatter("test", "body")
+        fm.tags = None
+        assert is_protected(fm) is False
+
+    def test_empty_tags_is_not_protected(self):
+        """Empty tags list returns False."""
+        from memory.curator.helpers import is_protected
+
+        fm = MockFrontmatter("test", "body", tags=[])
         assert is_protected(fm) is False
 
 
@@ -263,6 +313,7 @@ class TestLoadLastAccess:
         ts = load_last_access(stale_store, "fresh")
         assert ts > 0
         assert ts == _MOCK_TIME
+        assert isinstance(ts, float)
 
     def test_returns_zero_on_missing_memory(self, empty_store):
         """Returns 0 when memory_id not in effectiveness data."""
@@ -310,6 +361,32 @@ class TestBuildColdEntry:
 
         assert "superseded" in entry["tags"]
 
+    def test_extra_fields_passthrough(self, stale_store):
+        """Arbitrary keyword arguments are merged into the entry."""
+        from memory.curator.helpers import build_cold_entry
+
+        mem = stale_store.get("fresh")
+        entry = build_cold_entry(
+            mem, context_tag="test", chain_depth=3, custom_key="custom_value"
+        )
+
+        assert entry["chain_depth"] == 3
+        assert entry["custom_key"] == "custom_value"
+
+    def test_original_frontmatter_includes_key_fields(self, stale_store):
+        """original_frontmatter preserves created, confidence, pinned, supersedes."""
+        from memory.curator.helpers import build_cold_entry
+
+        mem = stale_store.get("fresh")
+        entry = build_cold_entry(mem, context_tag="test")
+        orig = entry["original_frontmatter"]
+
+        assert "created" in orig
+        assert "confidence" in orig
+        assert "pinned" in orig
+        assert "supersedes" in orig
+        assert "supersedes_reason" in orig
+
 
 class TestArchiveAndDelete:
     """Tests for archive_and_delete() helper."""
@@ -330,7 +407,6 @@ class TestArchiveAndDelete:
         """Returns (False, error_msg) when cold store append fails."""
         from memory.curator.helpers import archive_and_delete, build_cold_entry
 
-        # Use a path containing a null byte, which is invalid on all platforms.
         stale_store._cold_store_path_override = "/nonexistent\x00path/_cold.jsonl"
 
         mem = stale_store.get("fresh")
@@ -340,6 +416,63 @@ class TestArchiveAndDelete:
         assert success is False
         assert error is not None
         assert "cold store" in error.lower()
+
+    def test_preserves_active_memory_when_delete_fails(self, stale_store):
+        """If cold store succeeds but active delete fails, return False and keep memory."""
+        from memory.curator.helpers import archive_and_delete, build_cold_entry
+
+        class StoreWithFailingDelete(MockStore):
+            def delete(self, scope, mid):
+                raise RuntimeError("delete denied")
+
+        s = StoreWithFailingDelete()
+        s.memories["fresh"] = MockMemory("fresh", "recent")
+        with tempfile.TemporaryDirectory() as td:
+            s._cold_store_path_override = str(Path(td) / "_cold_store.jsonl")
+            mem = s.get("fresh")
+            entry = build_cold_entry(mem, context_tag="test")
+            success, error = archive_and_delete(s, mem, entry, "test")
+
+            assert success is False
+            assert "delete denied" in error
+            assert "fresh" in s.memories  # active memory preserved for safety
+
+
+# ---------------------------------------------------------------------------
+# Test: Config helpers
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorConfig:
+    """Tests for _curator_config and _curator_enabled helpers."""
+
+    def test_config_merges_defaults(self, empty_store):
+        """Missing keys fall back to hard-coded defaults."""
+        from memory.curator.helpers import _curator_config
+
+        cfg = _curator_config(empty_store)
+        assert cfg["enabled"] is True
+        assert cfg["trigger"] == "session_end"
+        assert cfg["stale"]["days"] == 90
+        assert cfg["similarity"]["bm25_threshold"] == 0.6
+
+    def test_config_layered_merge(self, empty_store):
+        """Top-level overrides and nested overrides both work."""
+        from memory.curator.helpers import _curator_config
+
+        empty_store._plugin_config_override = {
+            "curator": {
+                "enabled": False,
+                "stale": {"days": 30},
+                "similarity": {"enabled": False},
+            }
+        }
+        cfg = _curator_config(empty_store)
+        assert cfg["enabled"] is False
+        assert cfg["stale"]["days"] == 30
+        assert cfg["stale"]["effectiveness_threshold"] == 0.1  # default preserved
+        assert cfg["similarity"]["enabled"] is False
+        assert cfg["similarity"]["bm25_threshold"] == 0.6  # default preserved
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +512,61 @@ class TestArchiveStaleAction:
         assert result.archived == 0
         assert len(pinned_only_store.deleted) == 0
 
+    def test_empty_store_archives_nothing(self, empty_store):
+        """ArchiveStale on empty store returns zero archives."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 0
+        assert result.errors == []
+
+    def test_invalid_valid_until_is_treated_as_not_expired(self, empty_store):
+        """Malformed valid_until does not trigger archive."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        empty_store.memories["bad_date"] = MockMemory(
+            "bad_date", "body", valid_until="not-a-date"
+        )
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 0
+        assert "bad_date" in empty_store.memories
+
+    def test_effectiveness_below_threshold_triggers_archive(self, empty_store):
+        """Low effectiveness (even with recent access) triggers stale archive."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        empty_store.memories["low_eff"] = MockMemory(
+            "low_eff", "low effectiveness memory", confidence="high"
+        )
+        empty_store.eff_data["low_eff"] = {
+            "last_accessed": _MOCK_TIME,
+            "effectiveness": 0.05,  # below default threshold 0.1
+        }
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 1
+        assert "low_eff" in empty_store.deleted
+
+    def test_recent_high_effectiveness_is_not_archived(self, empty_store):
+        """Recent access and high effectiveness keep memory active."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        empty_store.memories["active"] = MockMemory("active", "active memory")
+        empty_store.eff_data["active"] = {
+            "last_accessed": _MOCK_TIME,
+            "effectiveness": 0.9,
+        }
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 0
+        assert "active" in empty_store.memories
+
 
 class TestCompactChainsAction:
     """Tests for CompactChains action."""
@@ -394,7 +582,7 @@ class TestCompactChainsAction:
         """CompactChains archives intermediate nodes in long chain."""
         from memory.curator.actions import CompactChains, CuratorContext
 
-        # Build chain: v1 → v2 → v3 → v4 → v5
+        # Build chain: v1 -> v2 -> v3 -> v4 -> v5
         empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
         empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
         empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
@@ -412,6 +600,56 @@ class TestCompactChainsAction:
         assert "v1" in empty_store.memories  # oldest preserved
         assert "v5" in empty_store.memories  # newest preserved
 
+    def test_short_chain_is_skipped(self, empty_store):
+        """Chains shorter than compact_min_chain are left untouched."""
+        from memory.curator.actions import CompactChains, CuratorContext
+
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "newest", zone="core", supersedes=["v1"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = CompactChains().execute(ctx)
+
+        assert result.compacted == 0
+        assert "v1" in empty_store.memories
+        assert "v2" in empty_store.memories
+
+    def test_recent_access_protects_chain(self, empty_store):
+        """Chains with a recently accessed node are not compacted."""
+        from memory.curator.actions import CompactChains, CuratorContext
+
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+        empty_store.eff_data["v2"] = {
+            "last_accessed": time.time(),  # recent
+            "effectiveness": 0.5,
+        }
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = CompactChains().execute(ctx)
+
+        assert result.compacted == 0
+        assert "v1" in empty_store.memories
+        assert "v4" in empty_store.memories
+
+    def test_protected_intermediate_is_skipped(self, empty_store):
+        """Pinned intermediate nodes are not compacted."""
+        from memory.curator.actions import CompactChains, CuratorContext
+
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"], pinned=True)
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = CompactChains().execute(ctx)
+
+        assert "v2" in empty_store.memories  # protected intermediate kept
+        assert "v1" in empty_store.memories
+        assert "v4" in empty_store.memories
+
 
 class TestArchiveSupersededAction:
     """Tests for ArchiveSuperseded action."""
@@ -427,7 +665,7 @@ class TestArchiveSupersededAction:
         """ArchiveSuperseded archives nodes in depth >= 3 chains."""
         from memory.curator.actions import ArchiveSuperseded, CuratorContext
 
-        # Chain: orig → v1 → v2 → v3 (depth = 3)
+        # Chain: orig -> v1 -> v2 -> v3 (depth = 3 from head v3)
         empty_store.memories["orig"] = MockMemory("orig", "original", zone="core", supersedes=[])
         empty_store.memories["v1"] = MockMemory("v1", "v1", zone="core", supersedes=["orig"])
         empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
@@ -437,8 +675,36 @@ class TestArchiveSupersededAction:
         action = ArchiveSuperseded()
         result = action.execute(ctx)
 
-        assert result.archived >= 1  # at least orig or v1 archived
+        assert result.archived >= 1
         assert "v3" not in empty_store.deleted  # newest preserved
+
+    def test_shallow_chain_is_skipped(self, empty_store):
+        """Chains with depth < 3 are not archived."""
+        from memory.curator.actions import ArchiveSuperseded, CuratorContext
+
+        empty_store.memories["orig"] = MockMemory("orig", "original", zone="core", supersedes=[])
+        empty_store.memories["v1"] = MockMemory("v1", "newest", zone="core", supersedes=["orig"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveSuperseded().execute(ctx)
+
+        assert result.archived == 0
+        assert "orig" in empty_store.memories
+        assert "v1" in empty_store.memories
+
+    def test_protected_node_is_skipped(self, empty_store):
+        """Protected nodes in deep chains are not archived."""
+        from memory.curator.actions import ArchiveSuperseded, CuratorContext
+
+        empty_store.memories["orig"] = MockMemory("orig", "original", zone="core", supersedes=[])
+        empty_store.memories["v1"] = MockMemory("v1", "v1", zone="core", supersedes=["orig"], pinned=True)
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "newest", zone="core", supersedes=["v2"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveSuperseded().execute(ctx)
+
+        assert "v1" in empty_store.memories  # protected node kept
 
 
 class TestMergeSimilarAction:
@@ -471,8 +737,68 @@ class TestMergeSimilarAction:
         result = action.execute(ctx)
 
         assert result.merged >= 1
-        # One archived, one remains
         assert len(empty_store.deleted) >= 1
+
+    def test_below_merge_threshold_does_not_merge(self, empty_store):
+        """Pairs with similarity below merge_threshold are only counted, not merged."""
+        from memory.curator.actions import MergeSimilar, CuratorContext
+
+        # Slightly related but unlikely to exceed default merge_threshold=0.7
+        empty_store.memories["a"] = MockMemory("a", "apple banana cherry")
+        empty_store.memories["b"] = MockMemory("b", "date elderberry fig")
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = MergeSimilar().execute(ctx)
+
+        assert result.merged == 0
+        assert len(empty_store.deleted) == 0
+        assert "a" in empty_store.memories
+        assert "b" in empty_store.memories
+
+    def test_similarity_disabled_returns_zero(self, empty_store):
+        """When similarity.enabled is False, action returns zero candidates."""
+        from memory.curator.actions import MergeSimilar, CuratorContext
+
+        empty_store._plugin_config_override = {
+            "curator": {"similarity": {"enabled": False}}
+        }
+
+        empty_store.memories["a"] = MockMemory("a", "duplicate text one")
+        empty_store.memories["b"] = MockMemory("b", "duplicate text two")
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = MergeSimilar().execute(ctx)
+
+        assert result.similar_pairs == 0
+        assert result.merged == 0
+
+    def test_identical_bodies_archive_one(self, empty_store):
+        """Identical bodies result in archiving one memory and keeping the other."""
+        from memory.curator.actions import MergeSimilar, CuratorContext
+
+        empty_store.memories["a"] = MockMemory("a", "exactly the same body", tags=["x"])
+        empty_store.memories["b"] = MockMemory("b", "exactly the same body", tags=["y"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = MergeSimilar().execute(ctx)
+
+        assert result.merged == 1
+        assert len(empty_store.deleted) == 1
+        assert ("a" in empty_store.deleted) != ("b" in empty_store.deleted)
+
+    def test_superseded_memories_are_skipped(self, empty_store):
+        """Memories already superseded by another are not merged."""
+        from memory.curator.actions import MergeSimilar, CuratorContext
+
+        empty_store.memories["a"] = MockMemory("a", "exactly the same body")
+        empty_store.memories["b"] = MockMemory("b", "exactly the same body")
+        empty_store.memories["c"] = MockMemory("c", "supersedes b", supersedes=["b"])
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = MergeSimilar().execute(ctx)
+
+        # a and c might be considered, but b is superseded and skipped
+        assert "b" not in empty_store.deleted
 
 
 class TestCleanOrphanEdgesAction:
@@ -495,6 +821,40 @@ class TestCleanOrphanEdgesAction:
 
         assert result.orphan_edges == 0
 
+    def test_counts_cleaned_edges_when_graph_available(self, empty_store, monkeypatch):
+        """Action forwards active IDs to graph manager and returns cleaned count."""
+        from memory.curator.actions import CleanOrphanEdges, CuratorContext
+
+        cleaned = {"count": 0}
+
+        class FakeGraphStore:
+            def clean_orphan_edges(self, active_ids):
+                cleaned["count"] = len(active_ids)
+                return 7
+
+        class FakeManager:
+            store = FakeGraphStore()
+
+        def fake_get_graph_manager_compat():
+            return FakeManager()
+
+        import memory.curator.actions as _actions_mod
+
+        monkeypatch.setattr(
+            _actions_mod,
+            "get_graph_manager_compat",
+            fake_get_graph_manager_compat,
+        )
+
+        empty_store.memories["m1"] = MockMemory("m1", "body1")
+        empty_store.memories["m2"] = MockMemory("m2", "body2")
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = CleanOrphanEdges().execute(ctx)
+
+        assert result.orphan_edges == 7
+        assert cleaned["count"] == 2
+
 
 class TestGenerateReportAction:
     """Tests for GenerateReport action."""
@@ -506,6 +866,178 @@ class TestGenerateReportAction:
         action = GenerateReport()
         assert action.name == "GenerateReport"
 
+    def test_empty_results_yield_no_actions_message(self):
+        """With no prior results, report text says 'No curator actions'."""
+        from memory.curator.actions import GenerateReport, CuratorContext
+
+        ctx = CuratorContext(mem_store=MockStore())
+        action = GenerateReport()
+        result = action.execute(ctx, [])
+
+        assert result.__dict__.get("report_text") == "No curator actions"
+
+    def test_report_includes_stale_archives(self):
+        """Report text mentions stale detection and archive counts."""
+        from memory.curator.actions import (
+            GenerateReport,
+            CuratorContext,
+            CuratorResult,
+        )
+
+        ctx = CuratorContext(mem_store=MockStore())
+        prior = [CuratorResult(action_name="ArchiveStale", archived=5)]
+        result = GenerateReport().execute(ctx, prior)
+        text = result.__dict__.get("report_text", "")
+
+        assert "stale" in text
+        assert "5" in text
+
+    def test_report_includes_all_action_types(self):
+        """Report aggregates counts from all action types."""
+        from memory.curator.actions import (
+            GenerateReport,
+            CuratorContext,
+            CuratorResult,
+        )
+
+        ctx = CuratorContext(mem_store=MockStore())
+        prior = [
+            CuratorResult(action_name="ArchiveStale", archived=2),
+            CuratorResult(action_name="ArchiveSuperseded", archived=3),
+            CuratorResult(action_name="CompactChains", compacted=4),
+            CuratorResult(action_name="MergeSimilar", similar_pairs=1, merged=1),
+            CuratorResult(action_name="CleanOrphanEdges", orphan_edges=6),
+        ]
+        result = GenerateReport().execute(ctx, prior)
+        text = result.__dict__.get("report_text", "")
+
+        assert "superseded: 3 archived" in text
+        assert "compacted: 4 archived" in text
+        assert "similar: 1 candidate pair(s) found" in text
+        assert "merged: 1 archived" in text
+        assert "orphan edges: 6 cleaned" in text
+
+    def test_report_includes_error_count(self):
+        """Report text includes the number of accumulated errors."""
+        from memory.curator.actions import (
+            GenerateReport,
+            CuratorContext,
+            CuratorResult,
+        )
+
+        ctx = CuratorContext(mem_store=MockStore())
+        ctx.errors.append("failure one")
+        ctx.errors.append("failure two")
+        prior = [CuratorResult(action_name="ArchiveStale", archived=1)]
+        result = GenerateReport().execute(ctx, prior)
+        text = result.__dict__.get("report_text", "")
+
+        assert "errors: 2" in text
+
+
+# ---------------------------------------------------------------------------
+# Test: Cold Store I/O
+# ---------------------------------------------------------------------------
+
+
+class TestColdStore:
+    """Direct tests for memory.curator.cold_store helpers."""
+
+    def test_load_returns_empty_when_missing(self, empty_store):
+        """Loading cold store that does not exist returns []."""
+        from memory.curator.cold_store import _load_cold_store
+
+        assert _load_cold_store(empty_store) == []
+
+    def test_append_and_load_round_trip(self, empty_store):
+        """Appended entries can be loaded back."""
+        from memory.curator.cold_store import _append_to_cold_store, _load_cold_store
+
+        entry = {"id": "m1", "body": "hello", "archived_at": "2026-01-01T00:00:00Z"}
+        assert _append_to_cold_store(empty_store, entry) is True
+        loaded = _load_cold_store(empty_store)
+        assert len(loaded) == 1
+        assert loaded[0]["id"] == "m1"
+
+    def test_load_skips_corrupt_jsonl_lines(self, empty_store):
+        """Corrupt JSONL lines are skipped with a warning, valid lines preserved."""
+        from memory.curator.cold_store import _load_cold_store, _cold_store_path
+
+        path = _cold_store_path(empty_store)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"id":"good"}\nnot-json\n{"id":"good2"}\n', encoding="utf-8"
+        )
+        loaded = _load_cold_store(empty_store)
+        assert len(loaded) == 2
+        assert loaded[0]["id"] == "good"
+        assert loaded[1]["id"] == "good2"
+
+    def test_prune_removes_oldest_to_fit_cap(self, empty_store):
+        """Prune removes oldest entries until total size is under cap."""
+        from memory.curator.cold_store import (
+            _append_to_cold_store,
+            _load_cold_store,
+            _prune_cold_store,
+        )
+
+        for i in range(5):
+            entry = {
+                "id": f"m{i}",
+                "body": "x" * 2000,
+                "archived_at": f"2026-01-{i + 1:02d}T00:00:00Z",
+            }
+            _append_to_cold_store(empty_store, entry)
+
+        removed = _prune_cold_store(empty_store, cap_mb=0)
+        assert removed >= 1
+        loaded = _load_cold_store(empty_store)
+        assert len(loaded) < 5
+
+    def test_restore_moves_entry_back_to_active(self, empty_store):
+        """Restoring a cold entry writes it to active store and removes from cold."""
+        from memory.curator.cold_store import (
+            _append_to_cold_store,
+            _load_cold_store,
+            _restore_from_cold,
+        )
+
+        entry = {
+            "id": "m1",
+            "body": "restored body",
+            "zone": "work",
+            "archived_at": "2026-01-01T00:00:00Z",
+            "tags": ["old"],
+            "original_frontmatter": {
+                "created": "2025-01-01T00:00:00Z",
+                "confidence": "high",
+                "pinned": False,
+                "supersedes": [],
+            },
+        }
+        _append_to_cold_store(empty_store, entry)
+        success = _restore_from_cold(empty_store, "m1")
+
+        assert success is True
+        assert "m1" in empty_store.memories
+        assert empty_store.memories["m1"].frontmatter.zone == "work"
+        loaded = _load_cold_store(empty_store)
+        assert not any(e.get("id") == "m1" for e in loaded)
+
+    def test_restore_missing_returns_false(self, empty_store):
+        """Restoring a non-existent ID returns False."""
+        from memory.curator.cold_store import _restore_from_cold
+
+        assert _restore_from_cold(empty_store, "missing") is False
+
+    def test_append_fails_open_on_invalid_path(self, empty_store):
+        """Cold store append returns False instead of raising on invalid path."""
+        from memory.curator.cold_store import _append_to_cold_store
+
+        empty_store._cold_store_path_override = "/nonexistent\x00path/_cold.jsonl"
+        result = _append_to_cold_store(empty_store, {"id": "x"})
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Test: Pipeline Orchestration
@@ -516,47 +1048,119 @@ class TestPipelineOrder:
     """Tests for action execution order in _run_curator."""
 
     def test_compact_runs_before_archive(self, empty_store):
-        """CompactChains executes before ArchiveSuperseded."""
-        # This test verifies ordering indirectly via observable state
-        # Build a chain that both actions would affect
-        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
-        empty_store.memories["v2"] = MockMemory("v2", "mid", zone="core", supersedes=["v1"])
-        empty_store.memories["v3"] = MockMemory("v3", "newest", zone="core", supersedes=["v2"])
+        """CompactChains executes before ArchiveSuperseded, preserving chain head ancestors.
 
+        With v1 -> v2 -> v3 -> v4 -> v5:
+        - If Compact runs first, intermediates v2,v3,v4 are archived and v5.supersedes
+          is updated to [v1]. ArchiveSuperseded then sees depth 2 and leaves v1 alone.
+        - If Archive ran first, depth 5 >= 3 would archive v4,v3,v2,v1.
+        Observable invariant: v1 remains active only when Compact runs before Archive.
+        """
         from memory.curator import _run_curator
 
-        result = _run_curator(None, empty_store)
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "v4", zone="core", supersedes=["v3"])
+        empty_store.memories["v5"] = MockMemory("v5", "newest", zone="core", supersedes=["v4"])
 
-        # Both compacted and superseded counts should be present
-        assert "compacted" in result
-        assert "superseded" in result
+        _run_curator(None, empty_store)
+
+        assert "v5" in empty_store.memories
+        assert "v1" in empty_store.memories  # preserved only if compact ran first
+        assert "v2" in empty_store.deleted
+        assert "v3" in empty_store.deleted
+        assert "v4" in empty_store.deleted
 
 
 class TestErrorIsolation:
     """Tests that one action failure does not skip subsequent actions."""
 
-    def test_action_failure_does_not_skip_later_actions(self, stale_store):
-        """If ArchiveStale fails, CompactChains still runs."""
+    def test_action_failure_does_not_skip_later_actions(self, empty_store, monkeypatch):
+        """If ArchiveStale cannot write cold store, CompactChains still compacts chains."""
+        from memory.curator import _run_curator
+        import memory.curator.actions as _actions_mod
+        import memory.curator.helpers as _helpers_mod
+
+        # Memory that ArchiveStale will try to archive
+        empty_store.memories["expired"] = MockMemory(
+            "expired", "past valid_until", valid_until="2020-01-01T00:00:00Z"
+        )
+        # Independent chain that CompactChains can process
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+
+        _original = _helpers_mod.archive_and_delete
+
+        def _failing_for_stale(mem_store, mem, entry, context):
+            if context == "stale":
+                return False, "stale cold store forced failure"
+            return _original(mem_store, mem, entry, context)
+
+        # actions.py imports archive_and_delete into its module namespace,
+        # so patch that binding rather than the helpers module source.
+        monkeypatch.setattr(_actions_mod, "archive_and_delete", _failing_for_stale)
+
+        result = _run_curator(None, empty_store)
+
+        assert len(result.get("errors", [])) >= 1
+        assert result["compacted"] == 2  # v2, v3 archived
+        assert "v2" in empty_store.deleted
+        assert "v3" in empty_store.deleted
+
+
+class TestPipelineAggregation:
+    """Tests for result aggregation in _run_curator."""
+
+    def test_total_archived_sums_all_sources(self, empty_store):
+        """total_archived includes stale, superseded, compacted, and merged."""
         from memory.curator import _run_curator
 
-        # Force ArchiveStale to fail with a path containing a null byte,
-        # which is invalid on all platforms.
-        stale_store._cold_store_path_override = "/nonexistent\x00path/_cold.jsonl"
+        # Stale memory
+        empty_store.memories["old"] = MockMemory(
+            "old", "old", valid_until="2020-01-01T00:00:00Z"
+        )
+        # Superseded chain depth 3
+        empty_store.memories["orig"] = MockMemory("orig", "orig", zone="core", supersedes=[])
+        empty_store.memories["v1"] = MockMemory("v1", "v1", zone="core", supersedes=["orig"])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
 
-        result = _run_curator(None, stale_store)
+        result = _run_curator(None, empty_store)
 
-        # ArchiveStale should have an error
-        assert len(result.get("errors", [])) >= 1
+        expected = result["archived"] + result["superseded"] + result["compacted"] + result["merged"]
+        assert result["total_archived"] == expected
 
-        # But other actions still ran (their counts may be 0 but keys exist)
-        assert "compacted" in result
-        assert "superseded" in result
-        assert "similar" in result
-        assert "merged" in result
+    def test_all_expected_keys_present(self, empty_store):
+        """_run_curator returns the same top-level keys as the v1.4 contract."""
+        from memory.curator import _run_curator
+
+        result = _run_curator(None, empty_store)
+
+        for key in (
+            "curator",
+            "stale",
+            "archived",
+            "superseded",
+            "compacted",
+            "similar",
+            "merged",
+            "orphan_edges",
+            "total_archived",
+            "errors",
+            "report",
+        ):
+            assert key in result
+
+
+# ---------------------------------------------------------------------------
+# Test: Backward Compatibility
+# ---------------------------------------------------------------------------
 
 
 class TestBackwardCompatibility:
-    """Tests that existing imports still work after refactor."""
+    """Tests that existing imports and wrapper functions still work."""
 
     def test_import_from_package(self):
         """Can import _run_curator from memory.curator package."""
@@ -566,7 +1170,7 @@ class TestBackwardCompatibility:
 
     def test_import_helper_functions(self):
         """Can import helper functions from memory.curator."""
-        from memory.curator import is_protected, build_cold_entry
+        from memory.curator import build_cold_entry, is_protected
 
         assert callable(is_protected)
         assert callable(build_cold_entry)
@@ -578,3 +1182,151 @@ class TestBackwardCompatibility:
         assert ArchiveStale is not None
         assert CompactChains is not None
         assert CuratorContext is not None
+
+    def test_scan_for_stale_returns_ids_without_mutating(self, stale_store):
+        """Legacy scan_for_stale detects stale IDs and does not archive."""
+        from memory.curator import scan_for_stale
+
+        ids = scan_for_stale(stale_store)
+        assert isinstance(ids, list)
+        assert "stale" in ids or "expired" in ids
+        assert len(stale_store.deleted) == 0
+
+    def test_archive_expired_archives_requested_ids(self, stale_store):
+        """Legacy archive_expired archives each ID in the list."""
+        from memory.curator import archive_expired
+
+        count = archive_expired(stale_store, ["stale"])
+        assert count == 1
+        assert "stale" in stale_store.deleted
+        assert "fresh" in stale_store.memories
+
+    def test_archive_superseded_delegates_action(self, empty_store):
+        """Legacy archive_superseded runs ArchiveSuperseded action."""
+        from memory.curator import archive_superseded
+
+        empty_store.memories["orig"] = MockMemory("orig", "orig", zone="core", supersedes=[])
+        empty_store.memories["v1"] = MockMemory("v1", "v1", zone="core", supersedes=["orig"])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "newest", zone="core", supersedes=["v2"])
+
+        count = archive_superseded(empty_store)
+        assert count >= 1
+
+    def test_compact_superseded_chains_delegates_action(self, empty_store):
+        """Legacy compact_superseded_chains runs CompactChains action."""
+        from memory.curator import compact_superseded_chains
+
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+
+        count = compact_superseded_chains(empty_store)
+        assert count == 2  # v2, v3
+
+    def test_scan_for_similar_returns_candidate_pairs(self, empty_store):
+        """Legacy scan_for_similar returns (a, b, score) tuples."""
+        from memory.curator import scan_for_similar
+
+        empty_store.memories["a"] = MockMemory("a", "OpenSpec SDD design workflow")
+        empty_store.memories["b"] = MockMemory("b", "OpenSpec SDD workflow design")
+
+        pairs = scan_for_similar(empty_store)
+        assert isinstance(pairs, list)
+        if pairs:
+            a, b, score = pairs[0]
+            assert isinstance(score, float)
+            assert 0.0 <= score <= 1.0
+
+    def test_merge_similar_delegates_action(self, empty_store):
+        """Legacy merge_similar runs MergeSimilar action."""
+        from memory.curator import merge_similar
+
+        empty_store.memories["a"] = MockMemory("a", "exactly the same body")
+        empty_store.memories["b"] = MockMemory("b", "exactly the same body")
+
+        count = merge_similar(empty_store)
+        assert count == 1
+
+    def test_clean_orphan_edges_delegates_action(self, empty_store, monkeypatch):
+        """Legacy clean_orphan_edges runs CleanOrphanEdges action."""
+        from memory.curator import clean_orphan_edges
+
+        class FakeGraphStore:
+            def clean_orphan_edges(self, active_ids):
+                return 9
+
+        class FakeManager:
+            store = FakeGraphStore()
+
+        monkeypatch.setattr(
+            "memory.curator.actions.get_graph_manager_compat", lambda: FakeManager()
+        )
+        empty_store.memories["m1"] = MockMemory("m1", "body")
+
+        count = clean_orphan_edges(empty_store)
+        assert count == 9
+
+
+# ---------------------------------------------------------------------------
+# Test: Structural Acceptance Criteria from SDD
+# ---------------------------------------------------------------------------
+
+
+class TestStructuralAcceptanceCriteria:
+    """Verify the structural refactoring goals in SDD AC 4/5/6/7."""
+
+    def _source_files(self):
+        repo = Path(__file__).resolve().parent.parent
+        return list((repo / "memory" / "curator").glob("*.py"))
+
+    def test_archive_and_delete_defined_once(self):
+        """AC4: archive+delete transaction pattern appears exactly once."""
+        count = 0
+        for py in self._source_files():
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "archive_and_delete":
+                    count += 1
+        assert count == 1
+
+    def test_is_protected_defined_once(self):
+        """AC5: pinned/keep guard appears exactly once."""
+        count = 0
+        for py in self._source_files():
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "is_protected":
+                    count += 1
+        assert count == 1
+
+    def test_load_effectiveness_wrapper_defined_once(self):
+        """AC6: _load_effectiveness wrapper appears exactly once."""
+        count = 0
+        for py in self._source_files():
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "_load_effectiveness":
+                    count += 1
+        assert count == 1
+
+    def test_no_bare_except_pass(self):
+        """AC7: no 'except Exception: pass' blocks remain in curator package.
+
+        This test captures the SDD intent. Current implementation still contains
+        fallback blocks for standalone import paths; they are addressed in Sprint 2.
+        """
+        for py in self._source_files():
+            source = py.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ExceptHandler):
+                    body = node.body
+                    if len(body) == 1 and isinstance(body[0], ast.Pass):
+                        handler_type = node.type
+                        # Bare except or Exception catch with pass
+                        if handler_type is None or (
+                            isinstance(handler_type, ast.Name) and handler_type.id == "Exception"
+                        ):
+                            pytest.fail(f"Bare 'except Exception: pass' found in {py}")

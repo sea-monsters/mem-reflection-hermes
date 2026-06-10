@@ -139,13 +139,13 @@ def test_version():
     import yaml
     with open(Path(__file__).parent.parent / "plugin.yaml") as f:
         data = yaml.safe_load(f)
-    assert data['version'] == '1.4-beta', f"Expected 1.4-beta, got {data['version']}"
-    print("  PASS: Version is 1.4-beta")
+    assert data['version'] == '1.5', f"Expected 1.5, got {data['version']}"
+    print("  PASS: Version is 1.5")
 
 
 def main():
     print("=" * 60)
-    print("v1.4-beta Runtime Verification")
+    print("v1.5 Runtime Verification")
     print("=" * 60)
 
     tests = [

@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.4-beta** — Context Reliability & Entity Recall (stable/dynamic context split, checkpoint recovery, graded compression, explainable search, entity index), CJK tokenizer modes, typed config diagnostics. See [CHANGELOG](docs/CHANGELOG.md) for full history.
+**Current version: v1.5** — Memory evolution & curator action pipeline, context reliability, entity recall, graph memory, and reflection system. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
