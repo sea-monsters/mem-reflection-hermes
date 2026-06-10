@@ -22,7 +22,7 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **PageRank**: Centrality scores for hub memory identification
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
 - **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
-- **Memory Curator** (v1.2 → v1.3): Automated 5-phase lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping
+- **Memory Curator** (v1.2 → v1.3 → v1.5): Automated 5-phase lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping. v1.5 refactored into composable action pipeline (`memory/curator/`)
 - **Context Reliability** (v1.4): Stable/dynamic context split, timeout-protected assembly, graded compression (`none/mild/aggressive/emergency`)
 - **Explainable Search** (v1.4): Opt-in `explain=true` flag returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, entity, Hebbian)
 - **Entity Recall** (v1.4): SQLite-backed entity index with lifecycle hooks; entity boost in search + explain output

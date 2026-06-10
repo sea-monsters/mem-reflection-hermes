@@ -60,23 +60,23 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 | `core/store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers | — |
 | `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain | store |
 | `core/graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
-| `core/config.py` | canonical (v1.4) | Typed config models, diagnostics, validation | store |
-| `core/backend.py` | canonical (v1.4) | Backend capability abstraction (SearchBackendLike) | — |
+| `core/config.py` | canonical | Typed config models, diagnostics, validation | store |
+| `core/backend.py` | canonical | Backend capability abstraction (SearchBackendLike) | — |
 | `reflection/engine.py` | canonical | ReflectionEngine, raw_chunk default, fact extraction | store |
 | `reflection/runtime.py` | canonical | _run_full_reflection, _run_micro_reflection, audit logging, compaction | store, search, reflection/engine |
-| `memory/curator.py` | canonical (v1.2) | 5-phase curation: TTL/staleness, supersedes archive, similarity detection, orphan cleanup, cold storage | store, memory/bridge |
-| `memory/bridge.py` | canonical (v1.1) | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
-| `memory/context.py` | canonical (v1.4) | Context assembly: stable/dynamic split, token budget, skill matching, graded compression | store, search |
+| `memory/curator/` | canonical (v1.5) | Composable action pipeline: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport | store, memory/bridge |
+| `memory/bridge.py` | canonical | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
+| `memory/context.py` | canonical | Context assembly: stable/dynamic split, token budget, skill matching, graded compression | store, search |
 | `runtime/tools.py` | canonical | 7 base SRH tool handlers (write, search, delete, palace, reflect, skill, compile) | store, search, reflection |
 | `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands | store, reflection, search, memory |
 | `runtime/graph.py` | canonical | 5 graph/health tools + graph manager singleton | core/graph, store |
-| `runtime/checkpoint.py` | canonical (v1.4) | Atomic session checkpoint, pending-stage recovery, corrupt backup | store |
+| `runtime/checkpoint.py` | canonical | Atomic session checkpoint, pending-stage recovery, corrupt backup | store |
 | `web/api.py` | canonical | FastAPI dashboard routes (15 endpoints) backed by store/search/runtime graph/curator APIs | package runtime services |
 | `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, `reflection/engine.py` | deprecated compat | Explicit old import paths forwarding to runtime modules | runtime/* |
 
 **Tool split**: 7 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py` through the package `register(ctx)` path. All 12 tools are declared in `plugin.yaml`.
 
-### Import Order Rules (v1.4)
+### Import Order Rules (v1.5)
 
 When adding new functionality, respect the module boundaries:
 
@@ -85,17 +85,18 @@ When adding new functionality, respect the module boundaries:
 3. **`core/graph.py`**: GraphIndex — imports `core/store` only where cross-zone analysis needs memory metadata
 4. **`core/config.py`** / **`core/backend.py`**: Typed config and backend abstraction — imports `core/store`
 5. **`reflection/engine.py`** / **`reflection/runtime.py`**: Reflection pipelines — import `core/store` + `core/search`
-6. **`memory/curator.py`** / **`memory/bridge.py`**: Curation and host sync — import `core/store` (`memory/curator` also imports `memory/bridge` for body refinement)
-7. **`memory/context.py`**: Context assembly — imports `core/store` + `core/search`
-8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features — depend on canonical services
-9. **`web/api.py`**: Dashboard — imports package runtime services via `sys.modules` fallback
-10. **`__init__.py`**: Registration and runtime singletons — imports all canonical modules explicitly
+6. **`memory/curator/`**: Composable action pipeline — imports `core/store` + `memory/bridge`; `memory/bridge.py` imports `core/store` only
+7. **`memory/context.py`**: Context assembly — imports `core/store` + `core/search` + `core/config`
+8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features
+9. **`runtime/registration.py`**, **`runtime/schemas.py`**, **`runtime/state.py`**, **`runtime/helpers.py`**, **`runtime/_lb.py`**: Registration, schemas, singletons, late-binding
+10. **`web/api.py`**: Dashboard — imports package runtime services via `sys.modules` fallback
+11. **`__init__.py`**: Exports public API, backward-compat aliases, delegates `register()` to `runtime/registration`
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
 ### Thread Safety (v1.5)
 
-Key concurrency protections present in v1.4-beta:
+Key concurrency protections present in v1.5:
 
 | Resource | Protection |
 |----------|-----------|
@@ -138,7 +139,7 @@ The `pre_llm_call` hook injects context in this priority order:
 Each layer respects the `max_context_token_preference` budget. Token estimation
 uses CJK-aware heuristics (3 bytes/token for CJK, 4 bytes/token for Latin).
 
-## Entity Recall Layer (v1.4)
+## Entity Recall Layer
 
 The plugin implements entity-based recall to improve retrieval of memories
 containing proper nouns, file paths, package names, and other identifiers
@@ -187,7 +188,7 @@ matched against the `entity_links` table. Matching memories receive an
 appears in `fusion_search_explain` output under the `entity_boost` and
 `entity_hits` fields.
 
-## Context Compression Tiers (v1.4)
+## Context Compression Tiers
 
 When token budget is insufficient for full context, the plugin applies
 graded compression to the **dynamic section** (relevant memories, triggered

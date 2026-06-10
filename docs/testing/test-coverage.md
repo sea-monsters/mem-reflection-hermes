@@ -1,9 +1,9 @@
 # Test Coverage Documentation
 
-> Version: v1.4 development baseline
-> Last updated: 2026-06-09
-> Collection snapshot: `pytest tests --collect-only -q` -> **413 tests collected**
-> Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.4 acceptance surfaces
+> Version: v1.5 development baseline
+> Last updated: 2026-06-10
+> Collection snapshot: `pytest tests --collect-only -q` -> **523 tests collected**
+> Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.5 acceptance surfaces
 
 ---
 
@@ -16,7 +16,7 @@ The suite now has two complementary marker layers:
 - cross-version functional markers:
   `store`, `search`, `retrieval`, `graph`, `reflection`, `runtime`, `context`, `curator`, `bridge`, `dashboard`, `tools`, `backend`, `config`, `contract`, `compaction`, `reranker`, `e2e`, `integration`, `smoke`, `compatibility`, `cjk`
 - v1.4 regression markers:
-  `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`
+  `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`, `v14_hooks`
 
 Example commands:
 
@@ -27,7 +27,7 @@ pytest -m "v14_runtime or v14_entity"
 pytest -m "contract or smoke"
 ```
 
-Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v1.4 additions are classified together without per-test decorators.
+Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v1.4/v1.5 additions are classified together without per-test decorators.
 
 ### Current Collected Test Modules
 
@@ -43,6 +43,7 @@ Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v
 | `test_config.py` | 15 | typed config fallback and diagnostics |
 | `test_context.py` | 29 | context assembly, bundle split, compression |
 | `test_core_data.py` | 16 | frontmatter, effectiveness, lineage, atomic write |
+| `test_curator_pipeline.py` | 31 | composable curator actions, pipeline aggregation |
 | `test_dashboard.py` | 18 | dashboard API, curator/reflection endpoints, zones |
 | `test_e2e.py` | 6 | end-to-end lifecycle integration |
 | `test_entity_extraction.py` | 21 | entity index lifecycle, regex patterns, weight hierarchy |
@@ -52,22 +53,25 @@ Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v
 | `test_graph_operations.py` | 15 | compat graph CRUD, spread activation, PageRank |
 | `test_host_contract_smoke.py` | 1 | host contract and smoke script |
 | `test_hooks.py` | 13 | v0.16.0 enhanced hooks |
+| `test_lb.py` | 8 | late-binding helper, module resolution, fail-open |
 | `test_memory_curator.py` | 27 | stale scan, supersedes compaction, merge, report |
 | `test_optional_deps.py` | 5 | optional dependency fallback paths |
 | `test_reflect.py` | 23 | reflection engine, facts, logs, raw chunk |
 | `test_reflection.py` | 27 | runtime reflection, hook cadence, JSON repair |
 | `test_reranker.py` | 13 | reranker abstraction and SearchIndex integration |
 | `test_reranker_exceptions.py` | 5 | reranker OOM/API failure fallbacks |
+| `test_schema_module.py` | 10 | runtime schema definitions, JSON schema validity |
 | `test_search.py` | 16 | RRF, MMR, conflict, explain, entity boost |
 | `test_store.py` | 18 | rebuild/validate/prune, lineage, delete callbacks |
+| `test_store_module_split.py` | 12 | core module split, import paths, backward compat |
 | `test_tool_handlers.py` | 9 | runtime tool lineage and write/read helpers |
 | `test_wave3_retrieval.py` | 15 | spread activation, CJK, fusion, time sorting |
 
 ---
 
-## v1.4 Acceptance Surface
+## v1.4 & v1.5 Acceptance Surface
 
-The current v1.4 work is covered by seven dedicated marker groups:
+The v1.4 work is covered by seven dedicated marker groups:
 
 | Marker | Focus | Main Files |
 |--------|-------|------------|
@@ -85,7 +89,7 @@ Verified selection example:
 pytest tests/ -m "v14" -q
 ```
 
-Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **413 passed**.
+Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **523 passed**.
 
 ---
 

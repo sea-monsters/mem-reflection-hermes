@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.5 — Module Refactoring & Composable Curator Pipeline
+
+### Core Module Split (v1.5)
+
+- **`core/store.py` → 10 modules**: Extracted `core/models.py`, `core/utils.py`, `core/tokenization.py`, `core/entities.py`, `core/store_methods.py`, `core/skill_store.py`, `core/lineage.py`, `core/intent.py`, `core/async_writer.py`, `core/store_health.py`
+- **Layered imports preserved**: No circular dependencies; `core/store.py` remains the leaf module
+
+### Curator Refactor (v1.5)
+
+- **Composable action pipeline**: `memory/curator/` subpackage replaces monolithic `memory/curator.py`
+  - `actions.py`: `CuratorAction` base + 6 implementations (`ArchiveStale`, `CompactChains`, `ArchiveSuperseded`, `MergeSimilar`, `CleanOrphanEdges`, `GenerateReport`)
+  - `helpers.py`: `is_protected`, `build_cold_entry`, `archive_and_delete`, `load_last_access`, config
+  - `cold_store.py`: JSONL append-only cold storage with 10MB cap
+  - `report.py`: Human-readable report generation and persistence
+- **Pipeline ordering**: ArchiveStale → CompactChains → ArchiveSuperseded → MergeSimilar → CleanOrphanEdges → GenerateReport
+- **Legacy API preserved**: Thin wrappers in `memory/curator/__init__.py` for backward compatibility
+
+### Runtime Package Split (v1.5)
+
+- **`runtime/registration.py`**: `register(ctx)` entrypoint that wires hooks, commands, tools, and post-delete callbacks
+- **`runtime/schemas.py`**: 12 Hermes tool JSON schemas
+- **`runtime/state.py`**: Singleton getters (`_get_mem_store`, `_get_search_index`, `_get_graph_mgr`, etc.) with double-checked locking
+- **`runtime/helpers.py`**: `_build_context_block`, `_build_context_bundle`, `_estimate_tokens`, `match_skills`
+- **`runtime/_lb.py`**: Late-binding helper — resolves modules/symbols without hard imports to avoid circular dependencies
+- **`__init__.py` slimmed**: Exports public API + backward-compat aliases only; registration delegated to `runtime/registration`
+
+### Infrastructure
+
+- **Test count**: 413 → 523 tests (110 new tests across module-split boundaries)
+- **Late-binding pattern**: Runtime modules use `_lb(name)` for cross-module resolution at call time rather than import time
+- **No functional regressions**: All v1.4 features (ContextBundle, checkpoint, entity index, explainable search, CJK tokenizer) preserved unchanged
+
+---
+
 ## v1.4-beta — Context Reliability & Entity Recall
 
 ### Context Reliability (stable/dynamic split)
@@ -39,6 +73,12 @@
 ### Tests
 
 - 317+ tests collected; new v1.4 tests grouped under pytest markers: `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`.
+
+---
+
+## v1.5 (2026-06-10)
+
+See top of this document for v1.5 changelog.
 
 ---
 
