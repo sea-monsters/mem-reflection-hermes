@@ -79,6 +79,7 @@ try:
         normalize_bm25,
         plugin_config,
         _tokenise,
+        entity_weight,
         embeddings_enabled,
         _memory_tokens as estimate_tokens,
         _bm25_search_scored,
@@ -102,6 +103,9 @@ except ImportError:
     normalize_bm25 = _store_mod.normalize_bm25
     plugin_config = _store_mod.plugin_config
     _tokenise = _store_mod._tokenise
+
+    entity_weight = _store_mod.entity_weight
+
     embeddings_enabled = _store_mod.embeddings_enabled
     estimate_tokens = _store_mod._memory_tokens
     _bm25_search_scored = _store_mod._bm25_search_scored
@@ -454,6 +458,63 @@ class SearchIndex:
         include_history: bool = False,
         fusion_mode: str = "rrf",
     ) -> List[LoadedMemory]:
+        """Return ranked memories only."""
+        return self._search_impl(
+            query,
+            k=k,
+            zone=zone,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            delta=delta,
+            hebbian_beta=hebbian_beta,
+            include_history=include_history,
+            fusion_mode=fusion_mode,
+            explain=False,
+        )
+
+    def search_explain(
+        self,
+        query: str,
+        k: int = 5,
+        zone: Optional[str] = None,
+        alpha: float = 0.5,
+        beta: float = 0.3,
+        gamma: float = 0.1,
+        delta: float = 0.1,
+        hebbian_beta: float = 0.0,
+        include_history: bool = False,
+        fusion_mode: str = "rrf",
+    ) -> Dict[str, Any]:
+        """Return ranked memories plus explainable score components."""
+        return self._search_impl(
+            query,
+            k=k,
+            zone=zone,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            delta=delta,
+            hebbian_beta=hebbian_beta,
+            include_history=include_history,
+            fusion_mode=fusion_mode,
+            explain=True,
+        )
+
+    def _search_impl(
+        self,
+        query: str,
+        k: int = 5,
+        zone: Optional[str] = None,
+        alpha: float = 0.5,
+        beta: float = 0.3,
+        gamma: float = 0.1,
+        delta: float = 0.1,
+        hebbian_beta: float = 0.0,
+        include_history: bool = False,
+        fusion_mode: str = "rrf",
+        explain: bool = False,
+    ) -> Any:
         """Three-layer retrieval: Recall → Fusion → Rerank.
 
         Args:
@@ -475,22 +536,51 @@ class SearchIndex:
             delta,
             hebbian_beta,
         )
-        with self._cache_lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                return cached
+        if not explain:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return cached
 
         if include_history:
             active = self.store.list(zone=normalized_zone) if normalized_zone else self.store.list()
         else:
             active = self.store.list(zone=normalized_zone, active_only=True) if normalized_zone else self.store.list_active()
         if not active:
+            if explain:
+                return {"results": [], "explain": {}, "meta": {"query": query, "k": k, "fusion_mode": fusion_mode}}
             return []
 
         now = datetime.now(timezone.utc)
         effectiveness = self.store.effectiveness()
         recall_k = k * 4
         active_map: Dict[str, LoadedMemory] = {m.id(): m for m in active}
+        explain_map: Dict[str, Dict[str, Any]] = {}
+
+        def _entry(mid: str) -> Dict[str, Any]:
+            data = explain_map.get(mid)
+            if data is None:
+                data = {
+                    "embedding_rank": None,
+                    "embedding_score": None,
+                    "bm25_rank": None,
+                    "bm25_score": None,
+                    "rrf_score": None,
+                    "weighted_base_score": None,
+                    "base_score": 0.0,
+                    "graph_only": False,
+                    "entity_boost": 0.0,
+                    "entity_hits": [],
+                    "recency_factor": 0.0,
+                    "effectiveness_factor": 0.0,
+                    "supersedes_factor": 1.0,
+                    "hebbian_boost": 0.0,
+                    "final_score": 0.0,
+                    "final_rank": None,
+                    "mmr_applied": False,
+                }
+                explain_map[mid] = data
+            return data
 
         # Layer 1: Recall
         # For history-inclusive queries we bypass the cached indexes (which only
@@ -516,6 +606,18 @@ class SearchIndex:
             bm25_scored = _bm25_search_scored(active, query, recall_k, effectiveness)
             bm25_results = {m.id(): s for m, s in bm25_scored}
 
+        if explain:
+            ranked_embed = sorted(embed_results.items(), key=lambda item: item[1], reverse=True)
+            for rank, (mid, score) in enumerate(ranked_embed, start=1):
+                info = _entry(mid)
+                info["embedding_rank"] = rank
+                info["embedding_score"] = score
+            ranked_bm25 = sorted(bm25_results.items(), key=lambda item: item[1], reverse=True)
+            for rank, (mid, score) in enumerate(ranked_bm25, start=1):
+                info = _entry(mid)
+                info["bm25_rank"] = rank
+                info["bm25_score"] = score
+
         # Layer 2: Fusion
         if fusion_mode == "rrf":
             fused_scores = self._rrf_fusion(embed_results, bm25_results, active_map)
@@ -525,7 +627,29 @@ class SearchIndex:
             )
 
         if not fused_scores:
+            if explain:
+                return {"results": [], "explain": {}, "meta": {"query": query, "k": k, "fusion_mode": fusion_mode}}
             return []
+
+        if explain:
+            for mid, score in fused_scores.items():
+                info = _entry(mid)
+                info["base_score"] = score
+                if fusion_mode == "rrf":
+                    info["rrf_score"] = score
+                else:
+                    info["weighted_base_score"] = score
+
+        entity_boosts: Dict[str, float] = {}
+        entity_hits: Dict[str, List[Dict[str, Any]]] = {}
+        query_entities: List[Dict[str, Any]] = []
+        try:
+            entity_boosts, entity_hits, query_entities = self.store.compute_entity_boosts(
+                query,
+                candidate_ids=set(active_map.keys()),
+            )
+        except Exception as e:
+            logger.debug("Entity recall skipped: %s", e)
 
         # Layer 3: Rerank — recency, effectiveness, Hebbian, supersedes
         reranked: List[Tuple[float, LoadedMemory]] = []
@@ -549,6 +673,7 @@ class SearchIndex:
 
             sup_depth = self._calc_supersedes_depth(mid)
             sup_factor = (1.0 + sup_depth) / (2.0 + sup_depth)
+            entity_bonus = entity_boosts.get(mid, 0.0) * max(entity_weight(), 0.0)
 
             if fusion_mode == "rrf":
                 # RRF base score × bonuses (recency, eff, supersedes)
@@ -558,10 +683,19 @@ class SearchIndex:
                 if delta > 0:
                     score *= (1.0 + delta * eff_factor)
                 score *= sup_factor
+                score += entity_bonus
             else:
                 # Weighted: recency and eff are additive terms in the weighted sum
-                score = base_score * sup_factor
+                score = (base_score * sup_factor) + entity_bonus
 
+            if explain:
+                info = _entry(mid)
+                info["entity_boost"] = entity_bonus
+                info["entity_hits"] = entity_hits.get(mid, [])
+                info["recency_factor"] = recency
+                info["effectiveness_factor"] = eff_factor
+                info["supersedes_factor"] = sup_factor
+                info["final_score"] = score
             if score > max_rerank_score:
                 max_rerank_score = score
             reranked.append((score, mem))
@@ -579,12 +713,22 @@ class SearchIndex:
                 # associated but semantically distant memories are recoverable.
                 for nid, act in activation.items():
                     if nid in active_map and nid not in fused_scores:
-                        reranked.append((hebbian_beta * min(act, 1.0) * scale, active_map[nid]))
+                        hebbian_score = hebbian_beta * min(act, 1.0) * scale
+                        reranked.append((hebbian_score, active_map[nid]))
+                        if explain:
+                            info = _entry(nid)
+                            info["graph_only"] = True
+                            info["hebbian_boost"] = hebbian_score
+                            info["final_score"] = hebbian_score
                 for i, (score, mem) in enumerate(reranked):
                     act = activation.get(mem.id(), 0.0)
                     if act > 0:
                         hebbian_score = hebbian_beta * min(act, 1.0) * scale
                         reranked[i] = (score + hebbian_score, mem)
+                        if explain:
+                            info = _entry(mem.id())
+                            info["hebbian_boost"] = hebbian_score
+                            info["final_score"] = score + hebbian_score
             except Exception as e:
                 logger.debug("Hebbian boost skipped: %s", e)
 
@@ -601,8 +745,34 @@ class SearchIndex:
         # MMR diversity re-ranking (optional, λ=0.7 balances relevance vs diversity)
         if k > 1:
             results = self._mmr_rerank(query, results, lambda_param=0.7, top_n=k * 2)
+            if explain:
+                for mid in explain_map:
+                    explain_map[mid]["mmr_applied"] = True
 
         results = results[:k]
+        if explain:
+            backend_caps = None
+            try:
+                caps = self.store.search_backend_capabilities()
+                backend_caps = caps.__dict__ if hasattr(caps, "__dict__") else dict(caps)
+            except Exception:
+                backend_caps = None
+            for rank, mem in enumerate(results, start=1):
+                _entry(mem.id())["final_rank"] = rank
+            return {
+                "results": results,
+                "explain": {mem.id(): explain_map.get(mem.id(), {}) for mem in results},
+                "meta": {
+                "query": query,
+                "k": k,
+                "zone": normalized_zone,
+                "include_history": include_history,
+                "fusion_mode": fusion_mode,
+                "hebbian_beta": hebbian_beta,
+                "query_entities": query_entities,
+                "backend_capabilities": backend_caps,
+                },
+            }
         with self._cache_lock:
             self._cache[cache_key] = results
         return results

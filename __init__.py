@@ -1,6 +1,6 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.2-beta2 Architecture (organized by functionality):
+v1.4-beta Architecture (organized by functionality):
 - core/: SQLite storage, search engine, graph index (3,650 LOC)
 - reflection/: Reflection engine and runtime (2,503 LOC)
 - memory/: Curation, bridge, context assembly (1,783 LOC)
@@ -71,6 +71,8 @@ from .reflection.runtime import (  # noqa: F401
     _format_pending_skills_for_display,
     _reset_current_session_memory_ids,
     _recent_reflect_outcomes,
+    _reflection_mode,
+    _save_pending_skill_candidates,
 )
 
 # Import from memory modules
@@ -94,6 +96,8 @@ from .memory.bridge import (  # noqa: F401
 
 from .memory.context import (  # noqa: F401
     build_context_block,
+    build_context_bundle,
+    ContextBundle,
 )
 
 # Import from runtime modules
@@ -244,17 +248,63 @@ def _build_context_block(query: str = "") -> str:
     return build_context_block(query)
 
 
+def _build_context_bundle(query: str = "", max_tokens: int = 4000, stable_only: bool = False):
+    """Build structured context bundle using memory.context module."""
+    from .memory.context import build_context_bundle
+    return build_context_bundle(_get_mem_store(), _get_search_index(), _get_skill_store(), query, max_tokens=max_tokens, stable_only=stable_only)
+
+
 def _estimate_tokens(text: str) -> int:
     """Estimate token count using store module."""
     from .core.store import _memory_tokens
     return _memory_tokens(text)
 
 
+def load_zone_summary(zone: str):
+    """Load cached zone summary from zone-cache directory."""
+    try:
+        from .core.store import zone_cache_dir, sanitize_zone_filename
+        path = zone_cache_dir() / f"{sanitize_zone_filename(zone)}.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return None
+
+
+def save_zone_summary(zone: str, content: str):
+    """Save zone summary cache to zone-cache directory."""
+    try:
+        from .core.store import zone_cache_dir, sanitize_zone_filename
+        path = zone_cache_dir() / f"{sanitize_zone_filename(zone)}.md"
+        path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
 def match_skills(skills, query, k=10):
-    """Match skills using search module."""
-    from .core.search import SearchIndex
-    # Skills are matched via BM25 on their description field
-    return SearchIndex.match_skills(skills, query, k)
+    """Match skills against query using token overlap (Jaccard-like)."""
+    from .core.store import _tokenise
+    q_tokens = set(_tokenise(query))
+    if not q_tokens:
+        return skills[:k]
+    scored = []
+    for skill in skills:
+        fm = skill.frontmatter
+        texts = [fm.name, fm.description]
+        triggers = getattr(fm, "triggers", [])
+        if triggers:
+            texts.extend(triggers)
+        skill_tokens = set()
+        for t in texts:
+            skill_tokens.update(_tokenise(t))
+        overlap = len(q_tokens & skill_tokens)
+        if overlap == 0:
+            continue
+        score = overlap / max(len(q_tokens), len(skill_tokens))
+        scored.append((score, skill))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:k]]
 
 
 # ── Tool Schemas ──────────────────────────────────────────────────────
@@ -535,6 +585,8 @@ __all__ = [
     "scan_for_stale",
     "_refine_body",
     "build_context_block",
+    "build_context_bundle",
+    "ContextBundle",
     # Runtime exports
     "srh_memory_write",
 #    "srh_memory_read",

@@ -1,5 +1,5 @@
 name: mem-reflection-hermes
-version: 1.2-beta2
+version: 1.4-beta
 description: "Self-evolving memory & reflection system. Memory Palace (core/work/episode/general/project:*), 17 SRH tools, dual scope (user+project), TF-IDF/BM25 + ONNX semantic search, effectiveness tracking with decay, micro/full reflection, skill auto-matching, profile compilation, runtime graph memory, zone rebalance, CJK adaptive threshold, LRU embed cache, PageRank centrality, SUPERSEDES graph edges, query templates, result cache, cross-zone analysis, dashboard graph/query APIs, and memory curator (TTL/staleness/supersedes/similarity/auto-archive)."
 author: "ported from coder-brzhang/small-rust-hermes"
 provides_tools:

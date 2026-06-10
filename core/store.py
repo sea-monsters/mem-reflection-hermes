@@ -51,6 +51,7 @@ CONFIG_KEY_RELEVANT_MEMORY_CAP = "relevant_memory_cap"
 CONFIG_KEY_TRIGGERED_SKILL_CAP = "triggered_skill_cap"
 CONFIG_KEY_INTENT_PROTOTYPES = "intent_prototypes"
 CONFIG_KEY_RERANKER = "reranker"
+CONFIG_KEY_ENTITY = "entity"
 
 # ---------------------------------------------------------------------------
 # Config & paths (with mtime-aware caching)
@@ -336,6 +337,180 @@ _CJK_STOPWORDS: Set[str] = {
     "와", "한", "하", "고", "도", "지", "다", "니다", "세요",
 }
 
+_ENTITY_PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/)?(?:[\w.\-]+[\\/])+[\w.\-]+\.\w+")
+_ENTITY_CODE_RE = re.compile(r"`([^`]{2,120})`")
+_ENTITY_QUOTED_RE = re.compile(r"\"([^\"]{2,120})\"|'([^']{2,120})'")
+_ENTITY_PACKAGE_RE = re.compile(r"\b(?:[A-Za-z_]\w*\.){1,}[A-Za-z_]\w*\b")
+_ENTITY_CAMEL_RE = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b")
+_ENTITY_COMPOUND_RE = re.compile(r"\b[a-z0-9]+(?:[-_/][a-z0-9]+){1,}\b", re.IGNORECASE)
+
+
+def _entity_config() -> Dict[str, Any]:
+    cfg = plugin_config().get(CONFIG_KEY_ENTITY, {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def entity_enabled() -> bool:
+    return bool(_entity_config().get("enabled", True))
+
+
+def entity_weight() -> float:
+    raw = _entity_config().get("weight", 0.08)
+    try:
+        return float(raw)
+    except Exception:
+        return 0.08
+
+
+def _normalize_entity_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", text.strip())
+    return value.lower()
+
+
+def _extract_entities_spacy(text: str) -> List[Tuple[str, str]]:
+    try:
+        import spacy  # type: ignore
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            return []
+        doc = nlp(text)
+        out: List[Tuple[str, str]] = []
+        for ent in doc.ents:
+            label = (ent.label_ or "spacy").lower()
+            candidate = ent.text.strip()
+            if len(candidate) >= 3:
+                out.append((candidate, label))
+        return out
+    except Exception:
+        return []
+
+
+def extract_entities(text: str) -> List[Dict[str, Any]]:
+    """Best-effort entity extraction using regex plus optional spaCy."""
+    if not text or not text.strip():
+        return []
+
+    seen: Set[Tuple[str, str]] = set()
+    entities: List[Dict[str, Any]] = []
+
+    def _add(candidate: str, kind: str, weight: float = 1.0) -> None:
+        cleaned = candidate.strip().strip("`\"'")
+        if len(cleaned) < 3:
+            return
+        normalized = _normalize_entity_text(cleaned)
+        key = (normalized, kind)
+        if not normalized or key in seen:
+            return
+        seen.add(key)
+        entities.append({
+            "text": cleaned,
+            "normalized": normalized,
+            "type": kind,
+            "weight": weight,
+        })
+
+    for match in _ENTITY_PATH_RE.finditer(text):
+        _add(match.group(0), "file_path", 1.0)
+    for match in _ENTITY_CODE_RE.finditer(text):
+        _add(match.group(1), "code", 0.9)
+    for match in _ENTITY_QUOTED_RE.finditer(text):
+        candidate = match.group(1) or match.group(2)
+        _add(candidate, "quoted", 0.8)
+    for match in _ENTITY_PACKAGE_RE.finditer(text):
+        _add(match.group(0), "package", 0.75)
+    for match in _ENTITY_CAMEL_RE.finditer(text):
+        _add(match.group(0), "proper", 0.7)
+    for match in _ENTITY_COMPOUND_RE.finditer(text):
+        _add(match.group(0), "compound", 0.65)
+    for candidate, kind in _extract_entities_spacy(text):
+        _add(candidate, kind, 0.6)
+
+    return entities
+
+_JIEBA_SEARCH = None
+_JIEBA_AVAILABLE: Optional[bool] = None
+
+
+def _search_config() -> Dict[str, Any]:
+    """Return the search configuration subtree."""
+    cfg = plugin_config().get("search", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def cjk_tokenizer_mode() -> str:
+    """Return normalized CJK tokenizer mode: auto, bigram, or jieba."""
+    raw = str(_search_config().get("cjk_tokenizer", "auto")).strip().lower()
+    if raw in {"auto", "bigram", "jieba"}:
+        return raw
+    return "auto"
+
+
+def _get_jieba_search():
+    """Return jieba.cut_for_search if available, else None."""
+    global _JIEBA_SEARCH, _JIEBA_AVAILABLE
+    if _JIEBA_AVAILABLE is False:
+        return None
+    if _JIEBA_SEARCH is not None:
+        return _JIEBA_SEARCH
+    try:
+        import jieba  # type: ignore
+        _JIEBA_SEARCH = jieba.cut_for_search
+        _JIEBA_AVAILABLE = True
+        return _JIEBA_SEARCH
+    except Exception:
+        _JIEBA_AVAILABLE = False
+        return None
+
+
+def _tokenise_cjk_bigram(part: str) -> List[str]:
+    """Tokenize a CJK-bearing fragment via non-overlapping bigrams."""
+    tokens: List[str] = []
+    i = 0
+    while i < len(part) - 1:
+        bigram = part[i:i + 2]
+        if all(is_cjk(c) for c in bigram):
+            tokens.append(bigram)
+            i += 2
+        else:
+            i += 1
+    non_cjk = "".join(c for c in part if not is_cjk(c))
+    if len(non_cjk) >= _MIN_TOKEN_LEN and non_cjk not in _STOPWORDS:
+        tokens.append(non_cjk)
+    return [t for t in tokens if t not in _CJK_STOPWORDS]
+
+
+def _tokenise_cjk_jieba(part: str) -> List[str]:
+    """Tokenize a CJK-bearing fragment via jieba search mode."""
+    cut_for_search = _get_jieba_search()
+    if cut_for_search is None:
+        return _tokenise_cjk_bigram(part)
+    tokens: List[str] = []
+    for token in cut_for_search(part):
+        piece = token.strip().lower()
+        if not piece:
+            continue
+        if any(is_cjk(c) for c in piece):
+            if piece not in _CJK_STOPWORDS:
+                tokens.append(piece)
+            continue
+        for sub in _TOKEN_RE.split(piece):
+            if len(sub) >= _MIN_TOKEN_LEN and sub not in _STOPWORDS:
+                tokens.append(sub)
+    return tokens
+
+
+def _tokenise_cjk_part(part: str) -> List[str]:
+    """Tokenize a CJK-bearing fragment using the configured strategy."""
+    mode = cjk_tokenizer_mode()
+    if mode == "bigram":
+        return _tokenise_cjk_bigram(part)
+    if mode == "jieba":
+        return _tokenise_cjk_jieba(part)
+    if _get_jieba_search() is not None:
+        return _tokenise_cjk_jieba(part)
+    return _tokenise_cjk_bigram(part)
+
 
 def _tokenise(s: str) -> List[str]:
     """Tokenize text for BM25 search.
@@ -350,21 +525,7 @@ def _tokenise(s: str) -> List[str]:
             continue
         has_cjk_flag = any(is_cjk(c) for c in part)
         if has_cjk_flag:
-            # CJK bigram tokenization: non-overlapping window of 2 chars
-            i = 0
-            while i < len(part) - 1:
-                bigram = part[i:i + 2]
-                if all(is_cjk(c) for c in bigram):
-                    tokens.append(bigram)
-                    i += 2  # non-overlapping stride
-                else:
-                    i += 1
-            # Also include the whole part if it has non-CJK
-            non_cjk = ''.join(c for c in part if not is_cjk(c))
-            if len(non_cjk) >= _MIN_TOKEN_LEN and non_cjk not in _STOPWORDS:
-                tokens.append(non_cjk)
-            # Filter CJK bigrams against stopwords
-            tokens = [t for t in tokens if t not in _CJK_STOPWORDS]
+            tokens.extend(_tokenise_cjk_part(part))
         else:
             if len(part) >= _MIN_TOKEN_LEN and part not in _STOPWORDS:
                 tokens.append(part)
@@ -1248,6 +1409,24 @@ CREATE TABLE IF NOT EXISTS stats (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stats_mem ON stats(memory_id);
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    normalized TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entities_normalized ON entities(normalized);
+CREATE TABLE IF NOT EXISTS entity_links (
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    weight REAL NOT NULL DEFAULT 1.0,
+    source TEXT NOT NULL DEFAULT 'regex',
+    PRIMARY KEY (entity_id, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_links_memory ON entity_links(memory_id);
+CREATE INDEX IF NOT EXISTS idx_entity_links_entity ON entity_links(entity_id);
 """
 
 
@@ -1351,6 +1530,7 @@ class MemoryStore:
         stale = existing - disk_ids
         for sid in stale:
             conn.execute("DELETE FROM memories WHERE id = ?", (sid,))
+        self._cleanup_orphan_entities(conn)
         conn.commit()
 
     def _upsert_memory_row(self, conn: sqlite3.Connection, m: LoadedMemory) -> None:
@@ -1378,6 +1558,50 @@ class MemoryStore:
                 "INSERT OR IGNORE INTO supersedes (old_id, new_id, reason) VALUES (?, ?, ?)",
                 (old_id, fm.id, fm.supersedes_reason),
             )
+        self._refresh_entity_links(conn, m)
+
+    def _refresh_entity_links(self, conn: sqlite3.Connection, m: LoadedMemory) -> None:
+        """Rebuild entity links for a memory, failing open on extraction issues."""
+        if not entity_enabled():
+            return
+        try:
+            extracted = extract_entities(m.body + "\n" + " ".join(m.frontmatter.tags or []))
+        except Exception:
+            logger.debug("Entity extraction failed for %s", m.id(), exc_info=True)
+            extracted = []
+
+        conn.execute("DELETE FROM entity_links WHERE memory_id = ?", (m.id(),))
+        now = datetime.now(timezone.utc).isoformat()
+        for entity in extracted:
+            row = conn.execute(
+                "SELECT id FROM entities WHERE normalized = ?",
+                (entity["normalized"],),
+            ).fetchone()
+            if row is None:
+                entity_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO entities (id, text, normalized, type, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (entity_id, entity["text"], entity["normalized"], entity["type"], now, now),
+                )
+            else:
+                entity_id = row["id"]
+                conn.execute(
+                    "UPDATE entities SET text = ?, type = ?, updated_at = ? WHERE id = ?",
+                    (entity["text"], entity["type"], now, entity_id),
+                )
+            conn.execute(
+                """INSERT OR REPLACE INTO entity_links (entity_id, memory_id, weight, source)
+                   VALUES (?, ?, ?, ?)""",
+                (entity_id, m.id(), float(entity.get("weight", 1.0)), entity["type"]),
+            )
+        self._cleanup_orphan_entities(conn)
+
+    @staticmethod
+    def _cleanup_orphan_entities(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM entity_links)"
+        )
 
     # -- helpers -------------------------------------------------------------
 
@@ -1511,6 +1735,7 @@ class MemoryStore:
                     logger.warning("Failed to delete memory file %s: %s", path, e)
                     return False
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+            self._cleanup_orphan_entities(conn)
             conn.commit()
             self._mark_changed()
             # P2a: post-delete callbacks (graph cleanup, etc.)
@@ -1680,6 +1905,75 @@ class MemoryStore:
             include_history=include_history,
             **kwargs,
         )
+
+    def fusion_search_explain(self, query: str, k: int = 5, zone: Optional[str] = None,
+                              include_history: bool = False, **kwargs) -> Dict[str, Any]:
+        """Search memories with explainable score components."""
+        return self._get_search_index().search_explain(
+            query,
+            k=k,
+            zone=zone,
+            include_history=include_history,
+            **kwargs,
+        )
+
+    def search_backend_capabilities(self):
+        """Report capabilities of the current SQLite/Markdown backend."""
+        from .backend import default_sqlite_backend_capabilities
+        return default_sqlite_backend_capabilities(
+            entity_search=entity_enabled(),
+            vector_search=embeddings_enabled(),
+        )
+
+    def entity_links_for_memory(self, memory_id: str) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT e.text, e.normalized, e.type, l.weight, l.source
+               FROM entity_links l
+               JOIN entities e ON e.id = l.entity_id
+               WHERE l.memory_id = ?
+               ORDER BY l.weight DESC, e.text ASC""",
+            (memory_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def compute_entity_boosts(
+        self,
+        query: str,
+        candidate_ids: Optional[Set[str]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+        """Return per-memory entity boosts plus hit diagnostics for a query."""
+        if not entity_enabled():
+            return {}, {}, []
+        extracted = extract_entities(query)
+        if not extracted:
+            return {}, {}, []
+        normalized_terms = [e["normalized"] for e in extracted]
+        conn = self._get_conn()
+        placeholders = ", ".join("?" for _ in normalized_terms)
+        rows = conn.execute(
+            f"""SELECT l.memory_id, l.weight, l.source, e.text, e.normalized, e.type
+                FROM entity_links l
+                JOIN entities e ON e.id = l.entity_id
+                WHERE e.normalized IN ({placeholders})""",
+            normalized_terms,
+        ).fetchall()
+        boosts: Dict[str, float] = {}
+        hits: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            mid = row["memory_id"]
+            if candidate_ids is not None and mid not in candidate_ids:
+                continue
+            hit = {
+                "text": row["text"],
+                "normalized": row["normalized"],
+                "type": row["type"],
+                "weight": float(row["weight"]),
+                "source": row["source"],
+            }
+            hits.setdefault(mid, []).append(hit)
+            boosts[mid] = boosts.get(mid, 0.0) + float(row["weight"])
+        return boosts, hits, extracted
 
     def check_conflict(self, body: str, threshold: Optional[float] = None,
                        exclude_ids: Optional[List[str]] = None) -> Optional[Tuple[str, float]]:
@@ -1942,6 +2236,8 @@ class MemoryStore:
         """
         with self._lock:
             conn = self._get_conn()
+            conn.execute("DROP TABLE IF EXISTS entity_links")
+            conn.execute("DROP TABLE IF EXISTS entities")
             conn.execute("DROP TABLE IF EXISTS stats")
             conn.execute("DROP TABLE IF EXISTS supersedes")
             conn.execute("DROP TABLE IF EXISTS tags")
@@ -2025,7 +2321,14 @@ class MemoryStore:
             conn.execute(
                 "DELETE FROM stats WHERE memory_id NOT IN (SELECT id FROM memories)"
             )
+            conn.execute(
+                "DELETE FROM entity_links WHERE memory_id NOT IN (SELECT id FROM memories)"
+                " OR entity_id NOT IN (SELECT id FROM entities)"
+            )
+            self._cleanup_orphan_entities(conn)
             conn.commit()
+            if removed:
+                self._mark_changed()
         return {"pruned": len(removed), "pruned_ids": removed}
 
     # -- reorder (dashboard API) ---------------------------------------------

@@ -691,15 +691,23 @@ def compact_superseded_chains(mem_store) -> int:
                     try:
                         mem_store.delete(mem.scope, mid)
                         archived += 1
-                    except Exception:
-                        pass
+                    except Exception as _de:
+                        logger.warning(
+                            "Failed to delete compacted memory %s after archiving: %s. "
+                            "Cold storage entry preserved.",
+                            mid, _de,
+                        )
 
             # Update head's supersedes to skip intermediates
             if archived > 0:
                 try:
                     mem_store.update(head_id, supersedes=[tail_id])
-                except Exception:
-                    pass
+                except Exception as _ue:
+                    logger.warning(
+                        "Failed to update head %s supersedes after compaction "
+                        "(%d intermediates archived): %s. Chain may be inconsistent.",
+                        head_id, archived, _ue,
+                    )
 
         except Exception:
             continue
@@ -851,8 +859,12 @@ def merge_similar(mem_store) -> int:
                     try:
                         mem_store.delete(to_archive.scope, to_archive.id())
                         merged += 1
-                    except Exception:
-                        pass
+                    except Exception as _de:
+                        logger.warning(
+                            "Failed to delete deduplicated memory %s after archiving: %s. "
+                            "Cold storage entry preserved.",
+                            to_archive.id(), _de,
+                        )
                 continue
 
             # Merge: combine bodies (dedup last-200 chars overlap)
@@ -873,8 +885,10 @@ def merge_similar(mem_store) -> int:
             # Merge tags (union)
             merged_tags = list(set((keeper.frontmatter.tags or []) + (archived.frontmatter.tags or [])))
 
-            # Update keeper
-            mem_store.update(keeper.id(), body=merged_body, tags=merged_tags)
+            # Update keeper — record lineage so the merge is traceable
+            existing_supersedes = list(keeper.frontmatter.supersedes or [])
+            new_supersedes = list(set(existing_supersedes + [archived.id()]))
+            mem_store.update(keeper.id(), body=merged_body, tags=merged_tags, supersedes=new_supersedes)
 
             # Archive the other via supersedes + cold storage
             entry = {
@@ -895,8 +909,12 @@ def merge_similar(mem_store) -> int:
                 try:
                     mem_store.delete(archived.scope, archived.id())
                     merged += 1
-                except Exception:
-                    pass
+                except Exception as _de:
+                    logger.warning(
+                        "Failed to delete merged memory %s after archiving: %s. "
+                        "Cold storage entry preserved.",
+                        archived.id(), _de,
+                    )
         except Exception:
             continue
     return merged
@@ -927,8 +945,6 @@ def clean_orphan_edges(mem_store) -> int:
     try:
         # Collect all currently valid memory IDs
         all_ids = {m.id() for m in mem_store.list_active()}
-        if not all_ids:
-            return 0
         return gm.store.clean_orphan_edges(all_ids)
     except Exception as e:
         logger.warning("Curator orphan edge cleanup failed: %s", e)

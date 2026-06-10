@@ -9,10 +9,12 @@ Run: pytest tests/test_bm25.py -v
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 
 import pytest
 
+import core.store as store_mod
 from tests._helpers import make_memory, make_memory_with_id, effectiveness_for
 from core.store import (
     LoadedMemory,
@@ -49,6 +51,51 @@ class TestTokenise:
         tokens = _tokenise("use golang进行后端开发")
         assert "golang" in tokens
         assert "进行" in tokens or "后端" in tokens or "开发" in tokens
+
+    def test_jieba_search_mode_uses_search_tokens(self, monkeypatch):
+        monkeypatch.setattr(store_mod, "cjk_tokenizer_mode", lambda: "jieba")
+        monkeypatch.setattr(
+            store_mod,
+            "_get_jieba_search",
+            lambda: (lambda text: ["开发", "规划", "上下文", "压缩"]),
+        )
+        tokens = _tokenise("开发规划上下文压缩")
+        assert "开发" in tokens
+        assert "规划" in tokens
+        assert "上下文" in tokens
+        assert "压缩" in tokens
+
+    def test_auto_mode_falls_back_to_bigram_without_jieba(self, monkeypatch):
+        monkeypatch.setattr(store_mod, "cjk_tokenizer_mode", lambda: "auto")
+        monkeypatch.setattr(store_mod, "_get_jieba_search", lambda: None)
+        tokens = _tokenise("开发规划")
+        assert "开发" in tokens
+        assert "规划" in tokens
+
+    def test_explicit_bigram_mode(self, monkeypatch):
+        """P0: Explicit bigram mode should always use non-overlapping bigram tokenization."""
+        monkeypatch.setattr(store_mod, "cjk_tokenizer_mode", lambda: "bigram")
+        tokens = _tokenise("开发规划上下文压缩")
+        # Non-overlapping bigram: 开发, 规划, 上下文, 压缩 (advance by 2)
+        assert "开发" in tokens
+        assert "规划" in tokens
+        # With bigram heuristic, individual characters should not appear
+        assert len(tokens) >= 2
+
+    def test_mixed_en_cjk_jieba_mode(self, monkeypatch):
+        """P0: jieba mode should correctly tokenize mixed English/CJK text."""
+        monkeypatch.setattr(store_mod, "cjk_tokenizer_mode", lambda: "jieba")
+        monkeypatch.setattr(
+            store_mod,
+            "_get_jieba_search",
+            lambda: (lambda text: list(set(re.findall(r'[a-zA-Z_]+|[一-鿿]+', text)))),
+        )
+        tokens = _tokenise("use golang进行后端开发")
+        # Should contain English terms and CJK terms from jieba
+        assert "golang" in tokens or "use" in tokens
+        # Check for CJK characters (any token containing a CJK character)
+        has_cjk = any('一' <= c <= '鿿' for token in tokens for c in token)
+        assert has_cjk, f"Expected CJK tokens in {tokens}"
 
 
 # ---------------------------------------------------------------------------

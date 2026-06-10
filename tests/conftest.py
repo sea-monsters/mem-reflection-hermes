@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Iterable
 
 import pytest
 
@@ -20,6 +21,90 @@ def pytest_configure(config):
     """
     if config.option.basetemp is None:
         config.option.basetemp = str(Path(tempfile.gettempdir()) / "hermes_pytest")
+
+
+_FILE_MARKERS = {
+    "test_store.py": ("store", "compatibility"),
+    "test_core_data.py": ("store", "compatibility"),
+    "test_search.py": ("search", "retrieval"),
+    "test_bm25.py": ("search", "retrieval", "cjk"),
+    "test_fusion_rerank.py": ("search", "retrieval"),
+    "test_wave3_retrieval.py": ("search", "retrieval", "graph"),
+    "test_reranker.py": ("search", "retrieval", "reranker"),
+    "test_reranker_exceptions.py": ("search", "retrieval", "reranker", "v14"),
+    "test_graph.py": ("graph",),
+    "test_graph_operations.py": ("graph", "compatibility"),
+    "test_graph_distil_failure.py": ("graph", "v14"),
+    "test_reflect.py": ("reflection", "compatibility"),
+    "test_reflection.py": ("reflection", "runtime"),
+    "test_context.py": ("context", "runtime"),
+    "test_hooks.py": ("runtime", "v14"),
+    "test_memory_curator.py": ("curator",),
+    "test_bridge.py": ("bridge", "integration"),
+    "test_dashboard.py": ("dashboard", "integration"),
+    "test_tool_handlers.py": ("tools", "runtime"),
+    "test_compaction.py": ("compaction", "runtime", "reflection"),
+    "test_e2e.py": ("e2e", "integration"),
+    "test_host_contract_smoke.py": ("contract", "smoke", "integration"),
+    "test_checkpoint.py": ("runtime", "config"),
+    "test_checkpoint_backup_failure.py": ("runtime", "v14"),
+    "test_config.py": ("config",),
+    "test_backend.py": ("backend",),
+    "test_entity_extraction.py": ("search", "retrieval", "v14"),
+    "test_async_writer.py": ("store", "v14"),
+    "test_optional_deps.py": ("config", "v14"),
+}
+
+_V14_NODE_MARKERS = {
+    "test_context.py::TestBuildContextPriority::test_context_bundle_splits_stable_and_dynamic_sections": ("v14_context",),
+    "test_context.py::TestBuildContextPriority::test_context_bundle_stable_only_omits_dynamic_sections": ("v14_context",),
+    "test_context.py::TestTokenBudget::test_bundle_records_compression_level_under_pressure": ("v14_context",),
+    "test_context.py::TestTokenBudget::test_emergency_compression_keeps_pinned_stable_context": ("v14_context",),
+    "test_reflection.py::TestHookReflectionCadence::test_pre_llm_call_uses_stable_fallback_on_timeout": ("v14_context",),
+    "test_bm25.py::TestTokenise::test_jieba_search_mode_uses_search_tokens": ("v14_retrieval",),
+    "test_bm25.py::TestTokenise::test_auto_mode_falls_back_to_bigram_without_jieba": ("v14_retrieval",),
+    "test_search.py::TestStoreSearchGraphWiring::test_store_fusion_search_explain_exposes_score_components": ("v14_retrieval",),
+    "test_checkpoint.py::TestCheckpointPersistence::test_corrupt_checkpoint_is_backed_up_and_defaults_returned": ("v14_runtime",),
+    "test_checkpoint.py::TestCheckpointPersistence::test_recover_pending_work_runs_available_stages_and_clears_them": ("v14_runtime",),
+    "test_reflection.py::TestHookReflectionCadence::test_on_session_start_runs_pending_recovery": ("v14_runtime",),
+    "test_reflection.py::TestHookReflectionCadence::test_on_session_end_marks_reflection_pending_when_reflection_fails": ("v14_runtime",),
+    "test_config.py::TestConfigModel::test_invalid_types_fall_back_to_defaults": ("v14_runtime",),
+    "test_config.py::TestConfigModel::test_unknown_keys_are_reported": ("v14_runtime",),
+    "test_search.py::TestStoreSearchGraphWiring::test_entity_links_are_indexed_and_deleted_without_orphans": ("v14_entity",),
+    "test_search.py::TestStoreSearchGraphWiring::test_entity_boost_and_hits_appear_in_explain": ("v14_entity",),
+    "test_backend.py::TestBackendCapabilities::test_sqlite_backend_capabilities_are_partial": ("v14_entity",),
+    "test_backend.py::TestBackendCapabilities::test_fake_backend_can_report_full_capabilities": ("v14_entity",),
+    "test_host_contract_smoke.py::test_host_contract_smoke_script_passes": ("v14_contract",),
+    "test_hooks.py::TestSessionStateManagement::test_ensure_session_state_creates_default_bag": ("v14_hooks",),
+    "test_hooks.py::TestSessionStateManagement::test_ensure_session_state_returns_existing": ("v14_hooks",),
+    "test_hooks.py::TestSessionStateManagement::test_cleanup_session_state_removes_from_memory": ("v14_hooks",),
+    "test_hooks.py::TestApiRequestErrorHook::test_no_session_id_is_noop": ("v14_hooks",),
+    "test_hooks.py::TestApiRequestErrorHook::test_error_count_increments": ("v14_hooks",),
+    "test_hooks.py::TestApiRequestErrorHook::test_threshold_crossing_logged": ("v14_hooks",),
+    "test_hooks.py::TestApiRequestErrorHook::test_non_threshold_values_not_logged": ("v14_hooks",),
+    "test_hooks.py::TestSubagentLifecycleHooks::test_start_increments_active_count": ("v14_hooks",),
+    "test_hooks.py::TestSubagentLifecycleHooks::test_multiple_start_increments": ("v14_hooks",),
+    "test_hooks.py::TestSubagentLifecycleHooks::test_stop_increments_total_count": ("v14_hooks",),
+    "test_hooks.py::TestSubagentLifecycleHooks::test_no_session_id_is_noop": ("v14_hooks",),
+    "test_hooks.py::TestSessionResetHook::test_logs_rotation_parameters": ("v14_hooks",),
+    "test_hooks.py::TestSessionResetHook::test_missing_ids_use_unknown": ("v14_hooks",),
+}
+
+
+def _add_markers(item, markers: Iterable[str]) -> None:
+    for marker in markers:
+        item.add_marker(getattr(pytest.mark, marker))
+
+
+def pytest_collection_modifyitems(config, items):
+    """Apply functional and v1.4-specific markers automatically."""
+    for item in items:
+        filename = Path(str(item.fspath)).name
+        _add_markers(item, _FILE_MARKERS.get(filename, ()))
+        normalized = item.nodeid.replace("\\", "/")
+        for suffix, markers in _V14_NODE_MARKERS.items():
+            if normalized.endswith(suffix):
+                _add_markers(item, markers)
 
 
 # Ensure project root is importable

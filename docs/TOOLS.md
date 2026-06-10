@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: **12 registered tools** (v1.2-beta2).
+Current SRH tool surface: **12 registered tools** (v1.4-beta).
 
 The 12 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 
@@ -15,6 +15,7 @@ Search active memories by relevance.
 ```python
 srh_memory_search(query="Python error handling", k=5)
 srh_memory_search(query="部署流程", k=5, zone="work")  # zone filter
+srh_memory_search(query="Python error handling", k=5, explain=True)  # v1.4: return score breakdown
 ```
 
 ### `srh_memory_write`

@@ -26,6 +26,8 @@ from .bridge import (
 
 from .context import (
     build_context_block,
+    build_context_bundle,
+    ContextBundle,
 )
 
 __all__ = [
@@ -45,4 +47,6 @@ __all__ = [
     "_refine_body",
     # Context exports
     "build_context_block",
+    "build_context_bundle",
+    "ContextBundle",
 ]

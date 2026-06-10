@@ -2,7 +2,7 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.2-beta2** — Memory Curator (TTL/staleness/supersedes/similarity/auto-archive with tool-noise stripping), v0.16.0 telemetry hooks, episode compaction, and bidirectional memory bridge. See [CHANGELOG](docs/CHANGELOG.md) for full history.
+**Current version: v1.4-beta** — Context Reliability & Entity Recall (stable/dynamic context split, checkpoint recovery, graded compression, explainable search, entity index), CJK tokenizer modes, typed config diagnostics. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
@@ -22,7 +22,11 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **PageRank**: Centrality scores for hub memory identification
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
 - **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
-- **Memory Curator** (v1.2): Automated lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, cold storage with tool-noise stripping
+- **Memory Curator** (v1.2 → v1.3): Automated 5-phase lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping
+- **Context Reliability** (v1.4): Stable/dynamic context split, timeout-protected assembly, graded compression (`none/mild/aggressive/emergency`)
+- **Explainable Search** (v1.4): Opt-in `explain=true` flag returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, entity, Hebbian)
+- **Entity Recall** (v1.4): SQLite-backed entity index with lifecycle hooks; entity boost in search + explain output
+- **Session Checkpoint** (v1.4): Atomic JSON persistence with pending-stage recovery and corrupt-failopen behavior
 - **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + runtime search + zone analysis
 - **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
 - **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
@@ -37,7 +41,7 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
-| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (17 exposed tools) with examples |
+| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (12 registered tools) with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 15 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
 | [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Test coverage map and host-contract smoke status |

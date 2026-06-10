@@ -23,7 +23,7 @@ Plugins do **not** implement their own auth layer — the host guarantees auth f
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 15 routes (v1.2-beta2).
+Current surface: 15 routes (v1.4-beta).
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -43,7 +43,7 @@ Current surface: 15 routes (v1.2-beta2).
 | `GET` | `/stats` | Aggregate statistics (memory count, zones, graph stats, cache stats) |
 | `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.2) |
 
-## Reflection Audit Log (v0.9.2-beta2)
+## Reflection Audit Log (v0.9.2-beta)
 
 The reflection pipeline now writes structured `audit_entries` into each reflect
 log record. These entries explain why a candidate was accepted, skipped,

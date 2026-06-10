@@ -1,5 +1,56 @@
 # Changelog
 
+## v1.4-beta — Context Reliability & Entity Recall
+
+### Context Reliability (stable/dynamic split)
+
+- **`ContextBundle`**: Internal structured context with stable/dynamic section separation. Stable section (pinned + always-active skills) preserves prompt cache; dynamic section (relevant memories + triggered skills + episode summaries) varies per turn.
+- **Timeout-protected context assembly**: `pre_llm_call` hook has 8s timeout with stable-only fallback on timeout/failure.
+- **Graded compression**: `none/mild/aggressive/emergency` levels applied to dynamic section under token pressure; stable section always preserved.
+- **Backward compatible**: Public `build_context()` still returns a single string; bundle helpers exported via package facades.
+
+### Retrieval Quality & Explainability
+
+- **Configurable CJK tokenizer**: `auto` (default), `bigram`, `jieba` modes. `jieba.cut_for_search` with fail-open fallback to bigram.
+- **Explainable search**: `search_explain()` returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, supersedes, entity, Hebbian signals).
+- **Opt-in tool flag**: `srh_memory_search(..., explain=true)` returns diagnostic output.
+
+### Runtime Reliability
+
+- **Session checkpoint**: `runtime/checkpoint.py` with atomic JSON persistence, corrupt backup, and pending-stage recovery.
+- **Session-end recovery**: Hooks mark reflection/curator/compaction stages as `pending` on failure; next session-start recovers them.
+- **Typed config diagnostics**: `core/config.py` validates types, warns on unknown keys, falls back to safe defaults.
+
+### Entity Recall & Backend Readiness
+
+- **SQLite entity index**: `entities` and `entity_links` tables with lifecycle hooks on write, delete, and rebuild.
+- **Entity extraction pipeline**: Regex-first + optional spaCy architecture. Six regex patterns:
+  - `file_path` (weight 1.0): filesystem paths like `src/providers/http/index.test.ts`
+  - `code` (0.9): backtick-quoted identifiers like `` `ToolRunner.execute` ``
+  - `quoted` (0.8): single/double-quoted strings like `"config.yaml"`
+  - `package` (0.75): dot-separated identifiers like `numpy.linalg.norm`
+  - `proper` (0.7): PascalCase/camelCase like `HttpRequestHandler`
+  - `compound` (0.65): hyphen/slash compounds like `auth-middleware`
+  - Optional spaCy NER (0.6) when `en_core_web_sm` is available
+- **Entity boost in search**: Mentioned entities receive recall boost proportional to extraction weight; hits appear in explain output.
+- **Cross-reference**: mem0 uses spaCy-only NER; SRH's regex-first approach provides finer weight granularity and no mandatory heavy dependency.
+- **Backend capability abstraction**: `core/backend.py` exposes SQLite capabilities without changing default runtime.
+
+### Tests
+
+- 317+ tests collected; new v1.4 tests grouped under pytest markers: `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`.
+
+---
+
+## v1.3-beta — Curator Enhancement + Graph Cleanup
+
+- Orphan edge cleanup (delete + curator sweep)
+- Compaction before archive in curator pipeline
+- `total_archived` includes compacted entries
+- Pre-existing test regressions fixed
+
+---
+
 ## v1.2-beta2 — Optional Reranker Layer (mem0 pattern)
 
 ### Optional Reranker Layer

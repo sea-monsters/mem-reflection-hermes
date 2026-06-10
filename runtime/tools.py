@@ -23,6 +23,7 @@ from ..reflection.runtime import (
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_reflection, _run_embedding_micro_reflection,
 )
+from ._lb import _lb
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,6 @@ def _jd(obj, **kw) -> str:
     if "ensure_ascii" not in kw:
         kw["ensure_ascii"] = False
     return json.dumps(obj, default=str, **kw)
-
-def _lb(name: str):
-    from mem_reflection_hermes import __dict__ as _pkg_dict
-    return _pkg_dict[name]
 
 __all__ = [
     "register",
@@ -94,9 +91,6 @@ def _get_graph_neighbors(*a, **kw):
 def _enrich_with_graph(*a, **kw):
     return _lb("_enrich_with_graph")(*a, **kw)
 
-def build_palace_index(*a, **kw):
-    return _lb("build_palace_index")(*a, **kw)
-
 def load_zone_summary(zone):
     return _lb("load_zone_summary")(zone)
 
@@ -124,14 +118,30 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     k = int(args.get("k", 5))
     zone_filter = args.get("zone")  # Optional zone scope
     include_history = bool(args.get("include_history", False))
+    explain = bool(args.get("explain", False))
     mem_store = _get_mem_store()
     # ── Scheme C: Fusion search (BM25 × Graph × Supersedes) instead of two-stage ──
-    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None,
-                                       include_history=include_history)
+    normalized_zone = _normalize_zone(zone_filter) if zone_filter else None
+    explain_payload = None
+    if explain:
+        explain_payload = mem_store.fusion_search_explain(
+            query,
+            k,
+            zone=normalized_zone,
+            include_history=include_history,
+        )
+        results = explain_payload.get("results", [])
+    else:
+        results = mem_store.fusion_search(
+            query,
+            k,
+            zone=normalized_zone,
+            include_history=include_history,
+        )
     out = []
     for m in results:
         is_superseded = mem_store.is_superseded(m.id())
-        out.append({
+        item = {
             "id": m.id(),
             "scope": m.scope,
             "confidence": m.frontmatter.confidence,
@@ -140,18 +150,24 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
             "zone": m.frontmatter.zone,
             "body": m.body[:500],
             "lineage_status": "superseded" if is_superseded else "active",
-        })
+        }
+        if explain and explain_payload is not None:
+            item["explain"] = explain_payload.get("explain", {}).get(m.id(), {})
+        out.append(item)
         record_memory_stat(m.id(), "accessed")
 
     # ── Enrich with graph neighbors (now as supplement, not primary ranking) ──
     graph_expanded = _get_graph_neighbors([m.id() for m in results], max_results=k,
-                                          zone_filter=_normalize_zone(zone_filter) if zone_filter else None)
+                                          zone_filter=normalized_zone)
     for neigh_id, _ in graph_expanded:
         record_memory_stat(neigh_id, "accessed")
-    return json.dumps({
+    response = {
         "results": out,
         "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
-    }, ensure_ascii=False)
+    }
+    if explain and explain_payload is not None:
+        response["meta"] = explain_payload.get("meta", {})
+    return json.dumps(response, ensure_ascii=False)
 
 
 def _tool_srh_memory_write(args: dict, **kwargs) -> str:
@@ -745,6 +761,7 @@ def register(ctx) -> None:
                     "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
                     "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
                     "include_history": {"type": "boolean", "description": "Include superseded memories in search results (lineage-aware recall)", "default": False},
+                    "explain": {"type": "boolean", "description": "Include structured score breakdown for each result", "default": False},
                 },
                 "required": ["query"],
             },

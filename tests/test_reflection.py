@@ -15,6 +15,7 @@ import sys
 import types
 from pathlib import Path
 from typing import Any, Dict, Optional
+from types import SimpleNamespace
 
 import pytest
 
@@ -362,11 +363,27 @@ class TestAuditEntry:
 
 @skip_no_engine
 class TestHookReflectionCadence:
+    def test_on_session_start_runs_pending_recovery(self, monkeypatch):
+        monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", None)
+        monkeypatch.setattr(_lifecycle_mod, "_lb", lambda name: (lambda: object()) if name == "_get_mem_store" else (lambda *_args, **_kwargs: None))
+        seen = {}
+
+        def _fake_recover(**kwargs):
+            seen.update(kwargs)
+            return {"reflection": 1, "compaction": 0, "curator": 0, "diagnostic": 0}
+
+        monkeypatch.setattr(_lifecycle_mod, "_checkpoint_recover_pending_work", _fake_recover)
+
+        _lifecycle_mod._on_session_start(session_id="start-session")
+
+        assert "reflection_runner" in seen
+        assert "diagnostic_logger" in seen
+
     def test_pre_llm_call_keeps_counter_when_llm_reflection_skips_without_ctx(self, monkeypatch):
         monkeypatch.setattr(_lifecycle_mod, "_micro_reflection_enabled", lambda: True)
         monkeypatch.setattr(_lifecycle_mod, "_is_explicit_memory_intent", lambda _text: False)
         monkeypatch.setattr(_lifecycle_mod, "_reflection_mode", lambda: "llm")
-        monkeypatch.setattr(_lifecycle_mod, "_build_context_block", lambda _query: None)
+        monkeypatch.setattr(_lifecycle_mod, "_build_context_bundle", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(_lifecycle_mod, "_run_micro_reflection", lambda *_args, **_kwargs: pytest.fail("should not run"))
         monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", None)
         with _lifecycle_mod._turns_since_reflect_lock:
@@ -383,6 +400,137 @@ class TestHookReflectionCadence:
         assert result is None
         with _lifecycle_mod._turns_since_reflect_lock:
             assert _lifecycle_mod._turns_since_reflect == 3
+
+    def test_pre_llm_call_uses_stable_fallback_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(_lifecycle_mod, "_micro_reflection_enabled", lambda: False)
+        monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", None)
+        monkeypatch.setattr(_lifecycle_mod, "_context_timeout_ms", lambda: 10)
+        monkeypatch.setattr(_lifecycle_mod, "_estimate_tokens", lambda _text: 1)
+
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+            if stable_only:
+                return SimpleNamespace(
+                    append_system_context="## Pinned Memories\n- [core] stable",
+                    prepend_context="",
+                )
+            time.sleep(0.05)
+            return SimpleNamespace(
+                append_system_context="## Pinned Memories\n- [core] stable",
+                prepend_context="## Relevant Memories\n- [general] dynamic",
+            )
+
+        import time
+        monkeypatch.setattr(_lifecycle_mod, "_build_context_bundle", _fake_bundle)
+
+        result = _lifecycle_mod._pre_llm_call(
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="timeout-session",
+        )
+
+        assert result is not None
+        assert "Pinned Memories" in result["context"]
+        assert "Relevant Memories" not in result["context"]
+
+    def test_pre_llm_call_timeout_does_not_corrupt_session_state(self, monkeypatch):
+        """P0: Timeout path should not corrupt _session_messages or _turns_since_reflect."""
+        monkeypatch.setattr(_lifecycle_mod, "_micro_reflection_enabled", lambda: False)
+        monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", None)
+        monkeypatch.setattr(_lifecycle_mod, "_context_timeout_ms", lambda: 10)
+        monkeypatch.setattr(_lifecycle_mod, "_estimate_tokens", lambda _text: 1)
+
+        import time
+
+        def _fake_slow_bundle(_query, max_tokens=4000, stable_only=False):
+            time.sleep(0.05)
+            return SimpleNamespace(
+                append_system_context="## Pinned\n- stable",
+                prepend_context="## Dynamic\n- dynamic",
+            )
+
+        monkeypatch.setattr(_lifecycle_mod, "_build_context_bundle", _fake_slow_bundle)
+
+        # Pre-set session state
+        with _lifecycle_mod._session_messages_lock:
+            _lifecycle_mod._session_messages["timeout-test-session"] = [
+                {"role": "user", "content": "existing"},
+            ]
+        with _lifecycle_mod._turns_since_reflect_lock:
+            _lifecycle_mod._turns_since_reflect = 5
+
+        result = _lifecycle_mod._pre_llm_call(
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="timeout-test-session",
+        )
+
+        # Session messages should be preserved (not corrupted)
+        with _lifecycle_mod._session_messages_lock:
+            assert "timeout-test-session" in _lifecycle_mod._session_messages
+            assert len(_lifecycle_mod._session_messages["timeout-test-session"]) == 1
+        # Turn counter should not be reset by timeout
+        with _lifecycle_mod._turns_since_reflect_lock:
+            assert _lifecycle_mod._turns_since_reflect == 5
+        # Result should still be valid (stable fallback)
+        assert result is not None
+        assert isinstance(result.get("context"), str)
+
+    def test_on_session_end_marks_reflection_pending_when_reflection_fails(self, monkeypatch):
+        pending_calls = []
+        completed_calls = []
+        snapshot_calls = []
+
+        monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", object())
+        monkeypatch.setattr(_lifecycle_mod, "_get_graph_mgr", lambda: None)
+        monkeypatch.setattr(_lifecycle_mod, "_checkpoint_snapshot_session_state", lambda sid, state: snapshot_calls.append((sid, dict(state))))
+        monkeypatch.setattr(_lifecycle_mod, "_checkpoint_mark_pending_stage", lambda sid, stage, payload: pending_calls.append((sid, stage, payload)))
+        monkeypatch.setattr(_lifecycle_mod, "_checkpoint_mark_stage_completed", lambda sid, stage, payload=None: completed_calls.append((sid, stage, payload)))
+        monkeypatch.setattr(_lifecycle_mod, "_checkpoint_clear_session_state", lambda _sid: None)
+        monkeypatch.setattr(_lifecycle_mod, "_run_full_reflection", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        _lifecycle_mod._on_session_end(
+            session_id="end-session",
+            reason="shutdown",
+            messages=[{"role": "user", "content": "remember this"}],
+        )
+
+        assert snapshot_calls
+        assert pending_calls
+        assert pending_calls[0][1] == "reflection"
+        assert completed_calls == []
+
+    def test_pre_llm_call_zero_timeout_uses_fallback(self, monkeypatch):
+        """P0: timeout_ms=0 should immediately trigger stable fallback without blocking."""
+        monkeypatch.setattr(_lifecycle_mod, "_micro_reflection_enabled", lambda: False)
+        monkeypatch.setattr(_lifecycle_mod, "_plugin_ctx", None)
+        monkeypatch.setattr(_lifecycle_mod, "_context_timeout_ms", lambda: 0)
+
+        call_log = []
+
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+            call_log.append(("stable" if stable_only else "full"))
+            if stable_only:
+                return SimpleNamespace(
+                    append_system_context="## Pinned\n- fallback",
+                    prepend_context="",
+                )
+            # Slow full path
+            import time
+            time.sleep(0.02)
+            return SimpleNamespace(
+                append_system_context="## Pinned\n- full",
+                prepend_context="## Relevant\n- dynamic",
+            )
+
+        monkeypatch.setattr(_lifecycle_mod, "_build_context_bundle", _fake_bundle)
+
+        result = _lifecycle_mod._pre_llm_call(
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="zero-timeout-session",
+        )
+
+        assert result is not None
+        # Should have called stable fallback at least once
+        assert "stable" in call_log
+        assert "fallback" in result["context"] or result["context"] == ""
 
 
 @skip_no_engine
