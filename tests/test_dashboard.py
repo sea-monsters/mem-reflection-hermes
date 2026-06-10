@@ -306,10 +306,10 @@ class TestCuratorEndpoint:
             memory_mod.__path__ = [str(_REPO / "memory")]
             sys.modules[f"{_PKG}.memory"] = memory_mod
 
-        # Register memory.curator
+        # Register memory.curator (now a package)
         _spec_cur = importlib.util.spec_from_file_location(
             f"{_PKG}.memory.curator",
-            str(_REPO / "memory" / "curator.py"),
+            str(_REPO / "memory" / "curator" / "__init__.py"),
         )
         _cur_mod = importlib.util.module_from_spec(_spec_cur)
         sys.modules[f"{_PKG}.memory.curator"] = _cur_mod
@@ -352,10 +352,10 @@ class TestCuratorEndpoint:
             memory_mod.__path__ = [str(_REPO / "memory")]
             sys.modules[f"{_PKG}.memory"] = memory_mod
 
-        # Register memory.curator
+        # Register memory.curator (now a package)
         _spec_cur = importlib.util.spec_from_file_location(
             f"{_PKG}.memory.curator",
-            str(_REPO / "memory" / "curator.py"),
+            str(_REPO / "memory" / "curator" / "__init__.py"),
         )
         _cur_mod = importlib.util.module_from_spec(_spec_cur)
         sys.modules[f"{_PKG}.memory.curator"] = _cur_mod

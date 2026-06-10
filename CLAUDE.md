@@ -320,3 +320,43 @@ All new hooks are gated by `has_hook()` — zero overhead when no subscriber is 
 - Config writes in autotrigger manage scripts: only on `start`/`bootstrap`, never on `status`/`stop`
 - Silent error swallowing: use `logger.warning` (not `logger.debug`) for all failure paths that could indicate data loss or degraded functionality
 - Cold storage safety: write-then-swap via `.tmp` + `os.replace()` for JSONL rewrites
+
+## Development Methodology: Spec -> Test -> Code
+
+Every feature (new module, refactor, API change) must follow this sequence:
+
+### 1. SDD (Software Design Document)
+
+Create `docs/design/<version>/<feature>-sdd.md` with:
+
+- Purpose / Problem / Design Goals / Non-Goals
+- Proposed Design with interface contracts and data flow
+- Files Affected
+- Acceptance Criteria (verifiable, testable)
+
+### 2. Test Suite (RED phase)
+
+Write `tests/test_<feature>.py` covering:
+
+- **Functional intent**: every behavior described in the SDD has a test
+- **Boundary conditions**: empty inputs, single-item, max-size, timing edge cases
+- **Error paths**: every failure mode in the SDD has a test
+- **Integration seams**: import paths, re-export compatibility, public API contracts
+
+All tests must **fail** at this stage (no production code exists yet). Verify coverage of the SDD acceptance criteria.
+
+### 3. Freeze Tests
+
+Lock the test file. Do not modify test assertions to fit implementation. Tests define truth.
+
+### 4. Production Code (GREEN phase)
+
+Implement the SDD design. Run `pytest tests/test_<feature>.py` iteratively until all tests pass.
+
+### 5. Verify Full Suite
+
+Run `pytest tests/ -v` — all 413+ tests must pass. No regressions.
+
+### Exceptions
+
+Single-file patches, doc edits, and config changes do not require the full methodology. Use judgment.
