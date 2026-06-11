@@ -117,14 +117,6 @@
 
 - 317+ tests collected; new v1.4 tests grouped under pytest markers: `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`.
 
----
-
-## v1.5 (2026-06-10)
-
-See top of this document for v1.5 changelog.
-
----
-
 ## v1.3-beta — Curator Enhancement + Graph Cleanup
 
 - Orphan edge cleanup (delete + curator sweep)

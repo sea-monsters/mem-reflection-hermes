@@ -43,6 +43,9 @@ Always use anyhow for app-level error handling in Rust.
 | `valid_from` | ISO 8601 | Earliest date this memory is considered active |
 | `valid_until` | ISO 8601 | Expiration date; memories past this date are flagged as expired in health checks |
 | `context_scope` | string | Context qualifier (e.g., `project:X`, `domain:backend`) for scoped filtering |
+| `user_id` | string (v1.6) | User identifier for memory event ledger attribution |
+| `agent_id` | string (v1.6) | Agent identifier for memory event ledger attribution |
+| `run_id` | string (v1.6) | Run/session identifier for memory event ledger attribution |
 
 ## Supersedes Semantics
 
@@ -121,17 +124,30 @@ valid and readable.
 │       ├── README.md                # Index document
 │       ├── core/                    # Storage, search, graph
 │       │   ├── store.py             # MemoryStore, SkillStore, frontmatter, lineage
+│       │   ├── store_methods.py     # Method bodies (entity boosts, etc.)
+│       │   ├── models.py            # MemoryFrontmatter, SkillFrontmatter
+│       │   ├── utils.py             # normalize_zone, sanitize_zone_filename
 │       │   ├── search.py            # SearchIndex, BM25/embedding fusion
-│       │   └── graph.py             # GraphIndex, PageRank, cross-zone analysis
+│       │   ├── graph.py             # GraphIndex, PageRank, cross-zone analysis
+│       │   ├── config.py            # Typed config models (v1.4)
+│       │   ├── backend.py           # Backend capability protocol (v1.4)
+│       │   ├── entities.py          # Entity extraction (v1.4)
+│       │   ├── tokenization.py      # CJK-aware tokenizer
+│       │   ├── skill_store.py       # SkillStore implementation
+│       │   ├── lineage.py           # Supersedes chain helpers
+│       │   ├── intent.py            # Intent classification
+│       │   ├── reranker.py          # Second-stage reranker
+│       │   ├── async_writer.py      # Background file I/O (v1.4)
+│       │   └── store_health.py      # Store health checks
 │       ├── reflection/              # Reflection engine and runtime
 │       │   ├── engine.py            # ReflectionEngine, fact extraction
 │       │   └── runtime.py           # Full/micro reflection, audit, compaction
 │       ├── memory/                  # Curation, bridge, context assembly
-│       │   ├── curator.py           # Automated lifecycle curation (v1.2)
+│       │   ├── curator/             # Composable action pipeline (v1.3+)
 │       │   ├── bridge.py            # Bidirectional host memory sync (v1.1)
 │       │   └── context.py           # 4-layer context assembly
 │       ├── runtime/                 # Tools and lifecycle hooks
-│       │   ├── tools.py             # 7 base SRH tool handlers
+│       │   ├── tools.py             # 8 base SRH tool handlers
 │       │   ├── hooks.py             # Session hooks and slash commands
 │       │   └── graph.py             # 5 graph/health tools + compat surface
 │       ├── web/                     # FastAPI dashboard

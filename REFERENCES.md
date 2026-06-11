@@ -10,10 +10,10 @@ Generated: 2026-05-31
 | Feature | Implementation |
 |---|---|
 | Storage | Flat .md files + YAML frontmatter (user ~/.hermes/memories/, project ./.hermes/memories/) |
-| Search Index | Pure Python TF-IDF (Counter + BOW, 0 external deps, ~0.8ms for 50 memories) |
+| Search Index | Pure Python BM25 (Counter + BOW, 0 external deps, ~0.8ms for 50 memories) |
 | Embedding | ONNX Runtime + all-MiniLM-L6-v2 (lazy-loaded, optional) |
 | Graph | GraphIndex-backed Hebbian co-occurrence graph in SQLite with decay |
-| Context Layering | Pinned -> Active Index (TF-IDF/embedding search) -> Triggered Skills -> Always-Active Skills |
+| Context Layering | Pinned -> Active Index (BM25/embedding search) -> Triggered Skills -> Always-Active Skills |
 | Memory Zones | Memory Palace: core/work/episode/general/project:* |
 | Reflection | Micro-reflection (per-turn background) + Full reflection (session-end, LLM-powered) |
 | Skill Discovery | LLM suggests skills during full reflection -> user approves (human-in-the-loop) |
@@ -24,7 +24,7 @@ Generated: 2026-05-31
 **Context injection architecture (pre_llm_call hook):**
 1. Palace zone index (memory map)
 2. Compiled profile (LLM-condensed user/agent model)
-3. Active index -> top-k memories via TF-IDF (+ optional embedding rerank)
+3. Active index -> top-k memories via BM25 (+ optional embedding rerank)
 4. Triggered skills (matched by token overlap + optional embedding)
 5. Always-active skills
 6. Graph neighbors (enriched via runtime GraphIndex SQLite)
@@ -233,9 +233,8 @@ Query: Hybrid Search (vector similarity + graph traversal) -> Re-ranking -> Cont
 ### Trade-offs
 1. No automatic extraction (writes are manual or reflection-driven; Mem0/Letta auto-extract)
 2. No temporal knowledge graph (Zep temporal edges enable precise when-X-was-true queries)
-3. No entity extraction (Mem0^g and Cognee build explicit entity-relation graphs)
-4. No STM/LTM consolidation (Memary human-memory-inspired consolidation more biologically plausible)
-5. No agent self-editing (Letta agent-managed memory allows dynamic context reconfiguration)
+3. No STM/LTM consolidation (Memary human-memory-inspired consolidation more biologically plausible)
+4. No agent self-editing (Letta agent-managed memory allows dynamic context reconfiguration)
 
 ---
 

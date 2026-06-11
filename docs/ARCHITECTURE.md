@@ -107,7 +107,6 @@ Key concurrency protections present in v1.5:
 | `_turns_since_reflect` counter | `threading.Lock` |
 | `_reflect_log_lock` | Covers both read and write paths |
 | Embedding cache | `threading.Lock` on all cache operations |
-| `_classify_intent_stats` | `threading.Lock` via `_bump_classify_intent_stat` |
 | `_build_adjacency` | mtime check + DB query + cache update inside `self._lock` |
 | `get_cache()` singleton | Double-checked locking |
 | Cold store writes | `threading.Lock` (`_cold_store_lock`) guards JSONL append/rewrite |
@@ -147,7 +146,7 @@ The plugin implements entity-based recall to improve retrieval of memories
 containing proper nouns, file paths, package names, and other identifiers
 that may not match well via BM25 or embedding similarity alone.
 
-### Extraction Pipeline (`core/store.py:extract_entities`)
+### Extraction Pipeline (`core/entities.py:extract_entities`)
 
 Entity extraction uses a **regex-first + optional spaCy** architecture,
 avoiding mandatory heavy dependencies while providing high-precision patterns:
@@ -182,7 +181,7 @@ mem0 uses **spaCy-only** NER with a generic-heads filter list (see
 - **Code-aware patterns**: Backticks, file paths, and package names are
   first-class entities rather than generic proper nouns.
 
-### Search Integration (`core/store.py:compute_entity_boosts`)
+### Search Integration (`core/store_methods.py:compute_entity_boosts`)
 
 When `entity.enabled=true` (default), query entities are extracted and
 matched against the `entity_links` table. Matching memories receive an

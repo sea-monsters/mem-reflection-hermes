@@ -46,7 +46,7 @@ memory/
   context.py        # Context assembly: stable/dynamic split, token budget, skill matching, graded compression (v1.4)
 
 runtime/
-  tools.py          # 7 base SRH tool handlers (write, search, delete, palace, reflect, skill, compile)
+  tools.py          # 8 base SRH tool handlers (write, search, delete, history, palace, reflect, skill, compile)
   hooks.py          # Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands
   graph.py          # 5 graph/health tools + graph manager singleton
   checkpoint.py     # Atomic session checkpoint, pending-stage recovery, corrupt backup (v1.4)
@@ -106,6 +106,8 @@ pytest tests/test_store_module_split.py -v  # v1.4: core/store.py module split
 pytest tests/test_async_writer.py -v        # v1.4: async file writer
 pytest tests/test_lb.py -v                  # v1.4: late-binding helper
 pytest tests/test_schema_module.py -v       # v1.4: runtime schemas
+pytest tests/test_memory_events.py -v       # v1.6: memory event ledger
+pytest tests/test_scope_filters.py -v       # v1.6: scoped search/history filters
 
 # Run a specific test class or test
 pytest tests/test_store.py::TestRebuildIndex -v

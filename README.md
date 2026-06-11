@@ -2,14 +2,14 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.5** — Memory evolution & curator action pipeline, context reliability, entity recall, graph memory, and reflection system. See [CHANGELOG](docs/CHANGELOG.md) for full history.
+**Current version: v1.6** — Memory Event Ledger, Scoped Filters, curator action pipeline, context reliability, entity recall, graph memory, and reflection system. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
 - **Structured Memories**: Markdown + YAML frontmatter with zone, rank, version, supersedes chains
 - **Dual Scope**: User-level (`~/.hermes/memories/`) and project-level (`./.hermes/memories/`)
 - **Memory Palace**: Zone-based organization (core, work, episode, general, project:*) with tool-driven navigation
-- **TF-IDF / BM25 Search**: Pure Python, zero dependencies, ~0.8ms for 50 memories
+- **BM25 Search**: Pure Python, zero dependencies, ~0.8ms for 50 memories
 - **Semantic Search**: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
 - **Conflict Detection**: Automatic similarity checking on write with version lineage
 - **Effectiveness Tracking**: Per-memory scoring with exponential time decay
@@ -24,6 +24,8 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
 - **Memory Curator** (v1.2 → v1.3 → v1.5): Automated 5-phase lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping. v1.5 refactored into composable action pipeline (`memory/curator/`)
 - **Context Reliability** (v1.4): Stable/dynamic context split, timeout-protected assembly, graded compression (`none/mild/aggressive/emergency`)
+- **Memory Event Ledger** (v1.6): Append-only `memory_events` log tracks all write/update/delete/archive/reflect events with `user_id`, `agent_id`, `run_id`, `memory_key`, `event_type`, and ISO timestamp; event search via `srh_memory_history` tool
+- **Scoped Filters** (v1.6): `scope_filter` parameter on search & history — `"general"` | `"user"` | `"project"` — controls which memory scope to query, with `scope=None` (default) returning cross-scope results
 - **Explainable Search** (v1.4): Opt-in `explain=true` flag returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, entity, Hebbian)
 - **Entity Recall** (v1.4): SQLite-backed entity index with lifecycle hooks; entity boost in search + explain output
 - **Session Checkpoint** (v1.4): Atomic JSON persistence with pending-stage recovery and corrupt-failopen behavior
@@ -41,15 +43,14 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 |----------|-------------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, module layout, context layering, import order |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Version history and release notes |
-| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (12 registered tools) with examples |
+| [docs/TOOLS.md](docs/TOOLS.md) | Current SRH tool reference (13 registered tools) with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | Dashboard UI features and 15 API endpoints |
 | [docs/MEMORY_FORMAT.md](docs/MEMORY_FORMAT.md) | Frontmatter schema and file structure |
 | [docs/testing/test-coverage.md](docs/testing/test-coverage.md) | Test coverage map and host-contract smoke status |
 | [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) | Write patterns, cache consistency, known issues |
-| [docs/PERF_REPORT.md](docs/PERF_REPORT.md) | Performance benchmark results |
+| [PERF_REPORT.md](PERF_REPORT.md) | Performance benchmark results |
 
 ## Quick Start
-
 ```bash
 # 1. Clone into Hermes plugins directory
 cd ~/.hermes/plugins
