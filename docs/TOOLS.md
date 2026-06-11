@@ -64,7 +64,9 @@ srh_memory_history(id="mem_abc123", include_events=True, event_types=["UPDATE", 
 srh_memory_history(id="mem_abc123", include_events=True, session_id="sess-001")
 ```
 
-**v1.6 audit events**: When `include_events=True`, the response includes a chronological list of ADD/UPDATE/DELETE/SUPERSEDE/PIN/UNPIN events. Filter by `event_types` or `session_id` to narrow the timeline.
+**v1.6 audit events**: When `include_events=True`, the response includes a chronological list of events. Event types: `ADD`, `UPDATE`, `DELETE`, `SUPERSEDE`, `PIN`, `UNPIN`. Each event records `old_body`/`new_body`, `old_frontmatter`/`new_frontmatter`, `session_id`, `actor_id`, and an ISO `created_at` timestamp. Filter by `event_types` or `session_id` to narrow the timeline.
+
+**Performance note**: The event log is append-only and indexed by `memory_id`, `session_id`, and `created_at`. Event queries for a single memory are O(1) — no full table scan.
 
 ## Palace Navigation (1)
 
