@@ -39,7 +39,9 @@ _FILE_MARKERS = {
     "test_reflection.py": ("reflection", "runtime"),
     "test_context.py": ("context", "runtime"),
     "test_hooks.py": ("runtime", "v14"),
+    "test_runtime_import_hygiene.py": ("runtime", "compatibility"),
     "test_memory_curator.py": ("curator",),
+    "test_curator_pipeline.py": ("curator", "integration"),
     "test_bridge.py": ("bridge", "integration"),
     "test_dashboard.py": ("dashboard", "integration"),
     "test_tool_handlers.py": ("tools", "runtime"),
@@ -50,9 +52,12 @@ _FILE_MARKERS = {
     "test_checkpoint_backup_failure.py": ("runtime", "v14"),
     "test_config.py": ("config",),
     "test_backend.py": ("backend",),
+    "test_schema_module.py": ("runtime", "tools", "contract"),
+    "test_lb.py": ("runtime", "compatibility"),
     "test_entity_extraction.py": ("search", "retrieval", "v14"),
     "test_async_writer.py": ("store", "v14"),
     "test_optional_deps.py": ("config", "v14"),
+    "test_store_module_split.py": ("store", "compatibility"),
 }
 
 _V14_NODE_MARKERS = {

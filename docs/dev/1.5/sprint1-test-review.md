@@ -4,6 +4,8 @@
 **审查对象**: `tests/test_curator_pipeline.py` 对 `docs/design/1.5/sprint1-curator-pipeline-sdd.md` 的覆盖
 **结论**: **未完全覆盖功能意图**。33 个测试中约 14 个有效对齐意图，6 个存在断言缺陷，13 个测试位点缺失。
 
+**当前注记（2026-06-11）**: 这是一份历史审查快照。文中指出的核心缺口已在后续 v1.5 round1 清理中修复，当前测试状态为 `510 passed`，且 curator 测试已分层为 canonical `test_curator_pipeline.py` 与 legacy `test_memory_curator.py`。
+
 ---
 
 ## 1. 覆盖情况逐项审查

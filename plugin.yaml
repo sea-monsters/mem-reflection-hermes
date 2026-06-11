@@ -6,6 +6,7 @@ provides_tools:
   - srh_memory_write
   - srh_memory_search
   - srh_memory_delete
+  - srh_memory_history
   - srh_palace_navigate
   - srh_reflect_now
   - srh_skill_query

@@ -42,12 +42,18 @@ class MemoryFrontmatter:
     zone: str = "general"
     rank: int = 0
     version: int = 1
+    user_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
 
     @classmethod
     def new(cls, source: str, confidence: str = "medium",
             tags: Optional[List[str]] = None,
             zone: Optional[str] = None,
-            pinned: bool = False) -> "MemoryFrontmatter":
+            pinned: bool = False,
+            user_id: Optional[str] = None,
+            agent_id: Optional[str] = None,
+            run_id: Optional[str] = None) -> "MemoryFrontmatter":
         """Factory: create a new frontmatter with auto-generated id and timestamp."""
         return cls(
             id=str(uuid.uuid4()),
@@ -57,6 +63,9 @@ class MemoryFrontmatter:
             pinned=pinned,
             tags=list(tags or []),
             zone=normalize_zone(zone),
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -68,8 +77,11 @@ class MemoryFrontmatter:
         d: Dict[str, Any] = {}
         for f in ("id", "created", "source", "confidence", "pinned", "tags",
                    "supersedes", "supersedes_reason", "valid_from", "valid_until",
-                   "context_scope", "zone", "rank", "version"):
+                   "context_scope", "zone", "rank", "version",
+                   "user_id", "agent_id", "run_id"):
             v = getattr(self, f)
+            if v == "" and f in ("user_id", "agent_id", "run_id"):
+                v = None
             if v is not None and v != [] and v is not False and v != 0 and v != "general" and v != "medium":
                 d[f] = v
             elif f in ("id", "created", "source", "confidence"):
@@ -247,6 +259,9 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     data.setdefault("zone", "general")
     data.setdefault("always_active", False)
     data.setdefault("rank", 0)
+    data.setdefault("user_id", None)
+    data.setdefault("agent_id", None)
+    data.setdefault("run_id", None)
     return data, body_part.strip()
 
 
@@ -269,7 +284,8 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
         buf.append("supersedes:")
         for s in supersedes:
             buf.append(f"  - {s}")
-    for key in ("supersedes_reason", "valid_from", "valid_until", "context_scope"):
+    for key in ("supersedes_reason", "valid_from", "valid_until", "context_scope",
+                "user_id", "agent_id", "run_id"):
         val = data.get(key)
         if val is not None:
             buf.append(f"{key}: {val}")

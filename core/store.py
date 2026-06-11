@@ -22,58 +22,96 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-import sys as _sys, types as _types
-
-if not __package__ or __package__ not in _sys.modules:
-    _pkg = "mem_reflection_hermes.core"
-    if _pkg not in _sys.modules:
-        _core_mod = _types.ModuleType("mem_reflection_hermes.core")
-        _core_mod.__path__ = [str(Path(__file__).resolve().parent)]
-        _sys.modules[_pkg] = _core_mod
-    if "mem_reflection_hermes" not in _sys.modules:
-        _root_mod = _types.ModuleType("mem_reflection_hermes")
-        _root_mod.__path__ = [str(Path(__file__).resolve().parent.parent)]
-        _sys.modules["mem_reflection_hermes"] = _root_mod
-    __package__ = _pkg
-
-from .config import (  # noqa: F401
-    CONFIG_KEY_EMBEDDINGS, CONFIG_KEY_ENTITY, CONFIG_KEY_INTENT_PROTOTYPES,
-    CONFIG_KEY_MICRO_REFLECTION, CONFIG_KEY_PALACE_INSTRUCTIONS,
-    CONFIG_KEY_PALACE_MODE, CONFIG_KEY_PROFILE_MODE, CONFIG_KEY_RERANKER,
-    CONFIG_SECTION, embeddings_enabled, hermes_home, load_config,
-    micro_reflection_enabled, palace_index_path, palace_mode_enabled,
-    plugin_config, plugin_data_dir, profile_mode_enabled,
-    project_memories_dir, project_skills_dir, user_memories_dir,
-    user_skills_dir, zone_cache_dir,
-)
-from .entities import (  # noqa: F401
-    _extract_entities_spacy, _normalize_entity_text, entity_enabled,
-    entity_weight, extract_entities,
-)
-from .intent import _classify_update_intent, _is_context_mismatch, _is_expired  # noqa: F401
-from .lineage import _lineage_cycle_check, _lineage_depth, _lineage_latest, _lineage_root  # noqa: F401
-from .models import (  # noqa: F401
-    LoadedMemory, LoadedSkill, MemoryEffectiveness, MemoryFrontmatter,
-    MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
-    parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
-)
-from .skill_store import SkillStore, _read_skill_file  # noqa: F401
-from .tokenization import (  # noqa: F401
-    _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
-    _cosine_similarity, _get_jieba_search, _memory_tokens, _tokenise,
-    adaptive_conflict_threshold, cjk_ratio, cjk_tokenizer_mode,
-    estimate_tokens, is_cjk, normalize_bm25,
-)
-from .utils import (  # noqa: F401
-    _PROJECT_ZONE_PREFIX, _VALID_ZONES, _ZONE_CORE, _ZONE_EPISODE,
-    _ZONE_GENERAL, _ZONE_MERGE_THRESHOLD, _ZONE_SEMANTIC,
-    _ZONE_SPLIT_THRESHOLD, _ZONE_WORK, fast_hash, is_valid_zone,
-    normalize_zone, sanitize_zone_filename,
-)
+try:
+    from .config import (  # noqa: F401
+        CONFIG_KEY_EMBEDDINGS, CONFIG_KEY_ENTITY, CONFIG_KEY_INTENT_PROTOTYPES,
+        CONFIG_KEY_MICRO_REFLECTION, CONFIG_KEY_PALACE_INSTRUCTIONS,
+        CONFIG_KEY_PALACE_MODE, CONFIG_KEY_PROFILE_MODE, CONFIG_KEY_RERANKER,
+        CONFIG_SECTION, embeddings_enabled, hermes_home, load_config,
+        micro_reflection_enabled, palace_index_path, palace_mode_enabled,
+        plugin_config, plugin_data_dir, profile_mode_enabled,
+        project_memories_dir, project_skills_dir, user_memories_dir,
+        user_skills_dir, zone_cache_dir,
+    )
+    from .entities import (  # noqa: F401
+        _extract_entities_spacy, _normalize_entity_text, entity_enabled,
+        entity_weight, extract_entities,
+    )
+    from .intent import _classify_update_intent, _is_context_mismatch, _is_expired  # noqa: F401
+    from .lineage import _lineage_cycle_check, _lineage_depth, _lineage_latest, _lineage_root  # noqa: F401
+    from .models import (  # noqa: F401
+        LoadedMemory, LoadedSkill, MemoryEffectiveness, MemoryFrontmatter,
+        MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
+        parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
+    )
+    from .skill_store import SkillStore, _read_skill_file  # noqa: F401
+    from .tokenization import (  # noqa: F401
+        _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
+        _cosine_similarity, _get_jieba_search, _memory_tokens, _tokenise,
+        adaptive_conflict_threshold, cjk_ratio, cjk_tokenizer_mode,
+        estimate_tokens, is_cjk, normalize_bm25,
+    )
+    from .utils import (  # noqa: F401
+        _PROJECT_ZONE_PREFIX, _VALID_ZONES, _ZONE_CORE, _ZONE_EPISODE,
+        _ZONE_GENERAL, _ZONE_MERGE_THRESHOLD, _ZONE_SEMANTIC,
+        _ZONE_SPLIT_THRESHOLD, _ZONE_WORK, fast_hash, is_valid_zone,
+        normalize_zone, sanitize_zone_filename,
+    )
+except ImportError:
+    from core.config import (  # noqa: F401
+        CONFIG_KEY_EMBEDDINGS, CONFIG_KEY_ENTITY, CONFIG_KEY_INTENT_PROTOTYPES,
+        CONFIG_KEY_MICRO_REFLECTION, CONFIG_KEY_PALACE_INSTRUCTIONS,
+        CONFIG_KEY_PALACE_MODE, CONFIG_KEY_PROFILE_MODE, CONFIG_KEY_RERANKER,
+        CONFIG_SECTION, embeddings_enabled, hermes_home, load_config,
+        micro_reflection_enabled, palace_index_path, palace_mode_enabled,
+        plugin_config, plugin_data_dir, profile_mode_enabled,
+        project_memories_dir, project_skills_dir, user_memories_dir,
+        user_skills_dir, zone_cache_dir,
+    )
+    from core.entities import (  # noqa: F401
+        _extract_entities_spacy, _normalize_entity_text, entity_enabled,
+        entity_weight, extract_entities,
+    )
+    from core.intent import _classify_update_intent, _is_context_mismatch, _is_expired  # noqa: F401
+    from core.lineage import _lineage_cycle_check, _lineage_depth, _lineage_latest, _lineage_root  # noqa: F401
+    from core.models import (  # noqa: F401
+        LoadedMemory, LoadedSkill, MemoryEffectiveness, MemoryFrontmatter,
+        MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
+        parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
+    )
+    from core.skill_store import SkillStore, _read_skill_file  # noqa: F401
+    from core.tokenization import (  # noqa: F401
+        _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
+        _cosine_similarity, _get_jieba_search, _memory_tokens, _tokenise,
+        adaptive_conflict_threshold, cjk_ratio, cjk_tokenizer_mode,
+        estimate_tokens, is_cjk, normalize_bm25,
+    )
+    from core.utils import (  # noqa: F401
+        _PROJECT_ZONE_PREFIX, _VALID_ZONES, _ZONE_CORE, _ZONE_EPISODE,
+        _ZONE_GENERAL, _ZONE_MERGE_THRESHOLD, _ZONE_SEMANTIC,
+        _ZONE_SPLIT_THRESHOLD, _ZONE_WORK, fast_hash, is_valid_zone,
+        normalize_zone, sanitize_zone_filename,
+    )
 
 logger = logging.getLogger(__name__)
 
 _stat_write_lock = threading.Lock()
+
+
+def _load_related_module(name: str):
+    package = __package__ or "core"
+    try:
+        return importlib.import_module(f"{package}.{name}")
+    except ImportError:
+        if package != "core":
+            return importlib.import_module(f"core.{name}")
+        raise
+
+
+def _sqlite_text_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 def _stats_path() -> Path:
@@ -175,21 +213,26 @@ def _safe_write(path: Path, content: str) -> None:
 
 
 def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
-    return {
+    d: Dict[str, Any] = {
         "id": fm.id,
-        "created": fm.created,
+        "created": _sqlite_text_value(fm.created),
         "source": fm.source,
         "confidence": fm.confidence,
         "pinned": fm.pinned,
         "tags": fm.tags,
         "supersedes": fm.supersedes,
-        "supersedes_reason": fm.supersedes_reason,
-        "valid_from": fm.valid_from,
-        "valid_until": fm.valid_until,
+        "supersedes_reason": _sqlite_text_value(fm.supersedes_reason),
+        "valid_from": _sqlite_text_value(fm.valid_from),
+        "valid_until": _sqlite_text_value(fm.valid_until),
         "context_scope": fm.context_scope,
         "zone": fm.zone,
         "rank": fm.rank,
     }
+    for k in ("user_id", "agent_id", "run_id"):
+        v = getattr(fm, k, None)
+        if v is not None:
+            d[k] = v
+    return d
 
 
 def _write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
@@ -293,11 +336,16 @@ CREATE TABLE IF NOT EXISTS memories (
     created TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'user',
     valid_from TEXT, valid_until TEXT, context_scope TEXT,
     version INTEGER NOT NULL DEFAULT 1, supersedes_reason TEXT,
-    body_hash TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL DEFAULT ''
+    body_hash TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+    user_id TEXT, agent_id TEXT, run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mem_zone ON memories(zone);
 CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(pinned) WHERE pinned = 1;
 CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created);
+CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
+CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id);
+CREATE INDEX IF NOT EXISTS idx_memories_run_id ON memories(run_id);
+CREATE INDEX IF NOT EXISTS idx_memories_scoped ON memories(user_id, agent_id, run_id);
 CREATE TABLE IF NOT EXISTS tags (
     memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     tag TEXT NOT NULL, PRIMARY KEY (memory_id, tag)
@@ -326,6 +374,21 @@ CREATE TABLE IF NOT EXISTS entity_links (
 );
 CREATE INDEX IF NOT EXISTS idx_entity_links_memory ON entity_links(memory_id);
 CREATE INDEX IF NOT EXISTS idx_entity_links_entity ON entity_links(entity_id);
+CREATE TABLE IF NOT EXISTS memory_events (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    old_body TEXT,
+    new_body TEXT,
+    old_frontmatter TEXT,
+    new_frontmatter TEXT,
+    session_id TEXT,
+    actor_id TEXT NOT NULL DEFAULT 'agent',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_events_memory_id ON memory_events(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_events_session_id ON memory_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_events_created_at ON memory_events(created_at);
 """
 
 
@@ -382,6 +445,8 @@ class MemoryStore:
         conn.executescript(_SCHEMA)
         conn.commit()
         self._ensure_body_column(conn)
+        self._ensure_scope_columns(conn)
+        self._ensure_event_table(conn)
 
     @staticmethod
     def _ensure_body_column(conn: sqlite3.Connection) -> None:
@@ -389,6 +454,35 @@ class MemoryStore:
         if "body" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN body TEXT NOT NULL DEFAULT ''")
             conn.commit()
+
+    @staticmethod
+    def _ensure_scope_columns(conn: sqlite3.Connection) -> None:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        for col in ("user_id", "agent_id", "run_id"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {col} TEXT")
+        conn.commit()
+
+    @staticmethod
+    def _ensure_event_table(conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_events (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                old_body TEXT,
+                new_body TEXT,
+                old_frontmatter TEXT,
+                new_frontmatter TEXT,
+                session_id TEXT,
+                actor_id TEXT NOT NULL DEFAULT 'agent',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_memory_id ON memory_events(memory_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_session_id ON memory_events(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_created_at ON memory_events(created_at)")
+        conn.commit()
 
     def _sync_from_disk(self) -> None:
         conn = self._get_conn()
@@ -415,8 +509,9 @@ class MemoryStore:
             """INSERT OR REPLACE INTO memories
                (id, scope, zone, confidence, pinned, rank, created, source,
                 valid_from, valid_until, context_scope, version,
-                supersedes_reason, body_hash, path, body)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                supersedes_reason, body_hash, path, body,
+                user_id, agent_id, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fm.id,
                 m.scope,
@@ -424,16 +519,19 @@ class MemoryStore:
                 fm.confidence,
                 int(fm.pinned),
                 fm.rank,
-                fm.created,
+                _sqlite_text_value(fm.created),
                 fm.source,
-                fm.valid_from,
-                fm.valid_until,
+                _sqlite_text_value(fm.valid_from),
+                _sqlite_text_value(fm.valid_until),
                 fm.context_scope,
                 fm.version,
-                fm.supersedes_reason,
+                _sqlite_text_value(fm.supersedes_reason),
                 body_hash,
                 str(m.source_path),
                 m.body,
+                fm.user_id,
+                fm.agent_id,
+                fm.run_id,
             ),
         )
         conn.execute("DELETE FROM tags WHERE memory_id = ?", (fm.id,))
@@ -483,6 +581,89 @@ class MemoryStore:
     def _cleanup_orphan_entities(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM entity_links)")
 
+    @staticmethod
+    def _event_json(data: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not data:
+            return None
+        def _default(obj: Any) -> str:
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError
+        result = json.dumps(data, ensure_ascii=False, default=_default)
+        if len(result) > 8192:
+            result = json.dumps({"id": data.get("id", "")}, ensure_ascii=False)
+            logger.warning("Event frontmatter truncated for memory %s", data.get("id", "?"))
+        return result
+
+    def _record_memory_event(
+        self,
+        conn: sqlite3.Connection,
+        memory_id: str,
+        event_type: str,
+        old_body: Optional[str] = None,
+        new_body: Optional[str] = None,
+        old_frontmatter: Optional[Dict[str, Any]] = None,
+        new_frontmatter: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        actor_id: str = "agent",
+    ) -> None:
+        """Append an event to the memory_events ledger."""
+        now = datetime.now(timezone.utc).isoformat()
+        event_id = str(uuid.uuid4())
+        old_fm_json = self._event_json(old_frontmatter)
+        new_fm_json = self._event_json(new_frontmatter)
+        conn.execute(
+            """INSERT INTO memory_events
+               (id, memory_id, event_type, old_body, new_body,
+                old_frontmatter, new_frontmatter, session_id, actor_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, memory_id, event_type, old_body, new_body, old_fm_json, new_fm_json, session_id or "", actor_id, now),
+        )
+
+    def get_memory_events(
+        self,
+        memory_id: str,
+        event_types: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query events for a memory, optionally filtered by type/session/limit."""
+        conn = self._get_conn()
+        clauses = ["memory_id = ?"]
+        params: List[Any] = [memory_id]
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            clauses.append(f"event_type IN ({placeholders})")
+            params.extend(event_types)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        where = " AND ".join(clauses)
+        sql = f"SELECT * FROM memory_events WHERE {where} ORDER BY created_at ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_memory_history(self, memory_id: str, include_events: bool = False) -> Dict[str, Any]:
+        """Return supersedes chain plus optional event history."""
+        result: Dict[str, Any] = {"memory_id": memory_id, "supersedes": []}
+        conn = self._get_conn()
+        # Build supersedes chain
+        visited: Set[str] = set()
+        current = memory_id
+        while True:
+            row = conn.execute("SELECT old_id FROM supersedes WHERE new_id = ?", (current,)).fetchone()
+            if row is None or row["old_id"] in visited:
+                break
+            visited.add(row["old_id"])
+            result["supersedes"].append(row["old_id"])
+            current = row["old_id"]
+        if include_events:
+            result["events"] = self.get_memory_events(memory_id)
+        return result
+
     def _validate_supersedes_targets(self, conn: sqlite3.Connection, fm: MemoryFrontmatter) -> None:
         missing = [
             old
@@ -524,12 +705,16 @@ class MemoryStore:
                 valid_from=row["valid_from"],
                 valid_until=row["valid_until"],
                 context_scope=row["context_scope"],
+                user_id=row["user_id"],
+                agent_id=row["agent_id"],
+                run_id=row["run_id"],
             )
             return LoadedMemory(
                 frontmatter=fm, body=body, source_path=Path(row["path"]), scope=row["scope"]
             )
         except Exception as exc:
-            logger.warning("SQLite row parse failed for %s: %s", row.get("id", "?"), exc)
+            row_id = row["id"] if "id" in row.keys() else "?"
+            logger.warning("SQLite row parse failed for %s: %s", row_id, exc)
             return self._row_to_loaded_from_disk(row)
 
     def _row_to_loaded_from_disk(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
@@ -548,6 +733,7 @@ class MemoryStore:
     def put(self, scope: str, fm: MemoryFrontmatter, body: str) -> Path:
         with self._lock:
             conn = self._get_conn()
+            was_in_transaction = conn.in_transaction
             if conn.execute("SELECT id FROM memories WHERE id = ?", (fm.id,)).fetchone():
                 raise ValueError(f"Duplicate memory id: {fm.id}")
             self._validate_supersedes_targets(conn, fm)
@@ -555,8 +741,26 @@ class MemoryStore:
             raw_date = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
             path = root / f"{re.sub(r'[\\/]', '_', raw_date)}-{re.sub(r'[^a-zA-Z0-9_-]', '_', fm.id[:16])}.md"
             write_memory_atomic(path, fm, body)
-            self._upsert_memory_row(conn, LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope))
-            conn.commit()
+            loaded = LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
+            self._upsert_memory_row(conn, loaded)
+            self._record_memory_event(
+                conn,
+                memory_id=fm.id,
+                event_type="ADD",
+                new_body=body.strip(),
+                new_frontmatter=_frontmatter_to_data(fm),
+            )
+            # Record SUPERSEDE events for each superseded memory
+            for old_id in fm.supersedes or []:
+                self._record_memory_event(
+                    conn,
+                    memory_id=old_id,
+                    event_type="SUPERSEDE",
+                    new_body=body.strip(),
+                    new_frontmatter=_frontmatter_to_data(fm),
+                )
+            if not was_in_transaction:
+                conn.commit()
             self._mark_changed()
             return path
 
@@ -570,7 +774,8 @@ class MemoryStore:
     def delete(self, scope: str, mem_id: str) -> bool:
         with self._lock:
             conn = self._get_conn()
-            row = conn.execute("SELECT path FROM memories WHERE id = ?", (mem_id,)).fetchone()
+            was_in_transaction = conn.in_transaction
+            row = conn.execute("SELECT path, body, scope FROM memories WHERE id = ?", (mem_id,)).fetchone()
             if row is None:
                 return False
             path = Path(row["path"]).resolve()
@@ -578,15 +783,26 @@ class MemoryStore:
             if not str(path).startswith(str(expected_root)):
                 logger.warning("Rejecting delete of out-of-bounds path: %s", path)
                 return False
+            old_body = row["body"] or ""
+            old_loaded = read_memory(path, scope)
+            old_fm = old_loaded.frontmatter.to_dict() if old_loaded else {}
             if path.exists():
                 try:
                     path.unlink()
                 except OSError as e:
                     logger.warning("Failed to delete memory file %s: %s", path, e)
                     return False
+            self._record_memory_event(
+                conn,
+                memory_id=mem_id,
+                event_type="DELETE",
+                old_body=old_body,
+                old_frontmatter=old_fm,
+            )
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
             self._cleanup_orphan_entities(conn)
-            conn.commit()
+            if not was_in_transaction:
+                conn.commit()
             self._mark_changed()
             for cb in self._post_delete_callbacks:
                 try:
@@ -605,8 +821,14 @@ class MemoryStore:
         pinned: Optional[bool] = None,
         supersedes: Optional[List[str]] = None,
     ) -> Optional[LoadedMemory]:
+        """Update mutable fields of an existing memory.
+
+        Scope fields (user_id, agent_id, run_id) are preserved from the
+        original memory and cannot be changed through this method.
+        """
         with self._lock:
             conn = self._get_conn()
+            was_in_transaction = conn.in_transaction
             row = conn.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Memory not found: {mem_id}")
@@ -628,14 +850,43 @@ class MemoryStore:
                 context_scope=fm.context_scope,
                 zone=zone if zone is not None else fm.zone,
                 rank=fm.rank,
+                version=fm.version,
+                user_id=fm.user_id,
+                agent_id=fm.agent_id,
+                run_id=fm.run_id,
             )
             new_body = body if body is not None else loaded.body
             write_memory_atomic(loaded.source_path, new_fm, new_body)
             updated = LoadedMemory(
                 frontmatter=new_fm, body=new_body.strip(), source_path=loaded.source_path, scope=loaded.scope
             )
+            old_body_val = loaded.body
+            old_fm_val = _frontmatter_to_data(fm)
+            new_fm_val = _frontmatter_to_data(new_fm)
+            # Record PIN/UNPIN event when pinned state changes
+            if pinned is not None and pinned != fm.pinned:
+                pin_type = "PIN" if pinned else "UNPIN"
+                self._record_memory_event(
+                    conn,
+                    memory_id=mem_id,
+                    event_type=pin_type,
+                    old_body=old_body_val,
+                    new_body=new_body.strip(),
+                    old_frontmatter=old_fm_val,
+                    new_frontmatter=new_fm_val,
+                )
+            self._record_memory_event(
+                conn,
+                memory_id=mem_id,
+                event_type="UPDATE",
+                old_body=old_body_val,
+                new_body=new_body.strip(),
+                old_frontmatter=old_fm_val,
+                new_frontmatter=new_fm_val,
+            )
             self._upsert_memory_row(conn, updated)
-            conn.commit()
+            if not was_in_transaction:
+                conn.commit()
             self._mark_changed()
             return updated
 
@@ -653,6 +904,7 @@ class MemoryStore:
         active_only: bool = False,
         sort: str = "rank",
         limit: Optional[int] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> List[LoadedMemory]:
         conn = self._get_conn()
         clauses: List[str] = []
@@ -662,6 +914,10 @@ class MemoryStore:
             params.append(normalize_zone(zone))
         if active_only:
             clauses.append("id NOT IN (SELECT old_id FROM supersedes)")
+        if filters:
+            f_clauses, f_params = self._build_scope_clauses(filters)
+            clauses.extend(f_clauses)
+            params.extend(f_params)
         where = " AND ".join(clauses) if clauses else "1=1"
         order = self._LIST_SORT_ORDERS.get(sort, self._LIST_SORT_ORDERS["rank"])
         sql = f"SELECT * FROM memories WHERE {where} ORDER BY {order}"
@@ -688,11 +944,73 @@ class MemoryStore:
             groups.setdefault(memory.frontmatter.zone, []).append(memory)
         return groups
 
+    @staticmethod
+    def _build_scope_clauses(filters: Dict[str, Optional[str]]) -> Tuple[List[str], List[Any]]:
+        """Build SQL WHERE clauses and params from scope filter dict.
+
+        Returns (clauses, params). Callers must validate that clauses is non-empty
+        if they require at least one filter.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        allowed_keys = {"user_id", "agent_id", "run_id"}
+        unknown = set(filters.keys()) - allowed_keys
+        if unknown:
+            raise ValueError(f"Unknown filter keys: {unknown}")
+        for key in ("user_id", "agent_id", "run_id"):
+            if key in filters:
+                val = filters[key]
+                if val is None:
+                    clauses.append(f"{key} IS NULL")
+                else:
+                    clauses.append(f"{key} = ?")
+                    params.append(val)
+        return clauses, params
+
+    def delete_by_filters(self, filters: Dict[str, Optional[str]]) -> int:
+        """Batch delete memories matching scope filters."""
+        if not filters:
+            raise ValueError("filters dict must not be empty")
+        with self._lock:
+            conn = self._get_conn()
+            clauses, params = self._build_scope_clauses(filters)
+            if not clauses:
+                raise ValueError("filters dict must contain at least one scope key")
+            where = " AND ".join(clauses)
+            rows = conn.execute(f"SELECT id, scope, path, body, zone, rank, pinned, confidence, source, created, version, supersedes_reason, valid_from, valid_until, context_scope, user_id, agent_id, run_id FROM memories WHERE {where}", params).fetchall()
+            deleted = 0
+            for row in rows:
+                mem_id = row["id"]
+                scope = row["scope"]
+                path = Path(row["path"])
+                old_body = row["body"] or ""
+                old_loaded = self._row_to_loaded(row) or read_memory(path, scope)
+                old_fm = old_loaded.frontmatter.to_dict() if old_loaded else {}
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        logger.warning("Failed to delete memory file %s", path)
+                        continue
+                self._record_memory_event(
+                    conn,
+                    memory_id=mem_id,
+                    event_type="DELETE",
+                    old_body=old_body,
+                    old_frontmatter=old_fm,
+                )
+                conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+                deleted += 1
+            self._cleanup_orphan_entities(conn)
+            conn.commit()
+            self._mark_changed()
+            return deleted
+
     def _get_search_index(self):
         if self._search_index is None:
             try:
-                from .search import SearchIndex
-            except ImportError:
+                SearchIndex = _load_related_module("search").SearchIndex
+            except Exception:
                 search_path = Path(__file__).resolve().with_name("search.py")
                 spec = importlib.util.spec_from_file_location("_memory_search_module", search_path)
                 mod = importlib.util.module_from_spec(spec)
@@ -700,7 +1018,7 @@ class MemoryStore:
                 spec.loader.exec_module(mod)
                 SearchIndex = mod.SearchIndex
             try:
-                from .reranker import _build_reranker
+                _build_reranker = _load_related_module("reranker")._build_reranker
                 reranker = _build_reranker(plugin_config().get(CONFIG_KEY_RERANKER, {}))
             except Exception:
                 reranker = None
@@ -713,8 +1031,8 @@ class MemoryStore:
             self._search_index._graph = graph
             self._search_index.invalidate_cache()
 
-    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None) -> List[LoadedMemory]:
-        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history)
+    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, filters=filters)
 
     def fusion_search(self, query: str, k: int = 5, zone: Optional[str] = None, include_history: bool = False, **kwargs) -> List[LoadedMemory]:
         return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, **kwargs)
@@ -723,17 +1041,17 @@ class MemoryStore:
         return self._get_search_index().search_explain(query, k=k, zone=zone, include_history=include_history, **kwargs)
 
     def search_backend_capabilities(self):
-        from .backend import default_sqlite_backend_capabilities
+        default_sqlite_backend_capabilities = _load_related_module("backend").default_sqlite_backend_capabilities
         return default_sqlite_backend_capabilities(entity_search=entity_enabled(), vector_search=embeddings_enabled())
 
     def entity_links_for_memory(self, memory_id: str) -> List[Dict[str, Any]]:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.entity_links_for_memory(self, memory_id)
 
     def compute_entity_boosts(
         self, query: str, candidate_ids: Optional[Set[str]] = None
     ) -> Tuple[Dict[str, float], Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.compute_entity_boosts(self, query, candidate_ids)
 
     def check_conflict(self, body: str, threshold: Optional[float] = None, exclude_ids: Optional[List[str]] = None) -> Optional[Tuple[str, float]]:
@@ -749,41 +1067,41 @@ class MemoryStore:
         return self._get_conn().execute("SELECT 1 FROM supersedes WHERE old_id = ?", (mem_id,)).fetchone() is not None
 
     def latest_for(self, mem_id: str) -> Optional[LoadedMemory]:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.latest_for(self, mem_id)
 
     def lineage_chain(self, mem_id: str, max_depth: int = 10) -> List[LoadedMemory]:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.lineage_chain(self, mem_id, max_depth)
 
     def _calc_supersedes_depth(
         self, mem_id: str, visited: Optional[Set[str]] = None, max_depth: int = 10, depth: int = 0
     ) -> int:
-        from . import lineage as _lineage_mod
+        _lineage_mod = _load_related_module("lineage")
         return _lineage_mod._calc_supersedes_depth(self, mem_id, visited, max_depth, depth)
 
     def record_stat(self, memory_id: str, event: str) -> None:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.record_stat(self, memory_id, event)
 
     def effectiveness(self, memory_id: Optional[str] = None) -> Dict[str, MemoryEffectiveness]:
-        from . import store_methods as _sm
+        _sm = _load_related_module("store_methods")
         return _sm.effectiveness(self, memory_id)
 
     def health_metrics(self) -> Dict[str, Any]:
-        from . import store_health as _sh
+        _sh = _load_related_module("store_health")
         return _sh.health_metrics(self)
 
     def rebuild_index(self) -> Dict[str, Any]:
-        from . import store_health as _sh
+        _sh = _load_related_module("store_health")
         return _sh.rebuild_index(self)
 
     def validate_index(self) -> Dict[str, Any]:
-        from . import store_health as _sh
+        _sh = _load_related_module("store_health")
         return _sh.validate_index(self)
 
     def prune_index(self) -> Dict[str, Any]:
-        from . import store_health as _sh
+        _sh = _load_related_module("store_health")
         return _sh.prune_index(self)
 
     def reorder(self, memory_ids: List[str]) -> List[str]:

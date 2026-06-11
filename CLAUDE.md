@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mem-reflection-hermes** is a self-evolving memory & reflection system plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It provides structured memory persistence, semantic search, reflection pipelines, skill auto-matching, graph memory (Hebbian co-activation), and a dashboard UI. Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes).
 
-Current version: **v1.5** (plugin.yaml version field).
+Current version: **v1.6** (plugin.yaml version field).
 
 ### Architecture (functional packages)
 
@@ -14,7 +14,7 @@ The codebase is organized into five functional packages:
 
 ```
 core/
-  store.py          # MemoryStore, SkillStore, config, paths, BM25 helpers
+  store.py          # MemoryStore, SkillStore, config, paths, BM25 helpers, memory_events ledger
   store_methods.py  # Thin method bodies extracted from MemoryStore (entity boosts, etc.)
   models.py         # MemoryFrontmatter, LoadedMemory, SkillFrontmatter, LoadedSkill, parse/serialize
   search.py         # SearchIndex: BM25 + embedding + fusion + Hebbian boost, explain, CJK tokenizer
@@ -51,7 +51,7 @@ runtime/
   graph.py          # 5 graph/health tools + graph manager singleton
   checkpoint.py     # Atomic session checkpoint, pending-stage recovery, corrupt backup (v1.4)
   registration.py   # register(ctx): wires hooks, commands, tools, post-delete callbacks
-  schemas.py        # 12 Hermes tool JSON schemas
+  schemas.py        # 13 Hermes tool JSON schemas
   state.py          # Singleton getters (_get_mem_store, _get_search_index, _get_graph_mgr, etc.)
   helpers.py        # _build_context_block, _build_context_bundle, _estimate_tokens, match_skills
   _lb.py            # Late-binding helper: resolves modules/symbols without circular imports
@@ -223,10 +223,10 @@ Context injection priority (subject to `max_context_token_preference`):
 
 ### Tool Split
 
-- 7 base tools in `runtime/tools.py` (write, search, delete, palace, reflect, skill, compile)
+- 8 base tools in `runtime/tools.py` (write, search, delete, history, palace, reflect, skill, compile)
 - 5 graph/health tools in `runtime/graph.py` (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`)
-- All 12 schemas in `runtime/schemas.py`
-- All 12 registered through `runtime/registration.py::register(ctx)` (called from `__init__.py`)
+- All 13 schemas in `runtime/schemas.py`
+- All 13 registered through `runtime/registration.py::register(ctx)` (called from `__init__.py`)
 
 ### Late Binding (`runtime/_lb.py`)
 
@@ -315,7 +315,7 @@ except ImportError:
 ### Memory Format
 
 Memories are Markdown files with YAML frontmatter. Key frontmatter fields:
-`id`, `created`, `source`, `confidence`, `pinned`, `tags`, `zone`, `rank`, `supersedes`, `supersedes_reason`, `version`, `valid_from`, `valid_until`, `context_scope`
+`id`, `created`, `source`, `confidence`, `pinned`, `tags`, `zone`, `rank`, `supersedes`, `supersedes_reason`, `version`, `valid_from`, `valid_until`, `context_scope`, `user_id`, `agent_id`, `run_id`
 
 Files stored in `~/.hermes/memories/` (user) or `./.hermes/memories/` (project).
 
@@ -346,6 +346,14 @@ The pipeline runs automatically at `on_session_end`. All actions implement `Cura
 Body refinement (`_refine_body`) strips fenced code blocks, `[Tool:xxx]` markers, tool-result prefixes, and collapses excess whitespace before bridge writes and cold-storage archive.
 
 **Legacy API preserved**: `scan_for_stale`, `archive_expired`, `archive_superseded`, `compact_superseded_chains`, `scan_for_similar`, `merge_similar`, `clean_orphan_edges` remain as thin wrappers in `memory/curator/__init__.py`.
+
+### v1.6 New Features
+
+- **Memory Event Ledger**: SQLite `memory_events` table tracks ADD/UPDATE/DELETE/SUPERSEDE/PIN/UNPIN events with old/new body, old/new frontmatter, session_id, actor_id. Transaction-aware: events are written atomically within the same SQLite connection as the memory mutation.
+- **Scoped Filters**: `user_id`/`agent_id`/`run_id` columns on `memories` table. NULL = universally visible. AND logic for combined filters. `filters` parameter on `list()`, `search()`, `search_explain()`, and `delete_by_filters()`.
+- **`srh_memory_history` tool**: Traces supersedes chain with optional audit events (`include_events`, `event_types`, `session_id`).
+- **Batch delete**: `srh_memory_delete` supports `filters`-only batch deletion.
+- **Schema consolidation**: Canonical schemas live in `runtime/schemas.py`; imported by `runtime/registration.py` for actual Hermes tool registration.
 
 ### v1.4 New Features
 
@@ -422,7 +430,7 @@ Implement the SDD design. Run `pytest tests/test_<feature>.py` iteratively until
 
 ### 5. Verify Full Suite
 
-Run `pytest tests/ -v` — all 523 tests must pass. No regressions.
+Run `pytest tests/ -v` — all 553 tests must pass. No regressions.
 
 ### Exceptions
 

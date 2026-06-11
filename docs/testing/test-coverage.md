@@ -1,9 +1,9 @@
 # Test Coverage Documentation
 
-> Version: v1.5 development baseline
-> Last updated: 2026-06-10
-> Collection snapshot: `pytest tests --collect-only -q` -> **523 tests collected**
-> Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.5 acceptance surfaces
+> Version: v1.6 development baseline
+> Last updated: 2026-06-11
+> Collection snapshot: `pytest tests --collect-only -q` -> **553 tests collected**
+> Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.6 acceptance surfaces
 
 ---
 
@@ -29,21 +29,27 @@ pytest -m "contract or smoke"
 
 Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v1.4/v1.5 additions are classified together without per-test decorators.
 
+Intent note:
+
+- behavior-facing tests should prefer public or workflow-visible effects over source inspection
+- private helpers are tested directly only when they are stable package seams or the smallest authoritative contract for a functional surface
+- implementation-shape checks (for example AST structure counting) are intentionally avoided unless no behavior-level proof exists
+
 ### Current Collected Test Modules
 
 | Test File | Tests | Primary Surface |
 |-----------|------:|-----------------|
 | `test_async_writer.py` | 3 | async writer queue.Full fallback, worker exception |
 | `test_backend.py` | 6 | backend capability abstraction |
-| `test_bm25.py` | 14 | tokenisation, BM25 scoring, CJK retrieval |
+| `test_bm25.py` | 16 | tokenisation, BM25 scoring, CJK retrieval, index build failure |
 | `test_bridge.py` | 35 | built-in/plugin bridge, body refinement, capacity rules |
 | `test_checkpoint.py` | 16 | runtime checkpoint persistence and recovery |
 | `test_checkpoint_backup_failure.py` | 1 | corrupt backup when os.replace fails |
 | `test_compaction.py` | 11 | episode compaction and return-shape stability |
 | `test_config.py` | 15 | typed config fallback and diagnostics |
-| `test_context.py` | 29 | context assembly, bundle split, compression |
+| `test_context.py` | 27 | context assembly, bundle split, compression |
 | `test_core_data.py` | 16 | frontmatter, effectiveness, lineage, atomic write |
-| `test_curator_pipeline.py` | 31 | composable curator actions, pipeline aggregation |
+| `test_curator_pipeline.py` | 81 | composable curator actions, pipeline aggregation, report persistence, boundary/error isolation |
 | `test_dashboard.py` | 18 | dashboard API, curator/reflection endpoints, zones |
 | `test_e2e.py` | 6 | end-to-end lifecycle integration |
 | `test_entity_extraction.py` | 21 | entity index lifecycle, regex patterns, weight hierarchy |
@@ -53,19 +59,51 @@ Marker assignment is auto-managed in `tests/conftest.py`, so legacy suites and v
 | `test_graph_operations.py` | 15 | compat graph CRUD, spread activation, PageRank |
 | `test_host_contract_smoke.py` | 1 | host contract and smoke script |
 | `test_hooks.py` | 13 | v0.16.0 enhanced hooks |
-| `test_lb.py` | 8 | late-binding helper, module resolution, fail-open |
-| `test_memory_curator.py` | 27 | stale scan, supersedes compaction, merge, report |
+| `test_lb.py` | 9 | late-binding helper, module resolution, fail-open |
+| `test_memory_curator.py` | 9 | legacy curator compatibility, cold-store lifecycle, restore |
 | `test_optional_deps.py` | 5 | optional dependency fallback paths |
 | `test_reflect.py` | 23 | reflection engine, facts, logs, raw chunk |
 | `test_reflection.py` | 27 | runtime reflection, hook cadence, JSON repair |
 | `test_reranker.py` | 13 | reranker abstraction and SearchIndex integration |
 | `test_reranker_exceptions.py` | 5 | reranker OOM/API failure fallbacks |
-| `test_schema_module.py` | 10 | runtime schema definitions, JSON schema validity |
+| `test_memory_events.py` | 24 | v1.6: event ledger ADD/UPDATE/DELETE/PIN/UNPIN/SUPERSEDE, query filters, atomicity, history |
+| `test_scope_filters.py` | 17 | v1.6: scoped write/search/list/update/delete/explain, migration, NULL matching |
+| `test_runtime_import_hygiene.py` | 3 | runtime recovery, compile-profile, tool handler dispatch |
+| `test_schema_module.py` | 12 | runtime schema definitions, JSON schema validity |
 | `test_search.py` | 16 | RRF, MMR, conflict, explain, entity boost |
 | `test_store.py` | 18 | rebuild/validate/prune, lineage, delete callbacks |
-| `test_store_module_split.py` | 12 | core module split, import paths, backward compat |
+| `test_store_module_split.py` | 11 | core module split, behavioral compatibility, backward compat |
 | `test_tool_handlers.py` | 9 | runtime tool lineage and write/read helpers |
 | `test_wave3_retrieval.py` | 15 | spread activation, CJK, fusion, time sorting |
+
+---
+
+## Functional Grouping
+
+### Curator
+
+- `test_memory_curator.py`: legacy-compatible curator behavior and cold-store lifecycle
+- `test_curator_pipeline.py`: canonical v1.5 curator action pipeline, orchestration, side effects, and boundary handling
+
+### Runtime and Contracts
+
+- `test_hooks.py`: hook state and lifecycle counters
+- `test_checkpoint.py` / `test_checkpoint_backup_failure.py`: checkpoint persistence and recovery edges
+- `test_schema_module.py`: runtime schema/registration contracts
+- `test_runtime_import_hygiene.py`: runtime recovery, compile-profile import-path regressions, tool handler late-binding dispatch
+- `test_lb.py`: late-binding and standalone loading safety
+
+### Store and Data
+
+- `test_store.py`, `test_core_data.py`, `test_store_module_split.py`, `test_async_writer.py`
+
+### Retrieval and Graph
+
+- `test_search.py`, `test_bm25.py`, `test_fusion_rerank.py`, `test_wave3_retrieval.py`, `test_reranker.py`, `test_reranker_exceptions.py`, `test_entity_extraction.py`, `test_graph.py`, `test_graph_operations.py`, `test_graph_distil_failure.py`
+
+### Integration and Host Surfaces
+
+- `test_bridge.py`, `test_dashboard.py`, `test_tool_handlers.py`, `test_e2e.py`, `test_host_contract_smoke.py`
 
 ---
 
@@ -89,7 +127,7 @@ Verified selection example:
 pytest tests/ -m "v14" -q
 ```
 
-Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **523 passed**.
+Observed result: **49 passed** (v1.4 exclusive subset). Full suite collection snapshot: **511 tests**.
 
 ---
 
@@ -103,7 +141,7 @@ Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **523 passed
 ### Retrieval and Ranking
 
 - `test_search.py` covers RRF fusion, MMR rerank, conflict detection, cache-key boundaries, graph wiring, explain payloads, and entity boost diagnostics.
-- `test_bm25.py` covers English, mixed-language, and CJK tokenization plus BM25 scoring semantics.
+- `test_bm25.py` covers English, mixed-language, and CJK tokenization plus BM25 scoring semantics, and index build failure graceful degradation.
 - `test_fusion_rerank.py` covers recency, effectiveness, Hebbian boost, supersedes penalties, channel normalization, and pipeline ranking sensitivity.
 - `test_reranker.py` covers lazy provider loading and second-stage reranker integration.
 - `test_reranker_exceptions.py` covers reranker OOM/API failure fallbacks and SDK shape compatibility.
@@ -120,11 +158,13 @@ Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **523 passed
 - `test_hooks.py` covers v0.16.0 enhanced hooks: `api_error`, `subagent_start/stop`, `session_reset`.
 - `test_tool_handlers.py` covers lineage-cycle prevention and host tool helper compatibility.
 - `test_async_writer.py` covers async writer `queue.Full` fallback and worker exception handling.
+- `test_runtime_import_hygiene.py` covers runtime recovery, compile-profile late-binding, and tool handler dispatch through `_lb`.
 
 ### Reflection, Curation, and Lifecycle
 
 - `test_reflect.py` covers reflection-engine heuristics, fact extraction, raw-chunk mode, full reflection, and reflect-log behavior.
-- `test_memory_curator.py` covers stale scan, expiry, supersedes-chain compaction, similarity merge, report generation, graph rebuild fail-open behavior, and session-state cleanup.
+- `test_curator_pipeline.py` covers the canonical curator pipeline: action isolation, orchestration, report persistence, fail-open boundaries, and backward-compatible wrappers.
+- `test_memory_curator.py` now covers the legacy compatibility slice: stale scan, archive wrappers, compact wrappers, cold-store append/load, restore, and no-graph cleanup.
 - `test_compaction.py` covers episode clustering, fallback summarisation, idempotency, and compact return-shape guarantees.
 
 ### Graph and API Surfaces
@@ -148,6 +188,7 @@ Observed result: **49 passed** (v1.4 exclusive subset). Full suite: **523 passed
 
 - `tests/pytest.ini` is the source of truth for marker registration.
 - `tests/conftest.py` is the source of truth for automatic marker assignment.
+- `tests/_helpers.py` provides shared mock classes and test utilities.
 - When adding new tests, prefer classifying them by functional surface first; add a `v14_*` style marker only when the test is part of a versioned acceptance slice.
 - Keep this document aligned to collected reality. The minimum refresh is:
   1. rerun `pytest tests --collect-only -q`

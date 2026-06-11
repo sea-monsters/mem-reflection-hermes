@@ -15,6 +15,10 @@ _SRH_MEMORY_WRITE_SCHEMA = {
         "pinned": {"type": "boolean", "description": "Pin the memory to the top"},
         "zone": {"type": "string", "description": "Memory zone (general, work, episode, core, or project:<name>)"},
         "supersedes": {"type": "array", "items": {"type": "string"}, "description": "IDs of memories this replaces"},
+        "supersedes_reason": {"type": "string", "description": "Reason this memory replaces earlier memories"},
+        "user_id": {"type": "string", "description": "Optional user scope filter"},
+        "agent_id": {"type": "string", "description": "Optional agent scope filter"},
+        "run_id": {"type": "string", "description": "Optional run scope filter"},
     },
     "required": ["body"],
 }
@@ -26,6 +30,8 @@ _SRH_MEMORY_SEARCH_SCHEMA = {
         "k": {"type": "integer", "description": "Maximum results to return (default 5)"},
         "zone": {"type": "string", "description": "Filter to a specific zone"},
         "include_history": {"type": "boolean", "description": "Include superseded memories"},
+        "explain": {"type": "boolean", "description": "Include score breakdown metadata"},
+        "filters": {"type": "object", "description": "Optional scope filters (user_id, agent_id, run_id). None means IS NULL (universally visible)."},
     },
     "required": ["query"],
 }
@@ -35,8 +41,9 @@ _SRH_MEMORY_DELETE_SCHEMA = {
     "properties": {
         "id": {"type": "string", "description": "Memory ID to delete"},
         "scope": {"type": "string", "enum": ["user", "project"], "description": "User or project scope"},
+        "filters": {"type": "object", "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
     },
-    "required": ["id"],
+    "required": [],
 }
 
 _SRH_PALACE_NAVIGATE_SCHEMA = {
@@ -70,7 +77,7 @@ _SRH_SKILL_QUERY_SCHEMA = {
 _SRH_COMPILE_PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
-        "mode": {"type": "string", "enum": ["profile", "summary", "stats"], "description": "Compilation mode"},
+        "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "description": "Compilation mode"},
     },
     "required": ["mode"],
 }
@@ -112,6 +119,18 @@ _SRH_GRAPH_VIZ_SCHEMA = {
         "depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
     },
     "required": [],
+}
+
+_SRH_MEMORY_HISTORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "Memory ID to trace history for"},
+        "max_depth": {"type": "integer", "description": "Max chain depth to follow (default 5, max 20)", "default": 5, "minimum": 1, "maximum": 20},
+        "include_events": {"type": "boolean", "description": "Include memory audit events in the response", "default": False},
+        "event_types": {"type": "array", "items": {"type": "string"}, "description": "Filter events to specific types (e.g. ['UPDATE', 'DELETE'])"},
+        "session_id": {"type": "string", "description": "Filter events to a specific session"},
+    },
+    "required": ["id"],
 }
 
 _SRH_MEMORY_HEALTH_SCHEMA = {

@@ -209,13 +209,13 @@ def _on_session_start(**kwargs) -> None:
             _run_full_reflection(ctx, entry.get("messages") or [])
 
         def _compaction_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
-            from .runtime_reflection import _compact_episode_zone as _compact
-            from . import _config_compaction as _cc
+            from ..reflection.runtime import _compact_episode_zone as _compact
+            from .. import _config_compaction as _cc
             if _cc():
                 _compact(mem_store, ctx)
 
         def _curator_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
-            from .memory_curator import _curator_enabled, _run_curator
+            from ..memory.curator import _curator_enabled, _run_curator
             if _curator_enabled(mem_store):
                 _run_curator(ctx, mem_store)
 
@@ -310,8 +310,8 @@ def _on_session_end(**kwargs) -> None:
         # ── Episode compaction (v1.1) ──────────────────────
         # Run after reflection to compact raw episode entries into summaries.
         try:
-            from .runtime_reflection import _compact_episode_zone as _compact
-            from . import _config_compaction as _cc
+            from ..reflection.runtime import _compact_episode_zone as _compact
+            from .. import _config_compaction as _cc
             if _cc():
                 if session_id:
                     _checkpoint_mark_pending_stage(session_id, "compaction", {
@@ -336,7 +336,7 @@ def _on_session_end(**kwargs) -> None:
 
         # ── Memory curator (v1.2) — runs after compaction ─────
         try:
-            from .memory_curator import _curator_enabled, _run_curator
+            from ..memory.curator import _curator_enabled, _run_curator
             mem_store = _lb("_get_mem_store")()
             if _curator_enabled(mem_store):
                 if session_id:
@@ -489,9 +489,9 @@ def _post_tool_call(**kwargs) -> None:
                 old_text = args.get("old_text", "")
                 entries_after = result_obj.get("entries", None)
 
-                from .memory_bridge import bridge_enabled as _bridge_enabled
+                from ..memory.bridge import bridge_enabled as _bridge_enabled
                 if _bridge_enabled():
-                    from .memory_bridge import mirror_builtin_to_plugin as _mirror
+                    from ..memory.bridge import mirror_builtin_to_plugin as _mirror
                     try:
                         _mirror(
                             action=action,
@@ -625,6 +625,11 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5,
     Returns deduplicated (memory_id, weight) pairs, sorted by weight descending.
     If zone_filter is provided, only returns neighbors whose zone matches.
     Gracefully returns empty list if graph data is not available or has no data.
+
+    Note: Graph expansion is scope-agnostic. Scope filtering (user_id/agent_id/run_id)
+    is applied to the primary search results, but graph neighbors may include memories
+    from different scopes. In multi-tenant scenarios, treat graph_expanded as hints
+    rather than authoritative results.
     """
     try:
         gm = _get_graph_mgr()

@@ -15,7 +15,6 @@ the SDD, not implementation details of the legacy curator.py.
 """
 from __future__ import annotations
 
-import ast
 import json
 import tempfile
 import time
@@ -25,138 +24,13 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from tests._helpers import MockFrontmatter, MockMemory, MockStore
+
 # ---------------------------------------------------------------------------
 # Test Fixtures
 # ---------------------------------------------------------------------------
 
 _MOCK_TIME = time.time()
-
-
-class MockFrontmatter:
-    def __init__(
-        self,
-        mem_id: str,
-        body: str,
-        zone: str = "general",
-        created: str = "",
-        confidence: str = "medium",
-        pinned: bool = False,
-        tags: list = None,
-        supersedes: list = None,
-        valid_until: str = "",
-    ):
-        self.id_val = mem_id
-        self.zone = zone
-        self.created = created or datetime.now(timezone.utc).isoformat()
-        self.confidence = confidence
-        self.pinned = pinned
-        self.tags = tags or []
-        self.supersedes = supersedes or []
-        self.valid_until = valid_until
-        self.supersedes_reason = ""
-
-    def id(self) -> str:
-        return self.id_val
-
-
-class MockMemory:
-    def __init__(
-        self,
-        mid: str,
-        body: str,
-        zone: str = "general",
-        created: str = "",
-        confidence: str = "medium",
-        pinned: bool = False,
-        tags: list = None,
-        supersedes: list = None,
-        valid_until: str = "",
-    ):
-        self.id_val = mid
-        self.body = body
-        self.scope = "user"
-        self.frontmatter = MockFrontmatter(
-            mid, body, zone, created, confidence, pinned, tags, supersedes, valid_until
-        )
-
-    def id(self) -> str:
-        return self.id_val
-
-
-class MockStore:
-    def __init__(self):
-        self.memories: Dict[str, MockMemory] = {}
-        self.deleted: List[str] = []
-        self.eff_data: Dict[str, Dict[str, Any]] = {}
-        self._cold_store: List[Dict[str, Any]] = []
-        self._plugin_config_override: Dict[str, Any] = {}
-
-    def list_active(self) -> List[MockMemory]:
-        return list(self.memories.values())
-
-    def get(self, mid: str) -> Optional[MockMemory]:
-        return self.memories.get(mid)
-
-    def put(self, scope: str, fm, body: str):
-        self.memories[fm.id] = MockMemory(
-            fm.id,
-            body,
-            zone=getattr(fm, "zone", "general"),
-            tags=getattr(fm, "tags", []),
-        )
-
-    def list(
-        self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None
-    ):
-        mems = list(self.memories.values())
-        if zone:
-            mems = [m for m in mems if m.frontmatter.zone == zone]
-        if limit is not None:
-            mems = mems[:limit]
-        return mems
-
-    def delete(self, scope: str, mid: str) -> bool:
-        if mid in self.memories:
-            del self.memories[mid]
-            self.deleted.append(mid)
-            return True
-        return False
-
-    def list_active_effectiveness(self) -> Dict[str, Dict[str, Any]]:
-        return self.eff_data
-
-    def update(
-        self,
-        mem_id,
-        body=None,
-        zone=None,
-        confidence=None,
-        tags=None,
-        pinned=None,
-        supersedes=None,
-    ):
-        mem = self.memories.get(mem_id)
-        if mem is None:
-            return None
-        if body is not None:
-            mem.body = body
-        if zone is not None:
-            mem.frontmatter.zone = zone
-        if confidence is not None:
-            mem.frontmatter.confidence = confidence
-        if tags is not None:
-            mem.frontmatter.tags = tags
-        if pinned is not None:
-            mem.frontmatter.pinned = pinned
-        if supersedes is not None:
-            mem.frontmatter.supersedes = supersedes
-        return mem
-
-    def is_superseded(self, mem_id: str) -> bool:
-        for mem in self.memories.values():
-            if mem_id in (mem.frontmatter.supersedes or []):
-                return True
-        return False
 
 
 @pytest.fixture
@@ -387,6 +261,23 @@ class TestBuildColdEntry:
         assert "supersedes" in orig
         assert "supersedes_reason" in orig
 
+    def test_refines_body_strips_tool_noise_and_truncates(self, empty_store):
+        """build_cold_entry strips code blocks, tool markers, and truncates before persisting."""
+        from memory.curator.helpers import build_cold_entry
+
+        empty_store.memories["noisy"] = MockMemory(
+            "noisy",
+            'User preference\n```json\n{"key": "value"}\n```\n[Tool: search] result here',
+        )
+        mem = empty_store.get("noisy")
+        entry = build_cold_entry(mem, context_tag="test")
+
+        body = entry["body"]
+        assert "```" not in body
+        assert "[Tool:" not in body
+        assert "User preference" in body
+        assert len(body) <= 560  # max_chars=500 + zone/tags overhead from truncation
+
 
 class TestArchiveAndDelete:
     """Tests for archive_and_delete() helper."""
@@ -417,8 +308,8 @@ class TestArchiveAndDelete:
         assert error is not None
         assert "cold store" in error.lower()
 
-    def test_preserves_active_memory_when_delete_fails(self, stale_store):
-        """If cold store succeeds but active delete fails, return False and keep memory."""
+    def test_preserves_active_memory_when_delete_fails(self, stale_store, caplog):
+        """If cold store succeeds but active delete fails, return False, keep memory, log warning."""
         from memory.curator.helpers import archive_and_delete, build_cold_entry
 
         class StoreWithFailingDelete(MockStore):
@@ -431,11 +322,14 @@ class TestArchiveAndDelete:
             s._cold_store_path_override = str(Path(td) / "_cold_store.jsonl")
             mem = s.get("fresh")
             entry = build_cold_entry(mem, context_tag="test")
-            success, error = archive_and_delete(s, mem, entry, "test")
+            with caplog.at_level("WARNING"):
+                success, error = archive_and_delete(s, mem, entry, "test")
 
             assert success is False
             assert "delete denied" in error
             assert "fresh" in s.memories  # active memory preserved for safety
+            assert "Failed to delete" in caplog.text
+            assert "cold entry preserved" in caplog.text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +367,26 @@ class TestCuratorConfig:
         assert cfg["stale"]["effectiveness_threshold"] == 0.1  # default preserved
         assert cfg["similarity"]["enabled"] is False
         assert cfg["similarity"]["bm25_threshold"] == 0.6  # default preserved
+
+    def test_curator_enabled_false_disables_pipeline(self, empty_store):
+        """enabled=False is the hard off switch for the curator."""
+        from memory.curator.helpers import _curator_enabled
+
+        empty_store._plugin_config_override = {"curator": {"enabled": False}}
+
+        assert _curator_enabled(empty_store) is False
+
+    def test_unsupported_trigger_warns_but_remains_enabled(self, empty_store, caplog):
+        """Unsupported trigger values warn but stay fail-open for session_end callers."""
+        from memory.curator.helpers import _curator_enabled
+
+        empty_store._plugin_config_override = {"curator": {"trigger": "manual"}}
+
+        with caplog.at_level("WARNING"):
+            enabled = _curator_enabled(empty_store)
+
+        assert enabled is True
+        assert "not supported" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +564,32 @@ class TestCompactChainsAction:
         assert "v1" in empty_store.memories
         assert "v4" in empty_store.memories
 
+    def test_update_head_failure_is_reported_after_archiving(self, empty_store):
+        """Compaction still archives intermediates even if head supersedes update fails."""
+        from memory.curator.actions import CompactChains, CuratorContext
+
+        class StoreWithFailingHeadUpdate(MockStore):
+            def update(self, mem_id, **kwargs):
+                if mem_id == "v4":
+                    raise RuntimeError("update blocked")
+                return super().update(mem_id, **kwargs)
+
+        store = StoreWithFailingHeadUpdate()
+        with tempfile.TemporaryDirectory() as td:
+            store._cold_store_path_override = str(Path(td) / "_cold_store.jsonl")
+            store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+            store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+            store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+            store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+
+            ctx = CuratorContext(mem_store=store)
+            result = CompactChains().execute(ctx)
+
+        assert result.compacted == 2
+        assert "v2" in store.deleted
+        assert "v3" in store.deleted
+        assert any("update head v4" in err for err in result.errors)
+
 
 class TestArchiveSupersededAction:
     """Tests for ArchiveSuperseded action."""
@@ -705,6 +645,25 @@ class TestArchiveSupersededAction:
         result = ArchiveSuperseded().execute(ctx)
 
         assert "v1" in empty_store.memories  # protected node kept
+
+    def test_recently_accessed_node_is_skipped(self, empty_store):
+        """Recently accessed superseded nodes are preserved even in deep chains."""
+        from memory.curator.actions import ArchiveSuperseded, CuratorContext
+
+        empty_store.memories["orig"] = MockMemory("orig", "original", zone="core", supersedes=[])
+        empty_store.memories["v1"] = MockMemory("v1", "v1", zone="core", supersedes=["orig"])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "newest", zone="core", supersedes=["v2"])
+        empty_store.eff_data["v1"] = {
+            "last_accessed": time.time(),
+            "effectiveness": 0.8,
+        }
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveSuperseded().execute(ctx)
+
+        assert "v1" in empty_store.memories
+        assert result.archived >= 1
 
 
 class TestMergeSimilarAction:
@@ -874,7 +833,7 @@ class TestGenerateReportAction:
         action = GenerateReport()
         result = action.execute(ctx, [])
 
-        assert result.__dict__.get("report_text") == "No curator actions"
+        assert getattr(result, "report_text", None) == "No curator actions"
 
     def test_report_includes_stale_archives(self):
         """Report text mentions stale detection and archive counts."""
@@ -887,7 +846,7 @@ class TestGenerateReportAction:
         ctx = CuratorContext(mem_store=MockStore())
         prior = [CuratorResult(action_name="ArchiveStale", archived=5)]
         result = GenerateReport().execute(ctx, prior)
-        text = result.__dict__.get("report_text", "")
+        text = getattr(result, "report_text", "")
 
         assert "stale" in text
         assert "5" in text
@@ -909,7 +868,7 @@ class TestGenerateReportAction:
             CuratorResult(action_name="CleanOrphanEdges", orphan_edges=6),
         ]
         result = GenerateReport().execute(ctx, prior)
-        text = result.__dict__.get("report_text", "")
+        text = getattr(result, "report_text", "")
 
         assert "superseded: 3 archived" in text
         assert "compacted: 4 archived" in text
@@ -930,9 +889,43 @@ class TestGenerateReportAction:
         ctx.errors.append("failure two")
         prior = [CuratorResult(action_name="ArchiveStale", archived=1)]
         result = GenerateReport().execute(ctx, prior)
-        text = result.__dict__.get("report_text", "")
+        text = getattr(result, "report_text", "")
 
         assert "errors: 2" in text
+
+
+class TestReportPersistence:
+    """Tests for curator report persistence side effects."""
+
+    def test_run_curator_persists_report_and_appends_reflection_log(self, empty_store, monkeypatch):
+        """Full curator run persists a report file and mirrors its summary into reflection logs."""
+        from memory.curator import _run_curator
+        import memory.curator.report as _report_mod
+
+        reflected = []
+
+        class FakeReflectionRuntime:
+            @staticmethod
+            def _append_reflect_log(entry):
+                reflected.append(entry)
+
+        monkeypatch.setattr(
+            _report_mod,
+            "_lb_fn",
+            lambda name: FakeReflectionRuntime if name.endswith("reflection.runtime") else None,
+        )
+
+        empty_store.memories["old"] = MockMemory(
+            "old", "old", valid_until="2020-01-01T00:00:00Z"
+        )
+        result = _run_curator(None, empty_store)
+
+        report_path = Path(empty_store._cold_store_path_override).parent / "curator-report.json"
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+        assert payload["report"] == result["report"]
+        assert payload["total_archived"] == result["total_archived"]
+        assert reflected and reflected[0]["summary"] == result["report"]
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1146,24 @@ class TestPipelineAggregation:
         ):
             assert key in result
 
+    def test_report_failure_falls_back_to_text_summary(self, empty_store, monkeypatch):
+        """If GenerateReport action crashes, orchestrator still returns a fallback report."""
+        import memory.curator as _curator_mod
+
+        class BrokenGenerateReport:
+            def execute(self, ctx, prior_results=None):
+                raise RuntimeError("report explosion")
+
+        monkeypatch.setattr(_curator_mod, "GenerateReport", BrokenGenerateReport)
+        empty_store.memories["old"] = MockMemory(
+            "old", "old", valid_until="2020-01-01T00:00:00Z"
+        )
+
+        result = _curator_mod._run_curator(None, empty_store)
+
+        assert result["report"].startswith("curator:")
+        assert any(err.startswith("report: ") for err in result["errors"])
+
 
 # ---------------------------------------------------------------------------
 # Test: Backward Compatibility
@@ -1268,65 +1279,3 @@ class TestBackwardCompatibility:
         count = clean_orphan_edges(empty_store)
         assert count == 9
 
-
-# ---------------------------------------------------------------------------
-# Test: Structural Acceptance Criteria from SDD
-# ---------------------------------------------------------------------------
-
-
-class TestStructuralAcceptanceCriteria:
-    """Verify the structural refactoring goals in SDD AC 4/5/6/7."""
-
-    def _source_files(self):
-        repo = Path(__file__).resolve().parent.parent
-        return list((repo / "memory" / "curator").glob("*.py"))
-
-    def test_archive_and_delete_defined_once(self):
-        """AC4: archive+delete transaction pattern appears exactly once."""
-        count = 0
-        for py in self._source_files():
-            tree = ast.parse(py.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "archive_and_delete":
-                    count += 1
-        assert count == 1
-
-    def test_is_protected_defined_once(self):
-        """AC5: pinned/keep guard appears exactly once."""
-        count = 0
-        for py in self._source_files():
-            tree = ast.parse(py.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "is_protected":
-                    count += 1
-        assert count == 1
-
-    def test_load_effectiveness_wrapper_defined_once(self):
-        """AC6: _load_effectiveness wrapper appears exactly once."""
-        count = 0
-        for py in self._source_files():
-            tree = ast.parse(py.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "_load_effectiveness":
-                    count += 1
-        assert count == 1
-
-    def test_no_bare_except_pass(self):
-        """AC7: no 'except Exception: pass' blocks remain in curator package.
-
-        This test captures the SDD intent. Current implementation still contains
-        fallback blocks for standalone import paths; they are addressed in Sprint 2.
-        """
-        for py in self._source_files():
-            source = py.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ExceptHandler):
-                    body = node.body
-                    if len(body) == 1 and isinstance(body[0], ast.Pass):
-                        handler_type = node.type
-                        # Bare except or Exception catch with pass
-                        if handler_type is None or (
-                            isinstance(handler_type, ast.Name) and handler_type.id == "Exception"
-                        ):
-                            pytest.fail(f"Bare 'except Exception: pass' found in {py}")

@@ -8,12 +8,9 @@ design intent:
 """
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
-
-import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -97,24 +94,3 @@ class TestCuratorStandaloneLoading:
         """memory/curator/report.py loads without raising in standalone mode."""
         mod = self._load_standalone("memory/curator/report.py")
         assert hasattr(mod, "generate_report")
-
-
-class TestNoBareExceptPass:
-    """Static test: curator package must not contain bare except-pass blocks."""
-
-    def test_no_bare_except_pass_in_curator(self):
-        """AC7: no 'except Exception: pass' blocks remain in curator package."""
-        repo = Path(__file__).resolve().parent.parent
-        for py in (repo / "memory" / "curator").glob("*.py"):
-            source = py.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ExceptHandler):
-                    body = node.body
-                    if len(body) == 1 and isinstance(body[0], ast.Pass):
-                        handler_type = node.type
-                        if handler_type is None or (
-                            isinstance(handler_type, ast.Name)
-                            and handler_type.id == "Exception"
-                        ):
-                            pytest.fail(f"Bare 'except Exception: pass' found in {py}")

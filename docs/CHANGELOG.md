@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.6 — Memory Event Ledger & Scoped Filters
+
+### Memory Event Ledger (Wave 1)
+
+- **SQLite `memory_events` table**: Tracks ADD/UPDATE/DELETE/SUPERSEDE/PIN/UNPIN events with old/new body, old/new frontmatter, session_id, and actor_id.
+- **`_record_memory_event()`**: Safe JSON serialization with datetime handling and 8KB frontmatter truncation to prevent oversized rows.
+- **`get_memory_events()`**: Query events filtered by `event_types`, `session_id`, and `limit`.
+- **`get_memory_history()`**: Combines supersedes chain + optional event timeline for full memory provenance.
+- **Transaction awareness**: Events are written atomically within the same SQLite connection as the memory mutation. Rollback-safe: if the outer transaction is rolled back, neither the memory nor its events persist.
+- **Tool integration**: `srh_memory_history(..., include_events=True, event_types=[...], session_id=...)` exposes audit trail to agents.
+
+### Scoped Filters (Wave 2)
+
+- **Three scope columns**: `user_id`, `agent_id`, `run_id` on the `memories` table. NULL = universally visible.
+- **AND logic for combined filters**: `{"user_id": "u1", "agent_id": "a1"}` matches only memories where BOTH conditions hold.
+- **`filters` parameter** on `MemoryStore.list()`, `SearchIndex.search()`, `SearchIndex.search_explain()`, and `MemoryStore.delete_by_filters()`.
+- **NULL matching**: `filters={"user_id": None}` uses `IS NULL` to find universally-visible memories.
+- **Unknown key rejection**: `list()` raises `ValueError` for unknown filter keys (e.g. `user_od` typo).
+- **Tool schema updates**:
+  - `srh_memory_write` accepts `user_id`, `agent_id`, `run_id`
+  - `srh_memory_search` accepts `filters`
+  - `srh_memory_delete` accepts `filters` for batch delete (`id` is optional when `filters` is provided)
+  - `srh_memory_history` accepts `include_events`, `event_types`, `session_id`
+- **Backward compatibility**: v1.5 memories without scope fields remain discoverable (columns default to NULL).
+
+### Code Review Fixes (v1.6)
+
+- **Schema unification**: `runtime/registration.py` imports all 13 schemas from `runtime/schemas.py` (was inline in `runtime/tools.py::register()`).
+- **Search response scope fields**: `srh_memory_search` results now include `user_id`/`agent_id`/`run_id` when non-None.
+- **History frontmatter deserialization**: `srh_memory_history` parses `old_frontmatter`/`new_frontmatter` JSON strings into objects.
+- **Event frontmatter truncation warning**: Logs `logger.warning` when event frontmatter exceeds 8KB and is truncated.
+- **Scope clause helper**: Extracted `_build_scope_clauses()` to unify `list()` and `delete_by_filters()` logic.
+- **Empty string normalization**: `MemoryFrontmatter.to_dict()` treats empty-string scope values as `None`.
+- **Explicit column select**: `delete_by_filters()` uses explicit column list instead of `SELECT *`.
+
+### Infrastructure
+
+- **Test count**: 523 → 553 tests (30 new tests across event ledger + scoped filters)
+- **Tool count**: 12 → 13 (`srh_memory_history` registered through canonical path)
+- **Zero regressions**: All v1.5 features preserved unchanged
+
+---
+
 ## v1.5 — Module Refactoring & Composable Curator Pipeline
 
 ### Core Module Split (v1.5)

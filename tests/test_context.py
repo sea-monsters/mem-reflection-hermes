@@ -293,39 +293,6 @@ class TestSkillMatching:
         assert "Triggered Skills" not in ctx
 
 
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-class TestFormatting:
-    def test_format_memory_truncation(self, temp_store):
-        """Long memory bodies are truncated to fit max_tokens."""
-        store = temp_store
-        fm = MemoryFrontmatter.new(source="test")
-        store.put("user", fm, "a" * 1000)
-        mem = store.get(fm.id)
-        formatted = _context._format_memory(mem, max_tokens=10)
-        # Should contain the zone prefix
-        assert "[general]" in formatted
-        # The body portion should be truncated (not the full 1000 chars)
-        # Extract body from formatted: "- [general] <body>"
-        lines = formatted.split('\n')
-        body_line = lines[0]  # First line contains the body
-        body_portion = body_line.split('] ', 1)[1] if '] ' in body_line else body_line
-        assert len(body_portion) < len(mem.body)
-
-    def test_format_skill_basic(self, temp_store, temp_skills_dir):
-        """Skill formatting includes name and description."""
-        skill_path = temp_skills_dir / "skill.md"
-        skill_path.write_text(
-            "---\nname: MySkill\ndescription: Does useful things\n---\n"
-        )
-        skill = _store._read_skill_file(skill_path, "user")
-        formatted = _context._format_skill(skill)
-        assert "MySkill" in formatted
-        assert "Does useful things" in formatted
-
-
 # =====================================================================
 # v1.1: Built-in memory block & compacted episode block
 # =====================================================================

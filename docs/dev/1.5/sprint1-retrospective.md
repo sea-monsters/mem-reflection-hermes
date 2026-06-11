@@ -4,6 +4,8 @@
 **Status**: Completed
 **Tests**: 446 passed, 0 failed (413 legacy + 33 new)
 
+**当前注记（2026-06-11）**: 这是 Sprint 1 的历史闭环记录。当前工作树中的测试状态已经演进到 `510 passed`，并且 curator 测试集已按 canonical/legacy 兼容层重新分层。
+
 ## What was delivered
 
 - `memory/curator.py` (1,124 deletions) replaced by `memory/curator/` package:

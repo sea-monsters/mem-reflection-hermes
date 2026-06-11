@@ -1,12 +1,12 @@
 # Tools Reference
 
-Current SRH tool surface: **12 registered tools** (v1.5).
+Current SRH tool surface: **13 registered tools** (v1.6).
 
-The 12 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
+The 13 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 
 > **Graph semantics note**: The runtime graph layer is an **associative co-activation graph** (Hebbian), not an entity-relation knowledge graph. Edges mean "these memories were used together", not "these entities have a typed factual relationship".
 
-## Memory Operations (3)
+## Memory Operations (4)
 
 ### `srh_memory_search`
 
@@ -16,7 +16,10 @@ Search active memories by relevance.
 srh_memory_search(query="Python error handling", k=5)
 srh_memory_search(query="部署流程", k=5, zone="work")  # zone filter
 srh_memory_search(query="Python error handling", k=5, explain=True)  # v1.4: return score breakdown
+srh_memory_search(query="alpha", k=5, filters={"user_id": "u1"})  # v1.6: scoped filter
 ```
+
+**v1.6 scoped filters**: Pass `filters={"user_id": ..., "agent_id": ..., "run_id": ...}` to restrict results. `None` means `IS NULL` (universally visible). Combined filters use AND logic.
 
 ### `srh_memory_write`
 
@@ -31,16 +34,37 @@ srh_memory_write(
     pinned=True,
     supersedes=[],
     zone="general",
+    user_id="alice",
+    agent_id="claude",
+    run_id="sess-001",
 )
 ```
 
+**v1.6 scope fields**: `user_id`, `agent_id`, and `run_id` are optional string fields stored in both frontmatter and the SQLite index. Memories without scope fields are universally visible (NULL in DB).
+
 ### `srh_memory_delete`
 
-Delete a memory by ID.
+Delete a memory by ID, or batch-delete by scope filters.
 
 ```python
 srh_memory_delete(id="mem_abc123", scope="user")
+srh_memory_delete(id="batch", filters={"run_id": "sess-001"})  # v1.6: batch delete
 ```
+
+**v1.6 batch delete**: When `filters` is provided, the tool deletes all memories matching the scope filter and returns `{deleted_count: N}`. The `id` field is still required in the schema for backward compatibility.
+
+### `srh_memory_history`
+
+Trace the supersedes chain (version lineage) for a memory.
+
+```python
+srh_memory_history(id="mem_abc123", max_depth=5)
+srh_memory_history(id="mem_abc123", include_events=True)  # v1.6: audit events
+srh_memory_history(id="mem_abc123", include_events=True, event_types=["UPDATE", "DELETE"])
+srh_memory_history(id="mem_abc123", include_events=True, session_id="sess-001")
+```
+
+**v1.6 audit events**: When `include_events=True`, the response includes a chronological list of ADD/UPDATE/DELETE/SUPERSEDE/PIN/UNPIN events. Filter by `event_types` or `session_id` to narrow the timeline.
 
 ## Palace Navigation (1)
 
@@ -72,8 +96,8 @@ Compile memories into a structured profile.
 
 ```python
 srh_compile_profile(mode="profile")       # profile.md format
-srh_compile_profile(mode="summary")       # brief summary
-srh_compile_profile(mode="stats")         # statistics only
+srh_compile_profile(mode="palace_index")  # compiled palace index
+srh_compile_profile(mode="zone")          # per-zone summaries
 ```
 
 ## Skills (1)
@@ -144,9 +168,10 @@ Returns:
 
 | Tool | Category | Handler | Notes |
 |------|----------|---------|-------|
-| `srh_memory_search` | Memory | `runtime/tools.py` | |
-| `srh_memory_write` | Memory | `runtime/tools.py` | |
-| `srh_memory_delete` | Memory | `runtime/tools.py` | |
+| `srh_memory_search` | Memory | `runtime/tools.py` | v1.6: `filters` for scoped queries |
+| `srh_memory_write` | Memory | `runtime/tools.py` | v1.6: `user_id`/`agent_id`/`run_id` |
+| `srh_memory_delete` | Memory | `runtime/tools.py` | v1.6: `filters` for batch delete |
+| `srh_memory_history` | Memory | `runtime/tools.py` | v1.6: `include_events` + event filtering |
 | `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall` |
 | `srh_reflect_now` | Reflection | `runtime/tools.py` | |
 | `srh_skill_query` | Skills | `runtime/tools.py` | Delegates to `_tool_srh_skill_search` |
@@ -157,4 +182,4 @@ Returns:
 | `srh_graph_viz` | Graph | `runtime/graph.py` | |
 | `srh_memory_health` | Health | `runtime/graph.py` | |
 
-**7 base tools** live in `runtime/tools.py`; **5 graph/health tools** live in `runtime/graph.py`.
+**8 base tools** live in `runtime/tools.py`; **5 graph/health tools** live in `runtime/graph.py`.

@@ -25,6 +25,7 @@ def register(ctx: Any) -> None:
         _SRH_GRAPH_VIZ_SCHEMA,
         _SRH_MEMORY_DELETE_SCHEMA,
         _SRH_MEMORY_HEALTH_SCHEMA,
+        _SRH_MEMORY_HISTORY_SCHEMA,
         _SRH_MEMORY_SEARCH_SCHEMA,
         _SRH_MEMORY_WRITE_SCHEMA,
         _SRH_PALACE_NAVIGATE_SCHEMA,
@@ -34,6 +35,7 @@ def register(ctx: Any) -> None:
     from ..runtime.tools import (
         srh_compile_profile,
         srh_memory_delete,
+        srh_memory_history,
         srh_memory_search,
         srh_memory_write,
         srh_palace_navigate,
@@ -76,6 +78,13 @@ def register(ctx: Any) -> None:
         schema=_SRH_MEMORY_DELETE_SCHEMA,
         handler=srh_memory_delete,
         description="Delete a memory by ID",
+    )
+    ctx.register_tool(
+        name="srh_memory_history",
+        toolset=_TOOLSET,
+        schema=_SRH_MEMORY_HISTORY_SCHEMA,
+        handler=srh_memory_history,
+        description="Trace supersedes chain history",
     )
     ctx.register_tool(
         name="srh_palace_navigate",

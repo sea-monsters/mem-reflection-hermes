@@ -116,15 +116,21 @@ class TestStepDecay:
         # After 100 steps at λ=0.995, factor ≈ 0.606; 0.06 * 0.606 = 0.036 < 0.05
         assert result["edges_pruned"] > 0
 
-    def test_step_counter_incremented(self, temp_graph_index):
-        """Each spread() call increments _step_counter."""
+    def test_spread_accumulates_decay_steps(self, temp_graph_index):
+        """Each spread() call adds steps that step_decay reports as steps_since_last_decay."""
         gi = temp_graph_index
         gi.associate(["a", "b"])
-        assert gi._step_counter == 0
+
+        # spread once → decay should report at least 1 step
         gi.spread(["a"])
-        assert gi._step_counter == 1
+        r1 = gi.step_decay()
+        assert r1["steps_since_last_decay"] >= 1
+
+        # spread twice more → next decay should report 2 steps (reset after first decay)
         gi.spread(["a"])
-        assert gi._step_counter == 2
+        gi.spread(["a"])
+        r2 = gi.step_decay()
+        assert r2["steps_since_last_decay"] == 2
 
     def test_multiple_decay_calls_cumulative(self, temp_graph_index):
         """Multiple step_decay calls use cumulative steps since last decay."""

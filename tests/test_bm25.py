@@ -200,3 +200,47 @@ class TestBM25Scoring:
         docs = self._make_docs(["alpha beta gamma"])
         results = _bm25_search_scored(docs, "xyz", k=5)
         assert results == []
+
+
+class TestBM25IndexBuildFailure:
+    """Verify SearchIndex degrades gracefully when BM25 index build fails."""
+
+    def test_bm25_build_failure_returns_empty_bm25_channel(self, temp_store):
+        """When bm25s raises during index build, BM25 search returns empty dict without crashing."""
+        from core.search import SearchIndex
+
+        fm = MemoryFrontmatter.new(source="test")
+        temp_store.put("user", fm, "User prefers dark mode in all applications")
+
+        si = SearchIndex(temp_store)
+
+        # Monkeypatch bm25s.BM25 to raise, simulating corrupt state
+        import bm25s
+        original_bm25 = bm25s.BM25
+
+        def _failing_bm25(*args, **kwargs):
+            raise RuntimeError("simulated corrupt index data")
+
+        bm25s.BM25 = _failing_bm25
+        try:
+            si._bm25_retriever = None  # force rebuild
+            result = si._bm25_search_bm25s("dark mode", k=5)
+            assert result == {}  # graceful empty, no exception
+        finally:
+            bm25s.BM25 = original_bm25
+
+    def test_search_still_returns_results_without_bm25(self, temp_store, monkeypatch):
+        """Full search() works (possibly with lower quality) when BM25 channel is disabled."""
+        from core.search import SearchIndex
+
+        fm = MemoryFrontmatter.new(source="test")
+        temp_store.put("user", fm, "User prefers dark mode in all applications")
+
+        si = SearchIndex(temp_store)
+
+        # Ensure BM25 channel fails
+        monkeypatch.setattr(si, "_ensure_bm25_index", lambda: False)
+
+        results = si.search("dark mode", k=5)
+        # Should still return results via embedding channel (or empty, but not crash)
+        assert isinstance(results, list)

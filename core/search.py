@@ -464,6 +464,7 @@ class SearchIndex:
         hebbian_beta: float = 0.0,
         include_history: bool = False,
         fusion_mode: str = "rrf",
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> List[LoadedMemory]:
         """Return ranked memories only."""
         return self._search_impl(
@@ -478,6 +479,7 @@ class SearchIndex:
             include_history=include_history,
             fusion_mode=fusion_mode,
             explain=False,
+            filters=filters,
         )
 
     def search_explain(
@@ -492,6 +494,7 @@ class SearchIndex:
         hebbian_beta: float = 0.0,
         include_history: bool = False,
         fusion_mode: str = "rrf",
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict[str, Any]:
         """Return ranked memories plus explainable score components."""
         return self._search_impl(
@@ -506,6 +509,7 @@ class SearchIndex:
             include_history=include_history,
             fusion_mode=fusion_mode,
             explain=True,
+            filters=filters,
         )
 
     def _search_impl(
@@ -521,6 +525,7 @@ class SearchIndex:
         include_history: bool = False,
         fusion_mode: str = "rrf",
         explain: bool = False,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Any:
         """Three-layer retrieval: Recall → Fusion → Rerank.
 
@@ -531,6 +536,7 @@ class SearchIndex:
             hebbian_beta: Hebbian boost coefficient (default 0 = off)
         """
         normalized_zone = zone.lower().strip() if zone else None
+        filter_tuple = tuple(sorted((str(k), str(v or "")) for k, v in (filters or {}).items()))
         cache_key = (
             query.lower().strip(),
             k,
@@ -542,6 +548,7 @@ class SearchIndex:
             gamma,
             delta,
             hebbian_beta,
+            filter_tuple,
         )
         if not explain:
             with self._cache_lock:
@@ -549,10 +556,13 @@ class SearchIndex:
                 if cached is not None:
                     return cached
 
+        list_kwargs: Dict[str, Any] = {"filters": filters}
+        if normalized_zone:
+            list_kwargs["zone"] = normalized_zone
         if include_history:
-            active = self.store.list(zone=normalized_zone) if normalized_zone else self.store.list()
+            active = self.store.list(**list_kwargs)
         else:
-            active = self.store.list(zone=normalized_zone, active_only=True) if normalized_zone else self.store.list_active()
+            active = self.store.list(active_only=True, **list_kwargs)
         if not active:
             if explain:
                 return {"results": [], "explain": {}, "meta": {"query": query, "k": k, "fusion_mode": fusion_mode}}
@@ -770,14 +780,15 @@ class SearchIndex:
                 "results": results,
                 "explain": {mem.id(): explain_map.get(mem.id(), {}) for mem in results},
                 "meta": {
-                "query": query,
-                "k": k,
-                "zone": normalized_zone,
-                "include_history": include_history,
-                "fusion_mode": fusion_mode,
-                "hebbian_beta": hebbian_beta,
-                "query_entities": query_entities,
-                "backend_capabilities": backend_caps,
+                    "query": query,
+                    "k": k,
+                    "zone": normalized_zone,
+                    "include_history": include_history,
+                    "fusion_mode": fusion_mode,
+                    "hebbian_beta": hebbian_beta,
+                    "query_entities": query_entities,
+                    "backend_capabilities": backend_caps,
+                    "applied_filters": filters,
                 },
             }
         with self._cache_lock:

@@ -85,6 +85,11 @@ _spec_hooks.loader.exec_module(_hooks)
 @pytest.fixture(autouse=True)
 def _clear_session_states(monkeypatch):
     """Clear global session state before each test."""
+    monkeypatch.setattr(_hooks, "_checkpoint_clear_session_state", lambda _session_id: None)
+    monkeypatch.setattr(_hooks, "_checkpoint_snapshot_session_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_mark_pending_stage", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_mark_stage_completed", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_recover_pending_work", lambda **_kwargs: {})
     with _hooks._session_states_lock:
         _hooks._session_states.clear()
     yield
