@@ -104,6 +104,9 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
         "valid_until": m.frontmatter.valid_until,
         "context_scope": m.frontmatter.context_scope,
         "source": m.frontmatter.source,
+        "user_id": getattr(m.frontmatter, "user_id", None),
+        "agent_id": getattr(m.frontmatter, "agent_id", None),
+        "run_id": getattr(m.frontmatter, "run_id", None),
     }
 
 
@@ -237,15 +240,25 @@ async def list_memories(
     zone: Optional[str] = None,
     query: Optional[str] = None,
     sort: Literal["rank", "created", "confidence", "zone"] = "rank",
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ):
-    """List memories with optional zone filter, search, and sorting."""
-    memories = _get_store().list_active()
+    """List memories with optional zone, search, sorting, and scope filters."""
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    if query:
+        memories = _get_store().search(query, k=100, filters=filters or None)
+    else:
+        memories = _get_store().list_active(filters=filters or None)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
-    if query:
-        memories = _get_store().search(query, k=100)
-        if zone:
-            memories = [m for m in memories if m.frontmatter.zone == zone]
 
     sort_key = {
         "rank": lambda m: getattr(m.frontmatter, "rank", 0),
@@ -359,21 +372,28 @@ async def get_graph(
     zone: Optional[str] = None,
     min_weight: float = 0.1,
     include_supersedes: bool = True,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ):
     """Return the memory graph with real Hebbian edges from GraphIndex.
 
-    v0.9.2: Now includes:
-    - Hebbian co_occurs edges from SQLite graph_store
-    - SUPERSEDES edges from graph_store
-    - Skill tag overlap edges (computed)
-    - PageRank scores on nodes
+    v1.6: Optionally filter nodes by scope (user_id/agent_id/run_id).
     """
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     seen_nodes: set = set()
 
-    # Get all active memories as nodes
-    memories = _get_store().list_active()
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    # Get active memories as nodes, optionally scoped
+    memories = _get_store().list_active(filters=filters or None)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
 
@@ -640,9 +660,21 @@ async def list_reflection_audit(limit: int = Query(100, ge=1, le=1000), decision
 # ---------------------------------------------------------------------------
 
 @router.get("/stats")
-async def get_stats():
-    """Return aggregate statistics."""
-    memories = _get_store().list_active()
+async def get_stats(
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+):
+    """Return aggregate statistics, optionally scoped."""
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    memories = _get_store().list_active(filters=filters or None)
     zones: Dict[str, int] = {}
     for m in memories:
         z = m.frontmatter.zone or "general"

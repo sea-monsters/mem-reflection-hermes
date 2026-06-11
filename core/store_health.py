@@ -5,11 +5,14 @@ Extracted from core/store.py to keep the main store module under 800 lines.
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Set
 
 if TYPE_CHECKING:
     from .store import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 
 def health_metrics(store: "MemoryStore") -> Dict[str, Any]:
@@ -44,8 +47,9 @@ def health_metrics(store: "MemoryStore") -> Dict[str, Any]:
                 if len(neighbors) > 1:
                     dup_clusters += 1
                     seen_ids.update(neighbors)
-    except Exception:
+    except Exception as e:
         from .tokenization import _tokenise
+        logger.warning("MinHash duplicate detection failed, falling back to Jaccard: %s", e)
         active_mems = store.list_active()
         seen_ids: Set[str] = set()
         token_sets: Dict[str, Set[str]] = {}

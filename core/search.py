@@ -354,23 +354,40 @@ class SearchIndex:
                 logger.info("Embedding index build failed: %s", e)
                 return False
 
-    def _embed_search(self, query: str, k: int) -> Optional[Dict[str, float]]:
-        """Embedding-based search returning {memory_id: cosine_similarity}."""
+    def _embed_search(
+        self, query: str, k: int, filters: Optional[Dict[str, Optional[str]]] = None
+    ) -> Optional[Dict[str, float]]:
+        """Embedding-based search returning {memory_id: cosine_similarity}.
+
+        If *filters* is provided, only returns results whose frontmatter matches
+        the scope filter (v1.6). The underlying index is still global; filtering
+        happens at output time (scheme C).
+        """
         if not self._ensure_embed_index():
             return None
         qvec = _embed_single(query)
         if qvec is None:
             return None
         try:
+            allowed_ids: Optional[Set[str]] = None
+            if filters:
+                active = self.store.list(active_only=True, filters=filters)
+                allowed_ids = {m.id() for m in active}
             if _HAS_NUMPY and isinstance(self._embed_array, np.ndarray):
                 qarr = np.array(qvec, dtype=np.float32)
                 scores = self._embed_array @ qarr  # dot product (all normalized)
                 top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
-                return {self._embed_ids[i]: float(scores[i]) for i in top_idx}
+                return {
+                    self._embed_ids[i]: float(scores[i])
+                    for i in top_idx
+                    if allowed_ids is None or self._embed_ids[i] in allowed_ids
+                }
             else:
                 # Pure Python fallback
                 scores = {}
                 for mid, vec in zip(self._embed_ids, self._embed_array):
+                    if allowed_ids is not None and mid not in allowed_ids:
+                        continue
                     scores[mid] = _cosine_sim(qvec, vec)
                 return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k])
         except Exception as e:
@@ -414,8 +431,13 @@ class SearchIndex:
         query: str,
         k: int,
         effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict[str, float]:
-        """BM25 search via bm25s library returning {memory_id: score}."""
+        """BM25 search via bm25s library returning {memory_id: score}.
+
+        If *filters* is provided, only memories matching the scope filter are
+        considered (v1.6). The underlying index remains global.
+        """
         if not self._ensure_bm25_index():
             return {}
         query_tokens = _tokenise(query)
@@ -423,7 +445,8 @@ class SearchIndex:
             return {}
         try:
             scores = self._bm25_retriever.get_scores(query_tokens)
-        except Exception:
+        except Exception as e:
+            logger.warning("BM25 score computation failed: %s", e)
             return {}
         # top-k via argpartition (numpy) or sort (pure Python)
         if _HAS_NUMPY:
@@ -433,7 +456,10 @@ class SearchIndex:
             indexed.sort(reverse=True)
             top_idx = [idx for _, idx in indexed[:k]]
         results: Dict[str, float] = {}
-        active_map = {m.id(): m for m in self.store.list_active()}
+        list_kwargs: Dict[str, Any] = {"active_only": True}
+        if filters:
+            list_kwargs["filters"] = filters
+        active_map = {m.id(): m for m in self.store.list(**list_kwargs)}
         for idx in top_idx:
             score = float(scores[idx])
             if score <= 0:
@@ -606,7 +632,7 @@ class SearchIndex:
         embed_results: Dict[str, float] = {}
         if not include_history:
             try:
-                emb = self._embed_search(query, recall_k)
+                emb = self._embed_search(query, recall_k, filters=filters)
                 if emb is not None:
                     embed_results = emb
             except Exception as e:
@@ -616,7 +642,7 @@ class SearchIndex:
         bm25_results: Dict[str, float] = {}
         if not include_history:
             try:
-                bm25_results = self._bm25_search_bm25s(query, recall_k, effectiveness)
+                bm25_results = self._bm25_search_bm25s(query, recall_k, effectiveness, filters=filters)
             except Exception as e:
                 logger.debug("bm25s search failed, falling back to handrolled: %s", e)
         if not bm25_results:
@@ -772,7 +798,8 @@ class SearchIndex:
             try:
                 caps = self.store.search_backend_capabilities()
                 backend_caps = caps.__dict__ if hasattr(caps, "__dict__") else dict(caps)
-            except Exception:
+            except Exception as e:
+                logger.warning("Could not retrieve backend capabilities: %s", e)
                 backend_caps = None
             for rank, mem in enumerate(results, start=1):
                 _entry(mem.id())["final_rank"] = rank
@@ -939,6 +966,7 @@ class SearchIndex:
         body: str,
         threshold: Optional[float] = None,
         exclude_ids: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Optional[Tuple[str, float]]:
         """Check for conflicting memories using dual-path detection.
 
@@ -946,6 +974,7 @@ class SearchIndex:
         Path 2: BM25 sigmoid (keyword overlap, supplementary)
 
         Returns (memory_id, score) if conflict found, None otherwise.
+        When *filters* is provided, only considers memories matching the scope.
         """
         tokens = _tokenise(body)
         if threshold is None:
@@ -954,9 +983,21 @@ class SearchIndex:
                 threshold = max(0.65, threshold - 0.05)
 
         active = self.store.list_active()
+        if filters:
+            # Apply scope filters to conflict check so scoped writes only
+            # compare against memories in the same scope (v1.6).
+            active = [m for m in active if all(
+                getattr(m.frontmatter, k, None) == v for k, v in filters.items()
+            )]
         if exclude_ids:
             exclude = set(exclude_ids)
             active = [m for m in active if m.id() not in exclude]
+
+        # Build allowed set for embedding path so global index output is
+        # restricted to the same scope (v1.6 scheme C).
+        allowed_ids: Optional[Set[str]] = None
+        if filters or exclude_ids:
+            allowed_ids = {m.id() for m in active}
 
         # Path 1: Embedding
         exclude_set = set(exclude_ids) if exclude_ids else set()
@@ -966,10 +1007,11 @@ class SearchIndex:
                 if qvec is not None and _HAS_NUMPY and isinstance(self._embed_array, np.ndarray):
                     qarr = np.array(qvec, dtype=np.float32)
                     scores = self._embed_array @ qarr
-                    if exclude_set:
-                        for i, mid in enumerate(self._embed_ids):
-                            if mid in exclude_set:
-                                scores[i] = -1.0
+                    for i, mid in enumerate(self._embed_ids):
+                        if mid in exclude_set:
+                            scores[i] = -1.0
+                        elif allowed_ids is not None and mid not in allowed_ids:
+                            scores[i] = -1.0
                     best_idx = int(np.argmax(scores))
                     best_score = float(scores[best_idx])
                     if best_score > threshold:
@@ -980,13 +1022,16 @@ class SearchIndex:
                     for mid, vec in zip(self._embed_ids, self._embed_array):
                         if mid in exclude_set:
                             continue
+                        if allowed_ids is not None and mid not in allowed_ids:
+                            continue
                         sim = _cosine_sim(qvec, vec)
                         if sim > best_score:
                             best_score = sim
                             best_id = mid
                     if best_score > threshold and best_id:
                         return (best_id, best_score)
-            except Exception:
+            except Exception as e:
+                logger.debug("Embedding conflict detection failed, falling back to BM25: %s", e)
                 pass
 
         # Path 2: BM25

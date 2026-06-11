@@ -31,7 +31,7 @@ from memory.bridge import (
     mirror_plugin_to_builtin,
     reset_bridge_stats,
 )
-from store import MemoryFrontmatter
+from core.store import MemoryFrontmatter
 from tests._helpers import make_memory
 
 
@@ -387,7 +387,7 @@ class TestBridgeConfig:
 
     def test_bridge_enabled_default(self, monkeypatch):
         """Without config, bridge should be enabled by default."""
-        import store
+        from core import store
         monkeypatch.setattr(store, "plugin_config", lambda: {})
         assert bridge_enabled() is True
 

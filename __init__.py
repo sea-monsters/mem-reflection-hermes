@@ -27,6 +27,12 @@ if __name__ != "__main__" and __name__ not in sys.modules:
         sys.modules[mod_name] = types.ModuleType(mod_name)
         sys.modules[mod_name].__dict__.update(globals())
 
+# Ensure __package__ is set for relative imports when loaded via importlib
+# without submodule_search_locations (e.g. spec_from_file_location with no
+# package context).  Relative imports need __package__ to resolve '.'.
+if __package__ is None:
+    __package__ = "mem_reflection_hermes"
+
 
 # ── Core exports ───────────────────────────────────────────────────────
 from .core.store import (  # noqa: F401

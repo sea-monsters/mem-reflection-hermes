@@ -15,10 +15,15 @@ except ImportError:
     from pathlib import Path
     _repo = Path(__file__).resolve().parent.parent
     import importlib.util
-    _spec = importlib.util.spec_from_file_location("store", str(_repo / "core" / "store.py"))
-    _store_mod = importlib.util.module_from_spec(_spec)
-    sys.modules["store"] = _store_mod
-    _spec.loader.exec_module(_store_mod)
+    _store_pkg = "mem_reflection_hermes.core.store"
+    if _store_pkg in sys.modules:
+        _store_mod = sys.modules[_store_pkg]
+    else:
+        _spec = importlib.util.spec_from_file_location(_store_pkg, str(_repo / "core" / "store.py"))
+        _store_mod = importlib.util.module_from_spec(_spec)
+        _store_mod.__package__ = "mem_reflection_hermes.core"
+        sys.modules[_store_pkg] = _store_mod
+        _spec.loader.exec_module(_store_mod)
     LoadedMemory = _store_mod.LoadedMemory
     LoadedSkill = _store_mod.LoadedSkill
     _tokenise = _store_mod._tokenise

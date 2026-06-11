@@ -71,7 +71,8 @@ class GraphIndex:
             except sqlite3.Error:
                 try:
                     conn.close()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to close stale SQLite connection: %s", e)
                     pass
                 self._local.conn = None
         if not hasattr(self._local, "conn") or self._local.conn is None:
@@ -388,24 +389,25 @@ class GraphIndex:
             from .store import MemoryFrontmatter, _tokenise
         except ImportError:
             # Fallback for direct loading (e.g., via importlib.util.spec_from_file_location)
-            if "_store" in sys.modules:
+            import importlib.util as _iu
+            _repo = Path(__file__).resolve().parent.parent
+            _pkg = "mem_reflection_hermes.core.store"
+            if _pkg in sys.modules:
+                _store_mod = sys.modules[_pkg]
+            elif "mem_reflection_hermes" in sys.modules:
+                _store_mod = sys.modules["mem_reflection_hermes.core.store"]
+            elif "_store" in sys.modules:
                 _store_mod = sys.modules["_store"]
-                MemoryFrontmatter = _store_mod.MemoryFrontmatter
-                _tokenise = _store_mod._tokenise
             elif "_store_fallback" in sys.modules:
                 _store_mod = sys.modules["_store_fallback"]
-                MemoryFrontmatter = _store_mod.MemoryFrontmatter
-                _tokenise = _store_mod._tokenise
             else:
-                _repo = Path(__file__).resolve().parent.parent
-                _store_spec = __import__("importlib.util").util.spec_from_file_location(
-                    "_store", str(_repo / "core" / "store.py")
-                )
-                _store_mod = __import__("importlib.util").util.module_from_spec(_store_spec)
-                sys.modules["_store"] = _store_mod
+                _store_spec = _iu.spec_from_file_location(_pkg, str(_repo / "core" / "store.py"))
+                _store_mod = _iu.module_from_spec(_store_spec)
+                _store_mod.__package__ = "mem_reflection_hermes.core"
+                sys.modules[_pkg] = _store_mod
                 _store_spec.loader.exec_module(_store_mod)
-                MemoryFrontmatter = _store_mod.MemoryFrontmatter
-                _tokenise = _store_mod._tokenise
+            MemoryFrontmatter = _store_mod.MemoryFrontmatter
+            _tokenise = _store_mod._tokenise
 
         pr = self.pagerank()
         if not pr:

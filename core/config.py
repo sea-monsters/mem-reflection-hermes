@@ -65,7 +65,8 @@ def load_config() -> Dict[str, Any]:
             _cached_config = yaml.safe_load(fh) or {}
         _cached_config_mtime = mtime
         return _cached_config
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to load config from %s: %s", cfg_path, e)
         return {}
 
 

@@ -395,6 +395,18 @@ class MergeSimilar(CuratorAction):
         if len(all_active) < 2:
             return []
 
+        # v1.6: Group by scope to avoid merging memories from different scopes.
+        def _scope_key(m):
+            fm = m.frontmatter
+            return (
+                getattr(fm, "user_id", None),
+                getattr(fm, "agent_id", None),
+                getattr(fm, "run_id", None),
+            )
+        scope_groups: Dict[Tuple, List] = {}
+        for m in all_active:
+            scope_groups.setdefault(_scope_key(m), []).append(m)
+
         def _sort_key(m):
             mem_id = m.id()
             try:
@@ -419,22 +431,26 @@ class MergeSimilar(CuratorAction):
         candidates: List[Tuple[str, str, float]] = []
         seen: Set[Tuple[str, str]] = set()
 
-        for i in range(len(all_active)):
-            for j in range(i + 1, len(all_active)):
-                key = tuple(sorted([all_active[i].id(), all_active[j].id()]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    tokens_a = set(tokenise(all_active[i].body))
-                    tokens_b = set(tokenise(all_active[j].body))
-                    if not tokens_a or not tokens_b:
+        # v1.6: Scan within scope groups only, not across scopes.
+        for group in scope_groups.values():
+            if len(group) < 2:
+                continue
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    key = tuple(sorted([group[i].id(), group[j].id()]))
+                    if key in seen:
                         continue
-                    overlap = len(tokens_a & tokens_b) / max(len(tokens_a), len(tokens_b))
-                    if overlap >= bm25_threshold:
-                        candidates.append((all_active[i].id(), all_active[j].id(), round(overlap, 3)))
-                except Exception:
-                    continue
+                    seen.add(key)
+                    try:
+                        tokens_a = set(tokenise(group[i].body))
+                        tokens_b = set(tokenise(group[j].body))
+                        if not tokens_a or not tokens_b:
+                            continue
+                        overlap = len(tokens_a & tokens_b) / max(len(tokens_a), len(tokens_b))
+                        if overlap >= bm25_threshold:
+                            candidates.append((group[i].id(), group[j].id(), round(overlap, 3)))
+                    except Exception:
+                        continue
 
         candidates.sort(key=lambda x: -x[2])
         return candidates

@@ -665,18 +665,18 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
 
         try:
+            supersedes_reason = cand.get("supersedes_reason", "")
+            if not supersedes_reason and supersedes:
+                supersedes_reason = "LLM suggested replacement"
             fm = MemoryFrontmatter.new(
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
                 zone="episode",
+                supersedes=supersedes,
+                supersedes_reason=supersedes_reason,
             )
-            fm.supersedes = supersedes
             _validate_supersedes_targets(mem_store, fm.supersedes)
-            supersedes_reason = cand.get("supersedes_reason", "")
-            if not supersedes_reason and fm.supersedes:
-                supersedes_reason = "LLM suggested replacement"
-            fm.supersedes_reason = supersedes_reason
             path = mem_store.put(scope, fm, body)
             _remember_current_session_memory_id(fm.id)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
@@ -811,8 +811,9 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
                 source="micro_reflection",
                 confidence=cand.get("confidence", "low"),
                 tags=cand.get("tags", []),
+                supersedes=supersedes,
+                supersedes_reason=cand.get("supersedes_reason", "LLM suggested replacement"),
             )
-            fm.supersedes = supersedes
             _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
             _remember_current_session_memory_id(fm.id)
@@ -1723,8 +1724,8 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             confidence=best["confidence"],
             tags=tags,
             zone="episode",
+            supersedes=supersedes,
         )
-        fm.supersedes = supersedes
         _validate_supersedes_targets(mem_store, fm.supersedes)
         path = mem_store.put("user", fm, best["text"])
         _remember_current_session_memory_id(fm.id)

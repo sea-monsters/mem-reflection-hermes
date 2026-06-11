@@ -53,12 +53,12 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.5)
+## Module Layout (v1.6)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
-| `core/store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers | — |
-| `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain | store |
+| `core/store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers, memory_events ledger | — |
+| `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain, scope-filtered recall | store |
 | `core/graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
 | `core/config.py` | canonical | Typed config models, diagnostics, validation | store |
 | `core/backend.py` | canonical | Backend capability abstraction (SearchBackendLike) | — |
@@ -67,14 +67,16 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 | `memory/curator/` | canonical (v1.5) | Composable action pipeline: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport | store, memory/bridge |
 | `memory/bridge.py` | canonical | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
 | `memory/context.py` | canonical | Context assembly: stable/dynamic split, token budget, skill matching, graded compression | store, search |
-| `runtime/tools.py` | canonical | 7 base SRH tool handlers (write, search, delete, palace, reflect, skill, compile) | store, search, reflection |
+| `runtime/tools.py` | canonical | 8 base SRH tool handlers (write, search, delete, history, palace, reflect, skill, compile) | store, search, reflection |
 | `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands | store, reflection, search, memory |
 | `runtime/graph.py` | canonical | 5 graph/health tools + graph manager singleton | core/graph, store |
 | `runtime/checkpoint.py` | canonical | Atomic session checkpoint, pending-stage recovery, corrupt backup | store |
+| `runtime/registration.py` | canonical | Plugin registration entrypoint: wires hooks, commands, tools, post-delete callbacks | hooks, schemas, tools, graph |
+| `runtime/schemas.py` | canonical | Canonical JSON schemas for all 13 registered Hermes tools | — |
 | `web/api.py` | canonical | FastAPI dashboard routes (15 endpoints) backed by store/search/runtime graph/curator APIs | package runtime services |
 | `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, `reflection/engine.py` | deprecated compat | Explicit old import paths forwarding to runtime modules | runtime/* |
 
-**Tool split**: 7 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py` through the package `register(ctx)` path. All 12 tools are declared in `plugin.yaml`.
+**Tool split**: 8 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py`. All 13 tools are declared in `plugin.yaml` and registered through the package `register(ctx)` path, which delegates to `runtime/registration.py` using schemas from `runtime/schemas.py`.
 
 ### Import Order Rules (v1.5)
 

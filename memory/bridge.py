@@ -443,20 +443,22 @@ def _write_to_plugin(
         from .store import MemoryFrontmatter  # type: ignore[import-untyped]
     except ImportError:
         try:
-            from store import MemoryFrontmatter  # type: ignore[import-untyped]
+            from core.store import MemoryFrontmatter  # type: ignore[import-untyped]
         except ImportError:
-            logger.debug("Dir A: cannot import MemoryFrontmatter")
-            return
+            try:
+                from mem_reflection_hermes.core.store import MemoryFrontmatter  # noqa: F401
+            except ImportError:
+                logger.debug("Dir A: cannot import MemoryFrontmatter")
+                return
 
     fm = MemoryFrontmatter.new(
         source="bridge",
         confidence="medium",
         tags=["bridge", "built-in-sync"],
         zone=zone,
+        supersedes=supersedes,
+        supersedes_reason="Auto-synced from built-in memory update" if supersedes else None,
     )
-    if supersedes:
-        fm.supersedes = supersedes
-        fm.supersedes_reason = "Auto-synced from built-in memory update"
     try:
         mem_store.put("user", fm, _refine_body(body))
     except ValueError:

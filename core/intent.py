@@ -31,7 +31,8 @@ def _is_expired(fm: "MemoryFrontmatter", now: Optional[datetime] = None) -> bool
         until_dt = datetime.fromisoformat(fm.valid_until)
         now_dt = now or datetime.now(timezone.utc)
         return now_dt > until_dt
-    except Exception:
+    except Exception as e:
+        logger.debug("Could not parse valid_until date %r: %s", fm.valid_until, e)
         return False
 
 

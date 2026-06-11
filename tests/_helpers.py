@@ -169,10 +169,14 @@ class MockStore:
             tags=getattr(fm, "tags", []),
         )
 
-    def list(self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None):
+    def list(self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None,
+             filters=None):
         mems = list(self.memories.values())
         if zone:
             mems = [m for m in mems if m.frontmatter.zone == zone]
+        if filters:
+            for key, val in filters.items():
+                mems = [m for m in mems if getattr(m.frontmatter, key, None) == val]
         if limit is not None:
             mems = mems[:limit]
         return mems

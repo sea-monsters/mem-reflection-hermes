@@ -51,6 +51,8 @@ class MemoryFrontmatter:
             tags: Optional[List[str]] = None,
             zone: Optional[str] = None,
             pinned: bool = False,
+            supersedes: Optional[List[str]] = None,
+            supersedes_reason: Optional[str] = None,
             user_id: Optional[str] = None,
             agent_id: Optional[str] = None,
             run_id: Optional[str] = None) -> "MemoryFrontmatter":
@@ -62,6 +64,8 @@ class MemoryFrontmatter:
             confidence=confidence,
             pinned=pinned,
             tags=list(tags or []),
+            supersedes=list(supersedes or []),
+            supersedes_reason=supersedes_reason,
             zone=normalize_zone(zone),
             user_id=user_id,
             agent_id=agent_id,
@@ -318,11 +322,13 @@ def read_memory(path: Path, scope: str = "user") -> Optional[LoadedMemory]:
     """Read a single memory Markdown file into a LoadedMemory."""
     try:
         metadata, body = _load_frontmatter_file(path)
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to load memory file %s: %s", path, e)
         return None
     try:
         fm = MemoryFrontmatter.from_dict(metadata)
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to parse frontmatter for %s: %s", path, e)
         return None
     return LoadedMemory(frontmatter=fm, body=body, source_path=path, scope=scope)
 

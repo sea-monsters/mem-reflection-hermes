@@ -926,8 +926,8 @@ class MemoryStore:
             params.append(max(0, int(limit)))
         return [m for r in conn.execute(sql, params).fetchall() if (m := self._row_to_loaded(r)) is not None]
 
-    def list_active(self) -> List[LoadedMemory]:
-        return self.list(active_only=True)
+    def list_active(self, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        return self.list(active_only=True, filters=filters)
 
     def list_pinned(self) -> List[LoadedMemory]:
         rows = self._get_conn().execute(
@@ -1010,7 +1010,8 @@ class MemoryStore:
         if self._search_index is None:
             try:
                 SearchIndex = _load_related_module("search").SearchIndex
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to load SearchIndex via package, falling back to direct load: %s", e)
                 search_path = Path(__file__).resolve().with_name("search.py")
                 spec = importlib.util.spec_from_file_location("_memory_search_module", search_path)
                 mod = importlib.util.module_from_spec(spec)
@@ -1020,7 +1021,8 @@ class MemoryStore:
             try:
                 _build_reranker = _load_related_module("reranker")._build_reranker
                 reranker = _build_reranker(plugin_config().get(CONFIG_KEY_RERANKER, {}))
-            except Exception:
+            except Exception as e:
+                logger.debug("Reranker unavailable: %s", e)
                 reranker = None
             self._search_index = SearchIndex(self, graph=self._graph, reranker=reranker)
         return self._search_index
@@ -1054,8 +1056,8 @@ class MemoryStore:
         _sm = _load_related_module("store_methods")
         return _sm.compute_entity_boosts(self, query, candidate_ids)
 
-    def check_conflict(self, body: str, threshold: Optional[float] = None, exclude_ids: Optional[List[str]] = None) -> Optional[Tuple[str, float]]:
-        return self._get_search_index().check_conflict(body, threshold=threshold, exclude_ids=exclude_ids)
+    def check_conflict(self, body: str, threshold: Optional[float] = None, exclude_ids: Optional[List[str]] = None, filters: Optional[Dict[str, Optional[str]]] = None) -> Optional[Tuple[str, float]]:
+        return self._get_search_index().check_conflict(body, threshold=threshold, exclude_ids=exclude_ids, filters=filters)
 
     def zone_counts(self) -> Dict[str, int]:
         rows = self._get_conn().execute(
