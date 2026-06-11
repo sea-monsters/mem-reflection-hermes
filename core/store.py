@@ -739,7 +739,9 @@ class MemoryStore:
             self._validate_supersedes_targets(conn, fm)
             root = self._root_for(scope)
             raw_date = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            path = root / f"{re.sub(r'[\\/]', '_', raw_date)}-{re.sub(r'[^a-zA-Z0-9_-]', '_', fm.id[:16])}.md"
+            date_part = re.sub(r'[\\/]', '_', raw_date)
+            id_part = re.sub(r'[^a-zA-Z0-9_-]', '_', fm.id[:16])
+            path = root / f"{date_part}-{id_part}.md"
             write_memory_atomic(path, fm, body)
             loaded = LoadedMemory(frontmatter=fm, body=body.strip(), source_path=path, scope=scope)
             self._upsert_memory_row(conn, loaded)
