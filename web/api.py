@@ -104,6 +104,9 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
         "valid_until": m.frontmatter.valid_until,
         "context_scope": m.frontmatter.context_scope,
         "source": m.frontmatter.source,
+        "user_id": getattr(m.frontmatter, "user_id", None),
+        "agent_id": getattr(m.frontmatter, "agent_id", None),
+        "run_id": getattr(m.frontmatter, "run_id", None),
     }
 
 
@@ -119,8 +122,10 @@ def _get_graph_interface():
             from mem_reflection_hermes.store import plugin_data_dir
             return GraphManagerCompat(plugin_data_dir() / "graph.db")
         except Exception:
+            logger.warning("Graph init (runtime_graph) failed", exc_info=True)
             return None
     except Exception:
+        logger.warning("Graph init failed", exc_info=True)
         return None
 
 
@@ -182,6 +187,7 @@ class _CrossLayerQueryCompat:
             try:
                 pagerank_scores = self.gm.pagerank()
             except Exception:
+                logger.warning("PageRank computation failed in cross-layer query", exc_info=True)
                 pagerank_scores = {}
 
         results: List[_CrossLayerResult] = []
@@ -237,15 +243,25 @@ async def list_memories(
     zone: Optional[str] = None,
     query: Optional[str] = None,
     sort: Literal["rank", "created", "confidence", "zone"] = "rank",
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ):
-    """List memories with optional zone filter, search, and sorting."""
-    memories = _get_store().list_active()
+    """List memories with optional zone, search, sorting, and scope filters."""
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    if query:
+        memories = _get_store().search(query, k=100, filters=filters or None)
+    else:
+        memories = _get_store().list_active(filters=filters or None)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
-    if query:
-        memories = _get_store().search(query, k=100)
-        if zone:
-            memories = [m for m in memories if m.frontmatter.zone == zone]
 
     sort_key = {
         "rank": lambda m: getattr(m.frontmatter, "rank", 0),
@@ -318,7 +334,7 @@ async def update_memory(mem_id: str, payload: MemoryUpdate):
             try:
                 gm.store.ensure_meta(mem_id, zone=payload.zone)
             except Exception:
-                pass
+                logger.warning("Graph meta update failed for %s", mem_id, exc_info=True)
     return _memory_to_dict(mem)
 
 
@@ -359,21 +375,28 @@ async def get_graph(
     zone: Optional[str] = None,
     min_weight: float = 0.1,
     include_supersedes: bool = True,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ):
     """Return the memory graph with real Hebbian edges from GraphIndex.
 
-    v0.9.2: Now includes:
-    - Hebbian co_occurs edges from SQLite graph_store
-    - SUPERSEDES edges from graph_store
-    - Skill tag overlap edges (computed)
-    - PageRank scores on nodes
+    v1.6: Optionally filter nodes by scope (user_id/agent_id/run_id).
     """
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     seen_nodes: set = set()
 
-    # Get all active memories as nodes
-    memories = _get_store().list_active()
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    # Get active memories as nodes, optionally scoped
+    memories = _get_store().list_active(filters=filters or None)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
 
@@ -495,6 +518,7 @@ async def get_graph(
                         "type": "skill",
                     })
     except Exception:
+        logger.warning("Cross-layer query skill enrichment failed", exc_info=True)
         pass
 
     return {
@@ -640,9 +664,21 @@ async def list_reflection_audit(limit: int = Query(100, ge=1, le=1000), decision
 # ---------------------------------------------------------------------------
 
 @router.get("/stats")
-async def get_stats():
-    """Return aggregate statistics."""
-    memories = _get_store().list_active()
+async def get_stats(
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+):
+    """Return aggregate statistics, optionally scoped."""
+    filters = {}
+    if user_id is not None:
+        filters["user_id"] = user_id
+    if agent_id is not None:
+        filters["agent_id"] = agent_id
+    if run_id is not None:
+        filters["run_id"] = run_id
+
+    memories = _get_store().list_active(filters=filters or None)
     zones: Dict[str, int] = {}
     for m in memories:
         z = m.frontmatter.zone or "general"
@@ -658,7 +694,7 @@ async def get_stats():
                 **gm.store.stats(),
             }
         except Exception:
-            pass
+            logger.warning("Graph stats collection failed in dashboard", exc_info=True)
 
     # Cache stats
     cache_stats = {"available": False}
@@ -677,7 +713,7 @@ async def get_stats():
                 **_get_cache().stats(),
             }
         except Exception:
-            pass
+            logger.warning("Cache stats collection failed in dashboard", exc_info=True)
 
     # Health metrics (WS-5)
     health = _get_store().health_metrics()
@@ -737,11 +773,13 @@ async def get_curator():
     try:
         result["enabled"] = _curator_enabled(store)
     except Exception:
+        logger.warning("Curator enabled check failed", exc_info=True)
         result["enabled"] = False
 
     try:
         result["config"] = _curator_config(store)
     except Exception:
+        logger.warning("Curator config check failed", exc_info=True)
         result["config"] = {}
 
     # Cold storage stats
@@ -763,6 +801,7 @@ async def get_curator():
                     # Fall back to showing only the filename
                     display_path = cold_path.name
             except Exception:
+                logger.debug("Path display normalization failed: %s", cold_path)
                 display_path = cold_path.name
 
             result["cold_storage"] = {
@@ -788,6 +827,7 @@ async def get_curator():
         else:
             result["last_run"] = None
     except Exception:
+        logger.warning("Curator report read failed", exc_info=True)
         result["last_run"] = None
 
     result["available"] = True

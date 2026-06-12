@@ -3,33 +3,66 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
     from ..core.store import LoadedMemory, LoadedSkill, _tokenise, _memory_tokens, plugin_config
+    from ..core.config import get_plugin_config_model
 except ImportError:
     import sys
     from pathlib import Path
     _repo = Path(__file__).resolve().parent.parent
     import importlib.util
-    _spec = importlib.util.spec_from_file_location("store", str(_repo / "core" / "store.py"))
-    _store_mod = importlib.util.module_from_spec(_spec)
-    sys.modules["store"] = _store_mod
-    _spec.loader.exec_module(_store_mod)
+    _store_pkg = "mem_reflection_hermes.core.store"
+    if _store_pkg in sys.modules:
+        _store_mod = sys.modules[_store_pkg]
+    else:
+        _spec = importlib.util.spec_from_file_location(_store_pkg, str(_repo / "core" / "store.py"))
+        _store_mod = importlib.util.module_from_spec(_spec)
+        _store_mod.__package__ = "mem_reflection_hermes.core"
+        sys.modules[_store_pkg] = _store_mod
+        _spec.loader.exec_module(_store_mod)
     LoadedMemory = _store_mod.LoadedMemory
     LoadedSkill = _store_mod.LoadedSkill
     _tokenise = _store_mod._tokenise
     _memory_tokens = _store_mod._memory_tokens
     plugin_config = _store_mod.plugin_config
+    def get_plugin_config_model():
+        class _DummyCompression:
+            enabled = True
+        class _DummyContext:
+            compression = _DummyCompression()
+            recall_timeout_ms = 1500
+            token_budget = 2000
+        class _Dummy:
+            context = _DummyContext()
+        return _Dummy()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ContextBundle:
+    """Structured context assembly result.
+
+    `append_system_context` is for relatively stable content that changes
+    infrequently. `prepend_context` is for per-turn dynamic recall.
+    `debug` carries non-semantic metadata for tests and future diagnostics.
+    """
+
+    prepend_context: str = ""
+    append_system_context: str = ""
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Path helpers (for built-in memory)
 # ---------------------------------------------------------------------------
 
 ENTRY_DELIMITER = "\n\u00a7\n"  # Section sign delimiter, matching memory_tool.py
+
+_COMPRESSION_LEVELS = ("none", "mild", "aggressive", "emergency")
 
 
 def _hermes_home() -> Path:
@@ -72,78 +105,130 @@ def build_context_block(query: str = "") -> str:
     return build_context(store, search, skills, query)
 
 
-def build_context(store, search, skills, query: str = "", max_tokens: int = 4000) -> str:
-    """Build context block for LLM injection.
+def build_context_bundle(
+    store,
+    search,
+    skills,
+    query: str = "",
+    max_tokens: int = 4000,
+    stable_only: bool = False,
+) -> ContextBundle:
+    """Build a structured context bundle for host injection.
 
-    Priority:
-    1. Pinned memories (always included)
-    2. Active memories (zone-based relevance via search)
-    3. Triggered skills (per-turn token overlap)
-    4. Always-active skills (user-configured)
-    5. (v1.1) Compacted episode summaries
+    The split is intentionally conservative for v1.4 phase 1:
+    - Stable: pinned memories + always-active skills
+    - Dynamic: relevant memories + triggered skills + compacted episodes
+
+    `stable_only=True` is used by runtime fallback paths when dynamic recall is
+    slow or unavailable.
     """
-    parts: List[str] = []
+    stable_parts: List[str] = []
     token_budget = max_tokens
     used_tokens = 0
+    debug: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "stable_only": stable_only,
+        "included_sections": [],
+        "dropped_sections": [],
+        "compression_level": "none",
+    }
 
-    # 1. Pinned memories
+    def _try_add(target_parts: List[str], label: str, block: str) -> bool:
+        nonlocal used_tokens
+        if not block:
+            return False
+        t = _estimate_block_tokens(block)
+        if used_tokens + t <= token_budget:
+            target_parts.append(block)
+            used_tokens += t
+            debug["included_sections"].append(label)
+            return True
+        debug["dropped_sections"].append(label)
+        return False
+
+    # 1. Stable: pinned memories
     pinned = store.list_pinned()
     if pinned:
         block = "## Pinned Memories\n" + "\n".join(_format_memory(m) for m in pinned)
-        t = _estimate_block_tokens(block)
-        if used_tokens + t <= token_budget:
-            parts.append(block)
-            used_tokens += t
+        _try_add(stable_parts, "pinned_memories", block)
 
-    # 2. Active memories (search if query provided, else top by rank)
+    # 2. Dynamic: active memories (search if query provided)
     active: List[LoadedMemory] = []
-    if query and query.strip():
-        try:
-            active = search.search(query, k=10)
-        except Exception:
-            active = store.list_active()[:10]
-    else:
-        active = store.list_active()[:10]
-
-    if active:
-        block = "## Relevant Memories\n" + "\n".join(_format_memory(m) for m in active)
-        t = _estimate_block_tokens(block)
-        if used_tokens + t <= token_budget:
-            parts.append(block)
-            used_tokens += t
-
-    # 3. Triggered skills
-    triggered = _match_triggered_skills(skills, query)
-    if triggered:
-        block = "## Triggered Skills\n" + "\n".join(_format_skill(s) for s in triggered)
-        t = _estimate_block_tokens(block)
-        if used_tokens + t <= token_budget:
-            parts.append(block)
-            used_tokens += t
-
-    # 4. Always-active skills
+    triggered: List[LoadedSkill] = []
     always = [s for s in skills.list() if getattr(s.frontmatter, "always_active", False)]
+    episode_block = ""
+    if not stable_only:
+        if query and query.strip():
+            try:
+                active = search.search(query, k=10)
+            except Exception:
+                logger.warning("Context search failed, falling back to list_active", exc_info=True)
+                active = store.list_active()[:10]
+        else:
+            active = store.list_active()[:10]
+
+        triggered = _match_triggered_skills(skills, query)
+
+    # 4. Stable: always-active skills
     if always:
-        block = "## Active Skills\n" + "\n".join(_format_skill(s) for s in always)
-        t = _estimate_block_tokens(block)
-        if used_tokens + t <= token_budget:
-            parts.append(block)
-            used_tokens += t
+        block = "## Active Skills\n" + "\n".join(_format_skill(s, detail_level="mild") for s in always)
+        _try_add(stable_parts, "always_active_skills", block)
 
-    # 5. (v1.1) Compacted episode summaries
+    # 5. Dynamic: compacted episode summaries
+    if not stable_only:
+        try:
+            cfg = plugin_config()
+            if cfg.get("context_compacted_episode", True):
+                episode_block = _build_compacted_episode_block(store, detail_level="mild")
+        except Exception:
+            debug["dropped_sections"].append("compacted_episode_summaries")
+
+    remaining_budget = max(token_budget - used_tokens, 0)
+    compression_enabled = True
     try:
-        cfg = plugin_config()
-        if cfg.get("context_compacted_episode", True):
-            episode_block = _build_compacted_episode_block(store)
-            if episode_block:
-                t = _estimate_block_tokens(episode_block)
-                if used_tokens + t <= token_budget:
-                    parts.append(episode_block)
-                    used_tokens += t
+        compression_enabled = bool(get_plugin_config_model().context.compression.enabled)
     except Exception:
-        pass
+        compression_enabled = True
+    if stable_only:
+        # Stable-only fallback contract: do not invoke the dynamic builder at
+        # all, so compacted episodes and other dynamic sections are excluded.
+        dynamic_parts: List[str] = []
+        compression_level = "none"
+        dropped_labels: List[str] = []
+        included_labels: List[str] = []
+    else:
+        dynamic_parts, compression_level, dropped_labels, included_labels = _build_dynamic_context_parts(
+            active=active,
+            triggered=triggered,
+            store=store,
+            budget=remaining_budget,
+            compression_enabled=compression_enabled,
+        )
+    debug["compression_level"] = compression_level
+    for label in dropped_labels:
+        if label not in debug["dropped_sections"]:
+            debug["dropped_sections"].append(label)
+    for label in included_labels:
+        if label not in debug["included_sections"]:
+            debug["included_sections"].append(label)
 
-    return "\n\n".join(parts)
+    used_tokens += sum(_estimate_block_tokens(block) for block in dynamic_parts)
+    debug["used_tokens"] = used_tokens
+    debug["stable_section_count"] = len(stable_parts)
+    debug["dynamic_section_count"] = len(dynamic_parts)
+
+    return ContextBundle(
+        prepend_context="\n\n".join(dynamic_parts),
+        append_system_context="\n\n".join(stable_parts),
+        debug=debug,
+    )
+
+
+def build_context(store, search, skills, query: str = "", max_tokens: int = 4000) -> str:
+    """Build a backward-compatible single-string context block for injection."""
+    bundle = build_context_bundle(store, search, skills, query, max_tokens=max_tokens)
+    parts = [bundle.append_system_context, bundle.prepend_context]
+    return "\n\n".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +236,7 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
 # ---------------------------------------------------------------------------
 
 
-def _build_compacted_episode_block(store) -> str:
+def _build_compacted_episode_block(store, detail_level: str = "mild") -> str:
     """Load compacted episode summaries from the episode zone.
 
     Searches for entries tagged 'compacted' and formats as a digest.
@@ -169,14 +254,16 @@ def _build_compacted_episode_block(store) -> str:
     if not compacted:
         return ""
 
+    max_items = 10 if detail_level == "mild" else 6 if detail_level == "aggressive" else 4
+    max_chars = 200 if detail_level == "mild" else 120 if detail_level == "aggressive" else 80
     lines = ["## Episode Summaries"]
-    for m in compacted[:10]:
-        body = m.body.strip()[:200]
-        if len(m.body) > 200:
+    for m in compacted[:max_items]:
+        body = m.body.strip()[:max_chars]
+        if len(m.body) > max_chars:
             body += "..."
         lines.append(f"- {body}")
-    if len(compacted) > 10:
-        lines.append(f"- ... ({len(compacted) - 10} more)")
+    if len(compacted) > max_items:
+        lines.append(f"- ... ({len(compacted) - max_items} more)")
     return "\n".join(lines)
 
 
@@ -203,6 +290,8 @@ def _format_memory(mem: LoadedMemory, max_tokens: int = 100) -> str:
         # Simple truncation based on character limit
         char_limit = max_tokens * 4  # Approximate chars for max_tokens
         body = body[:char_limit]
+        if len(mem.body.strip()) > len(body):
+            body += "..."
 
     lines = [f"- [{mem.frontmatter.zone or 'general'}] {body}"]
     tags = getattr(mem.frontmatter, "tags", None)
@@ -211,14 +300,118 @@ def _format_memory(mem: LoadedMemory, max_tokens: int = 100) -> str:
     return "\n".join(lines)
 
 
-def _format_skill(skill: LoadedSkill) -> str:
+def _format_skill(skill: LoadedSkill, detail_level: str = "mild") -> str:
     """Format a skill for context injection."""
     fm = skill.frontmatter
-    lines = [f"### {fm.name}", fm.description.strip()[:300]]
+    if detail_level == "emergency":
+        return f"### {fm.name}"
+    max_chars = 300 if detail_level == "mild" else 120
+    lines = [f"### {fm.name}", fm.description.strip()[:max_chars]]
     triggers = getattr(fm, "triggers", None)
     if triggers:
         lines.append(f"triggers: {', '.join(triggers)}")
     return "\n".join(lines)
+
+
+def _build_dynamic_context_parts(
+    *,
+    active: List[LoadedMemory],
+    triggered: List[LoadedSkill],
+    store,
+    budget: int,
+    compression_enabled: bool = True,
+) -> tuple[List[str], str, List[str], List[str]]:
+    """Assemble dynamic context using compression levels instead of tail truncation."""
+    if budget <= 0 and active:
+        return [], "emergency", [
+            "relevant_memories",
+            "triggered_skills",
+            "compacted_episode_summaries",
+        ], []
+    if budget <= 0:
+        return [], "none", [], []
+
+    section_order = ["relevant_memories", "triggered_skills", "compacted_episode_summaries"]
+    configs = [
+        ("none", {"memory_tokens": 100, "skill_detail": "mild", "episode_detail": "mild"}),
+    ]
+    if compression_enabled:
+        configs.extend([
+            ("mild", {"memory_tokens": 80, "skill_detail": "mild", "episode_detail": "mild"}),
+            ("aggressive", {"memory_tokens": 40, "skill_detail": "aggressive", "episode_detail": "aggressive"}),
+            ("emergency", {"memory_tokens": 18, "skill_detail": "emergency", "episode_detail": "emergency"}),
+        ])
+
+    best_parts: List[str] = []
+    best_included: List[str] = []
+    best_dropped = list(section_order)
+    # Default to 'none' when there is no content to compress.
+    # 'emergency' means reactive truncation under active token pressure.
+    best_level = "none"
+
+    for level, cfg in configs:
+        parts: List[str] = []
+        included: List[str] = []
+        dropped: List[str] = []
+        used = 0
+
+        if active:
+            lines = [_format_memory(m, max_tokens=cfg["memory_tokens"]) for m in active]
+            block = "## Relevant Memories\n" + "\n".join(lines)
+            cost = _estimate_block_tokens(block)
+            if used + cost <= budget:
+                parts.append(block)
+                included.append("relevant_memories")
+                used += cost
+            else:
+                fitted_lines: List[str] = []
+                for line in lines:
+                    candidate = "## Relevant Memories\n" + "\n".join(fitted_lines + [line])
+                    if fitted_lines and used + _estimate_block_tokens(candidate) > budget:
+                        break
+                    if not fitted_lines and used + _estimate_block_tokens(candidate) > budget:
+                        break
+                    fitted_lines.append(line)
+                if fitted_lines:
+                    block = "## Relevant Memories\n" + "\n".join(fitted_lines)
+                    parts.append(block)
+                    included.append("relevant_memories")
+                    used += _estimate_block_tokens(block)
+                else:
+                    dropped.append("relevant_memories")
+
+        if triggered:
+            block = "## Triggered Skills\n" + "\n".join(
+                _format_skill(s, detail_level=cfg["skill_detail"]) for s in triggered
+            )
+            cost = _estimate_block_tokens(block)
+            if used + cost <= budget:
+                parts.append(block)
+                included.append("triggered_skills")
+                used += cost
+            else:
+                dropped.append("triggered_skills")
+
+        episode_block = _build_compacted_episode_block(store, detail_level=cfg["episode_detail"])
+        if episode_block:
+            cost = _estimate_block_tokens(episode_block)
+            if used + cost <= budget:
+                parts.append(episode_block)
+                included.append("compacted_episode_summaries")
+                used += cost
+            else:
+                dropped.append("compacted_episode_summaries")
+
+        missing = [label for label in section_order if label not in included]
+        if len(included) > len(best_included):
+            best_parts = parts
+            best_included = included
+            best_dropped = missing
+            best_level = level
+        if not missing:
+            return parts, level, [], included
+
+    return best_parts, best_level, best_dropped, best_included
 
 
 # ---------------------------------------------------------------------------

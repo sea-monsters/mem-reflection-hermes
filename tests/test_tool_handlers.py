@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import pytest
 
-from store import (
+from core.store import (
     MemoryFrontmatter,
     LoadedMemory,
     _lineage_cycle_check,

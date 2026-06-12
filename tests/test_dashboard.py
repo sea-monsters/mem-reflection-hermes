@@ -98,12 +98,19 @@ def temp_dashboard():
     graph = GraphIndex(graph_db)
 
     store._test_data_dir = Path(tmpdir)
+    _real_srh = sys.modules.get("mem_reflection_hermes")
     if not _HAS_FASTAPI:
         yield None, store, graph
     else:
         app, mod = _make_dashboard_app(store, graph, data_dir=Path(tmpdir))
         client = TestClient(app)
         yield client, store, graph
+
+    # Restore real package to avoid mock pollution in later tests
+    if _real_srh is not None:
+        sys.modules["mem_reflection_hermes"] = _real_srh
+    else:
+        sys.modules.pop("mem_reflection_hermes", None)
 
     try:
         conn = getattr(store._local, "conn", None)
@@ -306,10 +313,10 @@ class TestCuratorEndpoint:
             memory_mod.__path__ = [str(_REPO / "memory")]
             sys.modules[f"{_PKG}.memory"] = memory_mod
 
-        # Register memory.curator
+        # Register memory.curator (now a package)
         _spec_cur = importlib.util.spec_from_file_location(
             f"{_PKG}.memory.curator",
-            str(_REPO / "memory" / "curator.py"),
+            str(_REPO / "memory" / "curator" / "__init__.py"),
         )
         _cur_mod = importlib.util.module_from_spec(_spec_cur)
         sys.modules[f"{_PKG}.memory.curator"] = _cur_mod
@@ -352,10 +359,10 @@ class TestCuratorEndpoint:
             memory_mod.__path__ = [str(_REPO / "memory")]
             sys.modules[f"{_PKG}.memory"] = memory_mod
 
-        # Register memory.curator
+        # Register memory.curator (now a package)
         _spec_cur = importlib.util.spec_from_file_location(
             f"{_PKG}.memory.curator",
-            str(_REPO / "memory" / "curator.py"),
+            str(_REPO / "memory" / "curator" / "__init__.py"),
         )
         _cur_mod = importlib.util.module_from_spec(_spec_cur)
         sys.modules[f"{_PKG}.memory.curator"] = _cur_mod

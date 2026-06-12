@@ -28,6 +28,20 @@ The curator's cold storage engine uses write-then-swap for JSONL rewrites:
 - **Append**: Uses `_cold_store_lock` to serialize concurrent append operations.
 - **OSError handling**: Write failures log `logger.warning` (never silent) so operators can detect disk-full or permission issues.
 
+## Event Ledger Safety (v1.6)
+
+- **Atomic writes**: Memory events are written inside the same SQLite connection as the memory mutation, using the same transaction boundary. If the outer transaction is rolled back, neither the memory nor its events persist.
+- **Safe serialization**: `_event_json()` handles `datetime` objects from frontmatter and truncates oversized frontmatter (>8KB) to `{id: ...}` to prevent row bloat.
+- **Immutable history**: Event rows are append-only; no update or delete path exists for `memory_events`.
+
+## Scope Filter Safety (v1.6)
+
+Scope filtering (`user_id`/`agent_id`/`run_id`) uses a **post-filter strategy** — the BM25 and embedding indices remain global, and filtering is applied at query-output time (see `core/search.py`). This means:
+
+- **No per-scope index isolation**: A scope-filtered query still scans the global index, then discards results outside the scope. For large multi-user stores (>10K memories), consider adding a scope prefix to queries to reduce the candidate set.
+- **Graph expansion is scope-agnostic**: Graph neighbors retrieved by `srh_graph_retrieve` or context assembly may include memories from different scopes. In multi-tenant scenarios, treat graph-expanded results as hints, not authoritative.
+- **Composite index**: A SQLite composite index `idx_memories_scoped(user_id, agent_id, run_id)` covers the most common filtering patterns. `NULL` values are universally visible (excluded from scope-filtered results).
+
 ## Known Issues
 
 ### ONNX Fallback Cache Guard (Known, P3)

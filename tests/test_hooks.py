@@ -1,0 +1,383 @@
+"""test_hooks.py — Tests for v0.16.0 enhanced runtime hooks.
+
+Coverage:
+- _on_api_request_error: error counting and threshold logging
+- _on_subagent_start / _on_subagent_stop: lifecycle tracking
+- _on_session_reset: session rotation logging
+- _ensure_session_state / _cleanup_session_state: state bag management
+
+Run: pytest tests/test_hooks.py -v
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Build a minimal namespace so hooks.py can import .checkpoint and ..core.store
+_PKG = "mem_reflection_hermes_hooks_test"
+
+
+def _setup_namespace():
+    pkg = types.ModuleType(_PKG)
+    pkg.__path__ = [str(_REPO)]
+    sys.modules[_PKG] = pkg
+
+    # core.store
+    core_mod = types.ModuleType(f"{_PKG}.core")
+    core_mod.__path__ = [str(_REPO / "core")]
+    core_mod.__package__ = f"{_PKG}.core"
+    sys.modules[f"{_PKG}.core"] = core_mod
+
+    _spec_store = importlib.util.spec_from_file_location(f"{_PKG}.core.store", str(_REPO / "core" / "store.py"))
+    _store = importlib.util.module_from_spec(_spec_store)
+    sys.modules[f"{_PKG}.core.store"] = _store
+    _spec_store.loader.exec_module(_store)
+
+    # reflection.engine
+    reflection_pkg = types.ModuleType(f"{_PKG}.reflection")
+    reflection_pkg.__path__ = [str(_REPO / "reflection")]
+    reflection_pkg.__package__ = f"{_PKG}.reflection"
+    sys.modules[f"{_PKG}.reflection"] = reflection_pkg
+
+    _spec_engine = importlib.util.spec_from_file_location(f"{_PKG}.reflection.engine", str(_REPO / "reflection" / "engine.py"))
+    _engine = importlib.util.module_from_spec(_spec_engine)
+    sys.modules[f"{_PKG}.reflection.engine"] = _engine
+    _spec_engine.loader.exec_module(_engine)
+
+    # runtime.checkpoint
+    runtime_pkg = types.ModuleType(f"{_PKG}.runtime")
+    runtime_pkg.__path__ = [str(_REPO / "runtime")]
+    runtime_pkg.__package__ = f"{_PKG}.runtime"
+    sys.modules[f"{_PKG}.runtime"] = runtime_pkg
+
+    _spec_ckpt = importlib.util.spec_from_file_location(f"{_PKG}.runtime.checkpoint", str(_REPO / "runtime" / "checkpoint.py"))
+    _ckpt = importlib.util.module_from_spec(_spec_ckpt)
+    sys.modules[f"{_PKG}.runtime.checkpoint"] = _ckpt
+    _spec_ckpt.loader.exec_module(_ckpt)
+
+    # reflection.runtime
+    _spec_rt = importlib.util.spec_from_file_location(f"{_PKG}.reflection.runtime", str(_REPO / "reflection" / "runtime.py"))
+    _rt = importlib.util.module_from_spec(_spec_rt)
+    sys.modules[f"{_PKG}.reflection.runtime"] = _rt
+    _spec_rt.loader.exec_module(_rt)
+
+    return _store, _ckpt
+
+
+_setup_namespace()
+
+_spec_hooks = importlib.util.spec_from_file_location(f"{_PKG}.runtime.hooks", str(_REPO / "runtime" / "hooks.py"))
+_hooks = importlib.util.module_from_spec(_spec_hooks)
+sys.modules[f"{_PKG}.runtime.hooks"] = _hooks
+_spec_hooks.loader.exec_module(_hooks)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_session_states(monkeypatch):
+    """Clear global session state before each test."""
+    monkeypatch.setattr(_hooks, "_checkpoint_clear_session_state", lambda _session_id: None)
+    monkeypatch.setattr(_hooks, "_checkpoint_snapshot_session_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_mark_pending_stage", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_mark_stage_completed", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(_hooks, "_checkpoint_recover_pending_work", lambda **_kwargs: {})
+    with _hooks._session_states_lock:
+        _hooks._session_states.clear()
+    yield
+    with _hooks._session_states_lock:
+        _hooks._session_states.clear()
+
+
+# ---------------------------------------------------------------------------
+# _ensure_session_state / _cleanup_session_state
+# ---------------------------------------------------------------------------
+
+class TestSessionStateManagement:
+    def test_ensure_session_state_creates_default_bag(self):
+        state = _hooks._ensure_session_state("sess-1")
+        assert state["api_error_count"] == 0
+        assert state["subagent_count"] == 0
+        assert state["rewind_count"] == 0
+        assert "created_at" in state
+
+    def test_ensure_session_state_returns_existing(self):
+        s1 = _hooks._ensure_session_state("sess-2")
+        s1["api_error_count"] = 5
+        s2 = _hooks._ensure_session_state("sess-2")
+        assert s2["api_error_count"] == 5
+        assert s1 is s2
+
+    def test_cleanup_session_state_removes_from_memory(self):
+        _hooks._ensure_session_state("sess-3")
+        _hooks._cleanup_session_state("sess-3")
+        assert "sess-3" not in _hooks._session_states
+
+
+# ---------------------------------------------------------------------------
+# _on_api_request_error
+# ---------------------------------------------------------------------------
+
+class TestApiRequestErrorHook:
+    def test_no_session_id_is_noop(self, caplog):
+        """Without session_id the hook returns immediately."""
+        _hooks._on_api_request_error(session_id="", error={"type": "timeout"})
+        # Should not crash; no state created
+        assert not _hooks._session_states
+
+    def test_error_count_increments(self):
+        _hooks._on_api_request_error(session_id="sess-a", error={"type": "timeout"})
+        state = _hooks._session_states["sess-a"]
+        assert state["api_error_count"] == 1
+
+        _hooks._on_api_request_error(session_id="sess-a", error={"type": "rate_limit"})
+        assert state["api_error_count"] == 2
+
+    def test_threshold_crossing_logged(self, caplog):
+        """At thresholds 1, 5, 10, 25, 50 an info log is emitted."""
+        import logging
+        with caplog.at_level(logging.INFO):
+            for i in range(6):
+                _hooks._on_api_request_error(session_id="sess-b", error={"type": "timeout"})
+        # Thresholds crossed: 1 and 5
+        assert "hit 1 API errors" in caplog.text
+        assert "hit 5 API errors" in caplog.text
+        # 2,3,4 should not log
+        assert "hit 2 API errors" not in caplog.text
+
+    def test_non_threshold_values_not_logged(self, caplog):
+        import logging
+        with caplog.at_level(logging.INFO):
+            for i in range(4):
+                _hooks._on_api_request_error(session_id="sess-c", error={"type": "timeout"})
+        # Only threshold 1 should be logged
+        assert caplog.text.count("API errors") == 1
+
+
+# ---------------------------------------------------------------------------
+# _on_subagent_start / _on_subagent_stop
+# ---------------------------------------------------------------------------
+
+class TestSubagentLifecycleHooks:
+    def test_start_increments_active_count(self):
+        _hooks._on_subagent_start(session_id="sess-d")
+        state = _hooks._session_states["sess-d"]
+        assert state["_subagent_active"] == 1
+        assert "_subagent_start_time" in state
+
+    def test_multiple_start_increments(self):
+        _hooks._on_subagent_start(session_id="sess-e")
+        _hooks._on_subagent_start(session_id="sess-e")
+        assert _hooks._session_states["sess-e"]["_subagent_active"] == 2
+
+    def test_stop_increments_total_count(self):
+        _hooks._on_subagent_start(session_id="sess-f")
+        _hooks._on_subagent_stop(session_id="sess-f")
+        state = _hooks._session_states["sess-f"]
+        assert state["subagent_count"] == 1
+
+    def test_no_session_id_is_noop(self):
+        """Missing session_id should not crash."""
+        _hooks._on_subagent_start(session_id="")
+        _hooks._on_subagent_stop(session_id="")
+        assert not _hooks._session_states
+
+
+# ---------------------------------------------------------------------------
+# _build_context_with_timeout
+# ---------------------------------------------------------------------------
+
+class TestContextTimeoutFallback:
+    def test_timeout_does_not_wait_for_slow_worker(self, monkeypatch):
+        """When full context assembly times out, stable-only fallback must run
+        promptly without blocking on the slow worker's completion.
+        """
+        import time
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="stable-only", prepend_context="")
+            time.sleep(2.0)  # much longer than the test timeout
+            return SimpleNamespace(append_system_context="dynamic", prepend_context="")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=100, compression=SimpleNamespace(enabled=True))
+        ))
+
+        # First call: full context times out, fallback should be invoked
+        start = time.monotonic()
+        result = _hooks._build_context_with_timeout("query", 100)
+        elapsed = time.monotonic() - start
+
+        # Fallback must be returned well before the slow worker finishes (2s)
+        assert elapsed < 1.0, f"fallback blocked for {elapsed:.2f}s"
+        # The function returns the rendered stable-only fallback text
+        assert result is not None
+        assert "stable-only" in result
+        assert calls["stable"] == 1
+
+    def test_exception_before_timeout_uses_fallback(self, monkeypatch):
+        """If full context assembly raises before timeout, stable-only fallback runs."""
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="fallback", prepend_context="")
+            raise RuntimeError("full context assembly exploded")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=5000, compression=SimpleNamespace(enabled=True))
+        ))
+
+        result = _hooks._build_context_with_timeout("query", 100)
+        assert "fallback" in result
+        assert calls["full"] == 2  # once for full, once for stable
+        assert calls["stable"] == 1
+
+    def test_successful_full_context_returns_without_fallback(self, monkeypatch):
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="fallback", prepend_context="")
+            assert stable_only is False
+            return SimpleNamespace(append_system_context="full-context", prepend_context="")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=5000, compression=SimpleNamespace(enabled=True))
+        ))
+
+        result = _hooks._build_context_with_timeout("query", 100)
+        assert "full-context" in result
+        assert calls["full"] == 1
+        assert calls["stable"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _on_session_reset
+# ---------------------------------------------------------------------------
+
+class TestSessionResetHook:
+    def test_logs_rotation_parameters(self, caplog):
+        import logging
+        with caplog.at_level(logging.DEBUG):
+            _hooks._on_session_reset(
+                old_session_id="old-123",
+                new_session_id="new-456",
+                reason="token_limit",
+            )
+        assert "old-123" in caplog.text
+        assert "new-456" in caplog.text
+        assert "token_limit" in caplog.text
+
+    def test_missing_ids_use_unknown(self, caplog):
+        import logging
+        with caplog.at_level(logging.DEBUG):
+            _hooks._on_session_reset(reason="manual")
+        # When IDs are missing, empty strings are logged (not "unknown")
+        assert "session rotated" in caplog.text
+        assert "reason=manual" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _pre_llm_call token budget fallback
+# ---------------------------------------------------------------------------
+
+class TestPreLlmCallTokenBudgetFallback:
+    def test_estimate_tokens_raises_truncates_context(self, monkeypatch):
+        """If _estimate_tokens raises, context longer than budget must be hard-truncated."""
+        from types import SimpleNamespace
+
+        budget = 10
+        long_context = "x" * 500  # far exceeds budget
+
+        def _build_context_with_timeout(query, b):
+            return long_context
+
+        def _estimate_tokens(text):
+            raise RuntimeError("tokenizer exploded")
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        ctx = result["context"]
+        # Must be truncated and contain the sentinel
+        assert "...[context truncated]" in ctx
+        # Length should be roughly budget*4 + sentinel length
+        assert len(ctx) <= int(budget * 4) + len("\n...[context truncated]")
+
+    def test_estimate_tokens_ok_no_truncation(self, monkeypatch):
+        """If _estimate_tokens works and tokens are under budget, context is untouched."""
+        from types import SimpleNamespace
+
+        budget = 1000
+        short_context = "short context"
+
+        def _build_context_with_timeout(query, b):
+            return short_context
+
+        def _estimate_tokens(text):
+            return 5
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        assert result["context"] == short_context
+        assert "...[context truncated]" not in result["context"]
+
+    def test_estimate_tokens_over_budget_truncates_normally(self, monkeypatch):
+        """Normal path: tokens exceed budget, context truncated with 3.5 multiplier."""
+        from types import SimpleNamespace
+
+        budget = 10
+        long_context = "a" * 500
+
+        def _build_context_with_timeout(query, b):
+            return long_context
+
+        def _estimate_tokens(text):
+            return 100
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        ctx = result["context"]
+        assert "...[context truncated]" in ctx
+        # Normal truncation uses budget * 3.5
+        assert len(ctx) <= int(budget * 3.5) + len("\n...[context truncated]")

@@ -1,5 +1,131 @@
 # Changelog
 
+## v1.6 — Memory Event Ledger & Scoped Filters
+
+### Memory Event Ledger (Wave 1)
+
+- **SQLite `memory_events` table**: Tracks ADD/UPDATE/DELETE/SUPERSEDE/PIN/UNPIN events with old/new body, old/new frontmatter, session_id, and actor_id.
+- **`_record_memory_event()`**: Safe JSON serialization with datetime handling and 8KB frontmatter truncation to prevent oversized rows.
+- **`get_memory_events()`**: Query events filtered by `event_types`, `session_id`, and `limit`.
+- **`get_memory_history()`**: Combines supersedes chain + optional event timeline for full memory provenance.
+- **Transaction awareness**: Events are written atomically within the same SQLite connection as the memory mutation. Rollback-safe: if the outer transaction is rolled back, neither the memory nor its events persist.
+- **Tool integration**: `srh_memory_history(..., include_events=True, event_types=[...], session_id=...)` exposes audit trail to agents.
+
+### Scoped Filters (Wave 2)
+
+- **Three scope columns**: `user_id`, `agent_id`, `run_id` on the `memories` table. NULL = universally visible.
+- **AND logic for combined filters**: `{"user_id": "u1", "agent_id": "a1"}` matches only memories where BOTH conditions hold.
+- **`filters` parameter** on `MemoryStore.list()`, `SearchIndex.search()`, `SearchIndex.search_explain()`, and `MemoryStore.delete_by_filters()`.
+- **NULL matching**: `filters={"user_id": None}` uses `IS NULL` to find universally-visible memories.
+- **Unknown key rejection**: `list()` raises `ValueError` for unknown filter keys (e.g. `user_od` typo).
+- **Tool schema updates**:
+  - `srh_memory_write` accepts `user_id`, `agent_id`, `run_id`
+  - `srh_memory_search` accepts `filters`
+  - `srh_memory_delete` accepts `filters` for batch delete (`id` is optional when `filters` is provided)
+  - `srh_memory_history` accepts `include_events`, `event_types`, `session_id`
+- **Backward compatibility**: v1.5 memories without scope fields remain discoverable (columns default to NULL).
+
+### Code Review Fixes (v1.6)
+
+- **Schema unification**: `runtime/registration.py` imports all 13 schemas from `runtime/schemas.py` (was inline in `runtime/tools.py::register()`).
+- **Search response scope fields**: `srh_memory_search` results now include `user_id`/`agent_id`/`run_id` when non-None.
+- **History frontmatter deserialization**: `srh_memory_history` parses `old_frontmatter`/`new_frontmatter` JSON strings into objects.
+- **Event frontmatter truncation warning**: Logs `logger.warning` when event frontmatter exceeds 8KB and is truncated.
+- **Scope clause helper**: Extracted `_build_scope_clauses()` to unify `list()` and `delete_by_filters()` logic.
+- **Empty string normalization**: `MemoryFrontmatter.to_dict()` treats empty-string scope values as `None`.
+- **Explicit column select**: `delete_by_filters()` uses explicit column list instead of `SELECT *`.
+
+### Infrastructure
+
+- **Test count**: 523 → 553 tests (30 new tests across event ledger + scoped filters)
+- **Tool count**: 12 → 13 (`srh_memory_history` registered through canonical path)
+- **Zero regressions**: All v1.5 features preserved unchanged
+
+---
+
+## v1.5 — Module Refactoring & Composable Curator Pipeline
+
+### Core Module Split (v1.5)
+
+- **`core/store.py` → 10 modules**: Extracted `core/models.py`, `core/utils.py`, `core/tokenization.py`, `core/entities.py`, `core/store_methods.py`, `core/skill_store.py`, `core/lineage.py`, `core/intent.py`, `core/async_writer.py`, `core/store_health.py`
+- **Layered imports preserved**: No circular dependencies; `core/store.py` remains the leaf module
+
+### Curator Refactor (v1.5)
+
+- **Composable action pipeline**: `memory/curator/` subpackage replaces monolithic `memory/curator.py`
+  - `actions.py`: `CuratorAction` base + 6 implementations (`ArchiveStale`, `CompactChains`, `ArchiveSuperseded`, `MergeSimilar`, `CleanOrphanEdges`, `GenerateReport`)
+  - `helpers.py`: `is_protected`, `build_cold_entry`, `archive_and_delete`, `load_last_access`, config
+  - `cold_store.py`: JSONL append-only cold storage with 10MB cap
+  - `report.py`: Human-readable report generation and persistence
+- **Pipeline ordering**: ArchiveStale → CompactChains → ArchiveSuperseded → MergeSimilar → CleanOrphanEdges → GenerateReport
+- **Legacy API preserved**: Thin wrappers in `memory/curator/__init__.py` for backward compatibility
+
+### Runtime Package Split (v1.5)
+
+- **`runtime/registration.py`**: `register(ctx)` entrypoint that wires hooks, commands, tools, and post-delete callbacks
+- **`runtime/schemas.py`**: 12 Hermes tool JSON schemas
+- **`runtime/state.py`**: Singleton getters (`_get_mem_store`, `_get_search_index`, `_get_graph_mgr`, etc.) with double-checked locking
+- **`runtime/helpers.py`**: `_build_context_block`, `_build_context_bundle`, `_estimate_tokens`, `match_skills`
+- **`runtime/_lb.py`**: Late-binding helper — resolves modules/symbols without hard imports to avoid circular dependencies
+- **`__init__.py` slimmed**: Exports public API + backward-compat aliases only; registration delegated to `runtime/registration`
+
+### Infrastructure
+
+- **Test count**: 413 → 523 tests (110 new tests across module-split boundaries)
+- **Late-binding pattern**: Runtime modules use `_lb(name)` for cross-module resolution at call time rather than import time
+- **No functional regressions**: All v1.4 features (ContextBundle, checkpoint, entity index, explainable search, CJK tokenizer) preserved unchanged
+
+---
+
+## v1.4-beta — Context Reliability & Entity Recall
+
+### Context Reliability (stable/dynamic split)
+
+- **`ContextBundle`**: Internal structured context with stable/dynamic section separation. Stable section (pinned + always-active skills) preserves prompt cache; dynamic section (relevant memories + triggered skills + episode summaries) varies per turn.
+- **Timeout-protected context assembly**: `pre_llm_call` hook has 8s timeout with stable-only fallback on timeout/failure.
+- **Graded compression**: `none/mild/aggressive/emergency` levels applied to dynamic section under token pressure; stable section always preserved.
+- **Backward compatible**: Public `build_context()` still returns a single string; bundle helpers exported via package facades.
+
+### Retrieval Quality & Explainability
+
+- **Configurable CJK tokenizer**: `auto` (default), `bigram`, `jieba` modes. `jieba.cut_for_search` with fail-open fallback to bigram.
+- **Explainable search**: `search_explain()` returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, supersedes, entity, Hebbian signals).
+- **Opt-in tool flag**: `srh_memory_search(..., explain=true)` returns diagnostic output.
+
+### Runtime Reliability
+
+- **Session checkpoint**: `runtime/checkpoint.py` with atomic JSON persistence, corrupt backup, and pending-stage recovery.
+- **Session-end recovery**: Hooks mark reflection/curator/compaction stages as `pending` on failure; next session-start recovers them.
+- **Typed config diagnostics**: `core/config.py` validates types, warns on unknown keys, falls back to safe defaults.
+
+### Entity Recall & Backend Readiness
+
+- **SQLite entity index**: `entities` and `entity_links` tables with lifecycle hooks on write, delete, and rebuild.
+- **Entity extraction pipeline**: Regex-first + optional spaCy architecture. Six regex patterns:
+  - `file_path` (weight 1.0): filesystem paths like `src/providers/http/index.test.ts`
+  - `code` (0.9): backtick-quoted identifiers like `` `ToolRunner.execute` ``
+  - `quoted` (0.8): single/double-quoted strings like `"config.yaml"`
+  - `package` (0.75): dot-separated identifiers like `numpy.linalg.norm`
+  - `proper` (0.7): PascalCase/camelCase like `HttpRequestHandler`
+  - `compound` (0.65): hyphen/slash compounds like `auth-middleware`
+  - Optional spaCy NER (0.6) when `en_core_web_sm` is available
+- **Entity boost in search**: Mentioned entities receive recall boost proportional to extraction weight; hits appear in explain output.
+- **Cross-reference**: mem0 uses spaCy-only NER; SRH's regex-first approach provides finer weight granularity and no mandatory heavy dependency.
+- **Backend capability abstraction**: `core/backend.py` exposes SQLite capabilities without changing default runtime.
+
+### Tests
+
+- 317+ tests collected; new v1.4 tests grouped under pytest markers: `v14_context`, `v14_retrieval`, `v14_runtime`, `v14_entity`, `v14_contract`.
+
+## v1.3-beta — Curator Enhancement + Graph Cleanup
+
+- Orphan edge cleanup (delete + curator sweep)
+- Compaction before archive in curator pipeline
+- `total_archived` includes compacted entries
+- Pre-existing test regressions fixed
+
+---
+
 ## v1.2-beta2 — Optional Reranker Layer (mem0 pattern)
 
 ### Optional Reranker Layer

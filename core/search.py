@@ -79,6 +79,7 @@ try:
         normalize_bm25,
         plugin_config,
         _tokenise,
+        entity_weight,
         embeddings_enabled,
         _memory_tokens as estimate_tokens,
         _bm25_search_scored,
@@ -90,9 +91,16 @@ except ImportError:
     _repo = Path(__file__).resolve().parent.parent
     import importlib.util
 
-    _store_spec = importlib.util.spec_from_file_location("_store_fallback", str(_repo / "core" / "store.py"))
+    _core_pkg = types.ModuleType("mem_reflection_hermes.core")
+    _core_pkg.__path__ = [str(_repo / "core")]
+    sys.modules["mem_reflection_hermes.core"] = _core_pkg
+    _store_spec = importlib.util.spec_from_file_location(
+        "mem_reflection_hermes.core.store",
+        str(_repo / "core" / "store.py"),
+    )
     _store_mod = importlib.util.module_from_spec(_store_spec)
-    sys.modules["_store_fallback"] = _store_mod
+    _store_mod.__package__ = "mem_reflection_hermes.core"
+    sys.modules["mem_reflection_hermes.core.store"] = _store_mod
     _store_spec.loader.exec_module(_store_mod)
 
     LoadedMemory = _store_mod.LoadedMemory
@@ -102,6 +110,9 @@ except ImportError:
     normalize_bm25 = _store_mod.normalize_bm25
     plugin_config = _store_mod.plugin_config
     _tokenise = _store_mod._tokenise
+
+    entity_weight = _store_mod.entity_weight
+
     embeddings_enabled = _store_mod.embeddings_enabled
     estimate_tokens = _store_mod._memory_tokens
     _bm25_search_scored = _store_mod._bm25_search_scored
@@ -343,27 +354,53 @@ class SearchIndex:
                 logger.info("Embedding index build failed: %s", e)
                 return False
 
-    def _embed_search(self, query: str, k: int) -> Optional[Dict[str, float]]:
-        """Embedding-based search returning {memory_id: cosine_similarity}."""
+    def _embed_search(
+        self, query: str, k: int, filters: Optional[Dict[str, Optional[str]]] = None
+    ) -> Optional[Dict[str, float]]:
+        """Embedding-based search returning {memory_id: cosine_similarity}.
+
+        If *filters* is provided, only returns results whose frontmatter matches
+        the scope filter (v1.6). The underlying index is still global; filtering
+        happens at output time (scheme C).
+        """
         if not self._ensure_embed_index():
             return None
         qvec = _embed_single(query)
         if qvec is None:
             return None
         try:
+            allowed_ids: Optional[Set[str]] = None
+            if filters:
+                active = self.store.list(active_only=True, filters=filters)
+                allowed_ids = {m.id() for m in active}
             if _HAS_NUMPY and isinstance(self._embed_array, np.ndarray):
                 qarr = np.array(qvec, dtype=np.float32)
                 scores = self._embed_array @ qarr  # dot product (all normalized)
-                top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+                if allowed_ids is not None:
+                    # Mask out-of-scope IDs before selecting top-k so scoped
+                    # matches are not discarded just because out-of-scope entries
+                    # score higher globally.
+                    masked_scores = np.copy(scores)
+                    for i, mid in enumerate(self._embed_ids):
+                        if mid not in allowed_ids:
+                            masked_scores[i] = -np.inf
+                    finite_count = int(np.isfinite(masked_scores).sum())
+                    if finite_count == 0:
+                        return {}
+                    top_idx = np.argpartition(-masked_scores, min(k, finite_count - 1))[:k]
+                else:
+                    top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
                 return {self._embed_ids[i]: float(scores[i]) for i in top_idx}
             else:
                 # Pure Python fallback
                 scores = {}
                 for mid, vec in zip(self._embed_ids, self._embed_array):
+                    if allowed_ids is not None and mid not in allowed_ids:
+                        continue
                     scores[mid] = _cosine_sim(qvec, vec)
                 return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k])
         except Exception as e:
-            logger.debug("Embedding search failed: %s", e)
+            logger.warning("Embedding search failed: %s", e)
             return None
 
     def _ensure_bm25_index(self) -> bool:
@@ -403,8 +440,13 @@ class SearchIndex:
         query: str,
         k: int,
         effectiveness: Optional[Dict[str, MemoryEffectiveness]] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict[str, float]:
-        """BM25 search via bm25s library returning {memory_id: score}."""
+        """BM25 search via bm25s library returning {memory_id: score}.
+
+        If *filters* is provided, only memories matching the scope filter are
+        considered (v1.6). The underlying index remains global.
+        """
         if not self._ensure_bm25_index():
             return {}
         query_tokens = _tokenise(query)
@@ -412,24 +454,45 @@ class SearchIndex:
             return {}
         try:
             scores = self._bm25_retriever.get_scores(query_tokens)
-        except Exception:
+        except Exception as e:
+            logger.warning("BM25 score computation failed: %s", e)
             return {}
+        # Resolve scope-filtered active set before ranking so in-scope matches
+        # are not discarded by global top-k truncation.
+        list_kwargs: Dict[str, Any] = {"active_only": True}
+        if filters:
+            list_kwargs["filters"] = filters
+        active_map = {m.id(): m for m in self.store.list(**list_kwargs)}
+        allowed_ids = set(active_map.keys()) if filters else None
+
         # top-k via argpartition (numpy) or sort (pure Python)
         if _HAS_NUMPY:
-            top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+            if allowed_ids is not None:
+                masked_scores = np.copy(scores)
+                for i, mid in enumerate(self._bm25_ids):
+                    if mid not in allowed_ids:
+                        masked_scores[i] = -np.inf
+                finite_count = int(np.isfinite(masked_scores).sum())
+                if finite_count == 0:
+                    return {}
+                top_idx = np.argpartition(-masked_scores, min(k, finite_count - 1))[:k]
+            else:
+                top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
         else:
             indexed = [(float(scores[i]), i) for i in range(len(scores))]
+            if allowed_ids is not None:
+                indexed = [(s, i) for s, i in indexed if self._bm25_ids[i] in allowed_ids]
             indexed.sort(reverse=True)
             top_idx = [idx for _, idx in indexed[:k]]
         results: Dict[str, float] = {}
-        active_map = {m.id(): m for m in self.store.list_active()}
         for idx in top_idx:
             score = float(scores[idx])
             if score <= 0:
                 continue
             mid = self._bm25_ids[idx]
-            if mid not in active_map:
-                continue
+            # allowed_ids was already applied before ranking; active_map is still
+            # needed for effectiveness lookup.
+            assert mid in active_map, f"BM25 top-k ID {mid} missing from active_map"
             if effectiveness:
                 eff = effectiveness.get(mid)
                 if eff:
@@ -453,7 +516,69 @@ class SearchIndex:
         hebbian_beta: float = 0.0,
         include_history: bool = False,
         fusion_mode: str = "rrf",
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> List[LoadedMemory]:
+        """Return ranked memories only."""
+        return self._search_impl(
+            query,
+            k=k,
+            zone=zone,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            delta=delta,
+            hebbian_beta=hebbian_beta,
+            include_history=include_history,
+            fusion_mode=fusion_mode,
+            explain=False,
+            filters=filters,
+        )
+
+    def search_explain(
+        self,
+        query: str,
+        k: int = 5,
+        zone: Optional[str] = None,
+        alpha: float = 0.5,
+        beta: float = 0.3,
+        gamma: float = 0.1,
+        delta: float = 0.1,
+        hebbian_beta: float = 0.0,
+        include_history: bool = False,
+        fusion_mode: str = "rrf",
+        filters: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict[str, Any]:
+        """Return ranked memories plus explainable score components."""
+        return self._search_impl(
+            query,
+            k=k,
+            zone=zone,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            delta=delta,
+            hebbian_beta=hebbian_beta,
+            include_history=include_history,
+            fusion_mode=fusion_mode,
+            explain=True,
+            filters=filters,
+        )
+
+    def _search_impl(
+        self,
+        query: str,
+        k: int = 5,
+        zone: Optional[str] = None,
+        alpha: float = 0.5,
+        beta: float = 0.3,
+        gamma: float = 0.1,
+        delta: float = 0.1,
+        hebbian_beta: float = 0.0,
+        include_history: bool = False,
+        fusion_mode: str = "rrf",
+        explain: bool = False,
+        filters: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Any:
         """Three-layer retrieval: Recall → Fusion → Rerank.
 
         Args:
@@ -463,6 +588,7 @@ class SearchIndex:
             hebbian_beta: Hebbian boost coefficient (default 0 = off)
         """
         normalized_zone = zone.lower().strip() if zone else None
+        filter_tuple = tuple(sorted((str(k), str(v or "")) for k, v in (filters or {}).items()))
         cache_key = (
             query.lower().strip(),
             k,
@@ -474,23 +600,56 @@ class SearchIndex:
             gamma,
             delta,
             hebbian_beta,
+            filter_tuple,
         )
-        with self._cache_lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                return cached
+        if not explain:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return cached
 
+        list_kwargs: Dict[str, Any] = {"filters": filters}
+        if normalized_zone:
+            list_kwargs["zone"] = normalized_zone
         if include_history:
-            active = self.store.list(zone=normalized_zone) if normalized_zone else self.store.list()
+            active = self.store.list(**list_kwargs)
         else:
-            active = self.store.list(zone=normalized_zone, active_only=True) if normalized_zone else self.store.list_active()
+            active = self.store.list(active_only=True, **list_kwargs)
         if not active:
+            if explain:
+                return {"results": [], "explain": {}, "meta": {"query": query, "k": k, "fusion_mode": fusion_mode}}
             return []
 
         now = datetime.now(timezone.utc)
         effectiveness = self.store.effectiveness()
         recall_k = k * 4
         active_map: Dict[str, LoadedMemory] = {m.id(): m for m in active}
+        explain_map: Dict[str, Dict[str, Any]] = {}
+
+        def _entry(mid: str) -> Dict[str, Any]:
+            data = explain_map.get(mid)
+            if data is None:
+                data = {
+                    "embedding_rank": None,
+                    "embedding_score": None,
+                    "bm25_rank": None,
+                    "bm25_score": None,
+                    "rrf_score": None,
+                    "weighted_base_score": None,
+                    "base_score": 0.0,
+                    "graph_only": False,
+                    "entity_boost": 0.0,
+                    "entity_hits": [],
+                    "recency_factor": 0.0,
+                    "effectiveness_factor": 0.0,
+                    "supersedes_factor": 1.0,
+                    "hebbian_boost": 0.0,
+                    "final_score": 0.0,
+                    "final_rank": None,
+                    "mmr_applied": False,
+                }
+                explain_map[mid] = data
+            return data
 
         # Layer 1: Recall
         # For history-inclusive queries we bypass the cached indexes (which only
@@ -499,7 +658,7 @@ class SearchIndex:
         embed_results: Dict[str, float] = {}
         if not include_history:
             try:
-                emb = self._embed_search(query, recall_k)
+                emb = self._embed_search(query, recall_k, filters=filters)
                 if emb is not None:
                     embed_results = emb
             except Exception as e:
@@ -509,12 +668,24 @@ class SearchIndex:
         bm25_results: Dict[str, float] = {}
         if not include_history:
             try:
-                bm25_results = self._bm25_search_bm25s(query, recall_k, effectiveness)
+                bm25_results = self._bm25_search_bm25s(query, recall_k, effectiveness, filters=filters)
             except Exception as e:
-                logger.debug("bm25s search failed, falling back to handrolled: %s", e)
+                logger.warning("bm25s search failed, falling back to handrolled: %s", e)
         if not bm25_results:
             bm25_scored = _bm25_search_scored(active, query, recall_k, effectiveness)
             bm25_results = {m.id(): s for m, s in bm25_scored}
+
+        if explain:
+            ranked_embed = sorted(embed_results.items(), key=lambda item: item[1], reverse=True)
+            for rank, (mid, score) in enumerate(ranked_embed, start=1):
+                info = _entry(mid)
+                info["embedding_rank"] = rank
+                info["embedding_score"] = score
+            ranked_bm25 = sorted(bm25_results.items(), key=lambda item: item[1], reverse=True)
+            for rank, (mid, score) in enumerate(ranked_bm25, start=1):
+                info = _entry(mid)
+                info["bm25_rank"] = rank
+                info["bm25_score"] = score
 
         # Layer 2: Fusion
         if fusion_mode == "rrf":
@@ -525,7 +696,29 @@ class SearchIndex:
             )
 
         if not fused_scores:
+            if explain:
+                return {"results": [], "explain": {}, "meta": {"query": query, "k": k, "fusion_mode": fusion_mode}}
             return []
+
+        if explain:
+            for mid, score in fused_scores.items():
+                info = _entry(mid)
+                info["base_score"] = score
+                if fusion_mode == "rrf":
+                    info["rrf_score"] = score
+                else:
+                    info["weighted_base_score"] = score
+
+        entity_boosts: Dict[str, float] = {}
+        entity_hits: Dict[str, List[Dict[str, Any]]] = {}
+        query_entities: List[Dict[str, Any]] = []
+        try:
+            entity_boosts, entity_hits, query_entities = self.store.compute_entity_boosts(
+                query,
+                candidate_ids=set(active_map.keys()),
+            )
+        except Exception as e:
+            logger.warning("Entity recall skipped: %s", e)
 
         # Layer 3: Rerank — recency, effectiveness, Hebbian, supersedes
         reranked: List[Tuple[float, LoadedMemory]] = []
@@ -549,6 +742,7 @@ class SearchIndex:
 
             sup_depth = self._calc_supersedes_depth(mid)
             sup_factor = (1.0 + sup_depth) / (2.0 + sup_depth)
+            entity_bonus = entity_boosts.get(mid, 0.0) * max(entity_weight(), 0.0)
 
             if fusion_mode == "rrf":
                 # RRF base score × bonuses (recency, eff, supersedes)
@@ -558,10 +752,19 @@ class SearchIndex:
                 if delta > 0:
                     score *= (1.0 + delta * eff_factor)
                 score *= sup_factor
+                score += entity_bonus
             else:
                 # Weighted: recency and eff are additive terms in the weighted sum
-                score = base_score * sup_factor
+                score = (base_score * sup_factor) + entity_bonus
 
+            if explain:
+                info = _entry(mid)
+                info["entity_boost"] = entity_bonus
+                info["entity_hits"] = entity_hits.get(mid, [])
+                info["recency_factor"] = recency
+                info["effectiveness_factor"] = eff_factor
+                info["supersedes_factor"] = sup_factor
+                info["final_score"] = score
             if score > max_rerank_score:
                 max_rerank_score = score
             reranked.append((score, mem))
@@ -579,14 +782,24 @@ class SearchIndex:
                 # associated but semantically distant memories are recoverable.
                 for nid, act in activation.items():
                     if nid in active_map and nid not in fused_scores:
-                        reranked.append((hebbian_beta * min(act, 1.0) * scale, active_map[nid]))
+                        hebbian_score = hebbian_beta * min(act, 1.0) * scale
+                        reranked.append((hebbian_score, active_map[nid]))
+                        if explain:
+                            info = _entry(nid)
+                            info["graph_only"] = True
+                            info["hebbian_boost"] = hebbian_score
+                            info["final_score"] = hebbian_score
                 for i, (score, mem) in enumerate(reranked):
                     act = activation.get(mem.id(), 0.0)
                     if act > 0:
                         hebbian_score = hebbian_beta * min(act, 1.0) * scale
                         reranked[i] = (score + hebbian_score, mem)
+                        if explain:
+                            info = _entry(mem.id())
+                            info["hebbian_boost"] = hebbian_score
+                            info["final_score"] = score + hebbian_score
             except Exception as e:
-                logger.debug("Hebbian boost skipped: %s", e)
+                logger.warning("Hebbian boost skipped: %s", e)
 
         reranked.sort(key=lambda x: x[0], reverse=True)
         results = [m for _, m in reranked]
@@ -601,8 +814,36 @@ class SearchIndex:
         # MMR diversity re-ranking (optional, λ=0.7 balances relevance vs diversity)
         if k > 1:
             results = self._mmr_rerank(query, results, lambda_param=0.7, top_n=k * 2)
+            if explain:
+                for mid in explain_map:
+                    explain_map[mid]["mmr_applied"] = True
 
         results = results[:k]
+        if explain:
+            backend_caps = None
+            try:
+                caps = self.store.search_backend_capabilities()
+                backend_caps = caps.__dict__ if hasattr(caps, "__dict__") else dict(caps)
+            except Exception as e:
+                logger.warning("Could not retrieve backend capabilities: %s", e)
+                backend_caps = None
+            for rank, mem in enumerate(results, start=1):
+                _entry(mem.id())["final_rank"] = rank
+            return {
+                "results": results,
+                "explain": {mem.id(): explain_map.get(mem.id(), {}) for mem in results},
+                "meta": {
+                    "query": query,
+                    "k": k,
+                    "zone": normalized_zone,
+                    "include_history": include_history,
+                    "fusion_mode": fusion_mode,
+                    "hebbian_beta": hebbian_beta,
+                    "query_entities": query_entities,
+                    "backend_capabilities": backend_caps,
+                    "applied_filters": filters,
+                },
+            }
         with self._cache_lock:
             self._cache[cache_key] = results
         return results
@@ -751,6 +992,7 @@ class SearchIndex:
         body: str,
         threshold: Optional[float] = None,
         exclude_ids: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> Optional[Tuple[str, float]]:
         """Check for conflicting memories using dual-path detection.
 
@@ -758,6 +1000,7 @@ class SearchIndex:
         Path 2: BM25 sigmoid (keyword overlap, supplementary)
 
         Returns (memory_id, score) if conflict found, None otherwise.
+        When *filters* is provided, only considers memories matching the scope.
         """
         tokens = _tokenise(body)
         if threshold is None:
@@ -766,9 +1009,21 @@ class SearchIndex:
                 threshold = max(0.65, threshold - 0.05)
 
         active = self.store.list_active()
+        if filters:
+            # Apply scope filters to conflict check so scoped writes only
+            # compare against memories in the same scope (v1.6).
+            active = [m for m in active if all(
+                getattr(m.frontmatter, k, None) == v for k, v in filters.items()
+            )]
         if exclude_ids:
             exclude = set(exclude_ids)
             active = [m for m in active if m.id() not in exclude]
+
+        # Build allowed set for embedding path so global index output is
+        # restricted to the same scope (v1.6 scheme C).
+        allowed_ids: Optional[Set[str]] = None
+        if filters or exclude_ids:
+            allowed_ids = {m.id() for m in active}
 
         # Path 1: Embedding
         exclude_set = set(exclude_ids) if exclude_ids else set()
@@ -778,10 +1033,11 @@ class SearchIndex:
                 if qvec is not None and _HAS_NUMPY and isinstance(self._embed_array, np.ndarray):
                     qarr = np.array(qvec, dtype=np.float32)
                     scores = self._embed_array @ qarr
-                    if exclude_set:
-                        for i, mid in enumerate(self._embed_ids):
-                            if mid in exclude_set:
-                                scores[i] = -1.0
+                    for i, mid in enumerate(self._embed_ids):
+                        if mid in exclude_set:
+                            scores[i] = -1.0
+                        elif allowed_ids is not None and mid not in allowed_ids:
+                            scores[i] = -1.0
                     best_idx = int(np.argmax(scores))
                     best_score = float(scores[best_idx])
                     if best_score > threshold:
@@ -792,14 +1048,16 @@ class SearchIndex:
                     for mid, vec in zip(self._embed_ids, self._embed_array):
                         if mid in exclude_set:
                             continue
+                        if allowed_ids is not None and mid not in allowed_ids:
+                            continue
                         sim = _cosine_sim(qvec, vec)
                         if sim > best_score:
                             best_score = sim
                             best_id = mid
                     if best_score > threshold and best_id:
                         return (best_id, best_score)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Embedding conflict detection failed, falling back to BM25: %s", e)
 
         # Path 2: BM25
         scored = _bm25_search_scored(active, body, 1, query_tokens=tokens)

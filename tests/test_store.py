@@ -271,6 +271,55 @@ class TestPostDeleteCallbacks:
         assert result is True
         assert mid in called
 
+    def test_callbacks_invoked_on_sync_from_disk(self, temp_store):
+        """_sync_from_disk must fire post-delete callbacks for removed IDs."""
+        store = temp_store
+        called: list = []
+        store._post_delete_callbacks.append(lambda mid: called.append(mid))
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then sync")
+        mid = fm.id
+
+        # Sanity: memory exists before deletion
+        assert store.get(mid) is not None
+
+        path.unlink()
+        store._sync_from_disk()
+
+        assert mid in called, f"expected callback for {mid}, got {called}"
+        assert store.get(mid) is None
+
+    def test_callbacks_invoked_on_prune_index(self, temp_store):
+        """prune_index must fire post-delete callbacks for pruned IDs."""
+        store = temp_store
+        called: list = []
+        store._post_delete_callbacks.append(lambda mid: called.append(mid))
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then prune")
+        mid = fm.id
+
+        path.unlink()
+        result = store.prune_index()
+
+        assert result["pruned"] == 1
+        assert mid in called, f"expected callback for {mid}, got {called}"
+
+    def test_prune_index_records_delete_event(self, temp_store):
+        """prune_index must record a DELETE memory event for each pruned ID."""
+        store = temp_store
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then prune")
+        mid = fm.id
+
+        path.unlink()
+        store.prune_index()
+
+        events = store.get_memory_events(mid, event_types=["DELETE"])
+        assert len(events) == 1
+        assert events[0]["event_type"] == "DELETE"
+
     def test_callback_failure_does_not_block_delete(self, temp_store):
         """A failing callback does not prevent the delete from succeeding."""
         store = temp_store
@@ -287,3 +336,79 @@ class TestPostDeleteCallbacks:
         result = store.delete("user", mid)
         assert result is True
         assert store.get(mid) is None
+
+
+class TestEntityRebuildIntegrity:
+    """P0-1: Verify _refresh_entity_links rebuild cleans orphans correctly."""
+
+    def test_rebuild_entity_links_after_manual_corruption(self, temp_store):
+        """Design intent: rebuild_index should restore entity_links from memory bodies."""
+        store = temp_store
+
+        fm = MemoryFrontmatter.new(source="test")
+        fm.id = "rebuild-entity"
+        store.put("user", fm, 'Use file "src/app/main.py" for testing')
+
+        # Verify entity was extracted
+        links_before = store.entity_links_for_memory("rebuild-entity")
+        assert links_before, "Entity links should exist after put"
+
+        # Manually corrupt the entity_links table - delete links but keep entities
+        conn = store._get_conn()
+        conn.execute("DELETE FROM entity_links WHERE memory_id = ?", ("rebuild-entity",))
+        conn.commit()
+
+        # Verify corruption - entity_links empty but memory still exists
+        links_corrupt = store.entity_links_for_memory("rebuild-entity")
+        assert links_corrupt == [], "Entity links should be empty after corruption"
+
+        # Rebuild the index
+        result = store.rebuild_index()
+
+        # Verify entity links were recreated
+        links_after = store.entity_links_for_memory("rebuild-entity")
+        assert links_after, "Entity links should be restored after rebuild"
+        assert any("main.py" in link["text"] for link in links_after)
+
+        # No orphan entities
+        orphan_count = conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE id NOT IN (SELECT entity_id FROM entity_links)"
+        ).fetchone()[0]
+        assert orphan_count == 0
+
+
+class TestMemoryUpdateConflict:
+    """P0-2: Test MemoryStore.update() validates supersedes and checks conflicts."""
+
+    def test_update_with_supersedes_does_not_crash_on_nonexistent_target(self, temp_store):
+        """Design intent: update validates memory ID exists, raises ValueError for missing."""
+        store = temp_store
+
+        with pytest.raises(ValueError, match="Memory not found"):
+            store.update("nonexistent-id", body="New body")
+
+
+class TestHealthMetricsFallback:
+    """P0-3: Test health_metrics() duplicate detection fallback when datasketch unavailable."""
+
+    def test_duplicate_detection_without_datasketch(self, temp_store, monkeypatch):
+        """Design intent: health_metrics should work when datasketch not installed."""
+        store = temp_store
+
+        for i in range(5):
+            fm = MemoryFrontmatter.new(source="test")
+            store.put("user", fm, f"Duplicate body text is shared across {i} similar memories")
+
+        # Remove datasketch from sys.modules to trigger fallback
+        import sys
+        original = sys.modules.get("datasketch")
+        sys.modules["datasketch"] = None
+
+        try:
+            metrics = store.health_metrics()
+            assert "duplicate_clusters" in metrics
+        finally:
+            if original:
+                sys.modules["datasketch"] = original
+            else:
+                sys.modules.pop("datasketch", None)

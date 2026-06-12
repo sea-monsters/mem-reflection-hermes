@@ -50,7 +50,7 @@ def _inject_effectiveness(store, eff_map):
 def _mock_embed(store, mapping: Dict[str, float]):
     """Patch SearchIndex._embed_search to return controlled cosine scores."""
     si = store._get_search_index()
-    si._embed_search = lambda query, k: mapping
+    si._embed_search = lambda query, k, filters=None: mapping
 
 
 # ---------------------------------------------------------------------------

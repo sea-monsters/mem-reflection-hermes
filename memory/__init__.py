@@ -1,9 +1,13 @@
 """Memory management: curation, bridging, and context assembly.
 
 This package contains:
-- curator.py: Automated memory lifecycle management (4-phase pipeline)
+- curator/: Composable action pipeline for memory lifecycle (v1.5 refactor)
+  - actions.py: CuratorAction classes (ArchiveStale, CompactChains, etc.)
+  - helpers.py: is_protected, build_cold_entry, archive_and_delete, config
+  - cold_store.py: JSONL append-only cold storage
+  - report.py: Report generation and persistence
 - bridge.py: Bidirectional sync between built-in and plugin memory
-- context.py: Palace-mode context assembly
+- context.py: Context assembly with stable/dynamic split and graded compression
 """
 
 from .curator import (
@@ -26,6 +30,8 @@ from .bridge import (
 
 from .context import (
     build_context_block,
+    build_context_bundle,
+    ContextBundle,
 )
 
 __all__ = [
@@ -45,4 +51,6 @@ __all__ = [
     "_refine_body",
     # Context exports
     "build_context_block",
+    "build_context_bundle",
+    "ContextBundle",
 ]

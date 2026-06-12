@@ -1,6 +1,7 @@
 """Runtime hook implementation for mem-reflection-hermes."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 import json
 import logging
 import sys
@@ -8,6 +9,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .checkpoint import (
+    clear_pending_stage as _checkpoint_clear_pending_stage,
+    clear_session_state as _checkpoint_clear_session_state,
+    mark_pending_stage as _checkpoint_mark_pending_stage,
+    mark_stage_completed as _checkpoint_mark_stage_completed,
+    recover_pending_work as _checkpoint_recover_pending_work,
+    snapshot_session_state as _checkpoint_snapshot_session_state,
+)
+from ..core.config import get_plugin_config_model
 from ..core.store import (
     LoadedMemory, MemoryFrontmatter, record_memory_stat,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
@@ -21,6 +31,7 @@ from ..reflection.engine import (
     _reset_current_session_memory_ids,
 )
 from ..core.search import _is_explicit_memory_intent
+from ._lb import _lb
 
 logger = logging.getLogger(__name__)
 
@@ -74,15 +85,15 @@ def _cleanup_session_state(session_id: str) -> None:
     """Remove session state after session ends."""
     with _session_states_lock:
         _session_states.pop(session_id, None)
+    try:
+        _checkpoint_clear_session_state(session_id)
+    except Exception:
+        logger.debug("Failed to clear checkpoint session state for %s", session_id, exc_info=True)
 
 def _set_plugin_context(ctx: Any) -> None:
     """Remember the host plugin context for hooks that run without ctx kwargs."""
     global _plugin_ctx
     _plugin_ctx = ctx
-
-def _lb(name: str):
-    from mem_reflection_hermes import __dict__ as _pkg_dict
-    return _pkg_dict[name]
 
 def _get_mem_store():
     return _lb("_get_mem_store")()
@@ -92,6 +103,9 @@ def _get_skill_store():
 
 def _build_context_block(query=""):
     return _lb("_build_context_block")(query)
+
+def _build_context_bundle(query="", max_tokens=4000, stable_only=False):
+    return _lb("_build_context_bundle")(query, max_tokens=max_tokens, stable_only=stable_only)
 
 def _estimate_tokens(text):
     return _lb("_estimate_tokens")(text)
@@ -122,12 +136,111 @@ _gm_singleton = None
 _gm_singleton_lock = threading.Lock()
 
 
+def _context_token_budget() -> int:
+    try:
+        return int(get_plugin_config_model().context.token_budget)
+    except Exception:
+        return 2000
+
+
+def _context_timeout_ms() -> int:
+    try:
+        return int(get_plugin_config_model().context.recall_timeout_ms)
+    except Exception:
+        return 1500
+
+
+def _render_context_bundle(bundle: Any) -> Optional[str]:
+    if bundle is None:
+        return None
+    stable = getattr(bundle, "append_system_context", "") or ""
+    dynamic = getattr(bundle, "prepend_context", "") or ""
+    parts = [stable, dynamic]
+    text = "\n\n".join(p for p in parts if p)
+    return text or None
+
+
+def _build_context_with_timeout(query: str, budget: int) -> Optional[str]:
+    timeout_ms = max(1, _context_timeout_ms())
+
+    def _assemble_full():
+        return _build_context_bundle(query, max_tokens=budget, stable_only=False)
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="srh-context")
+    future = executor.submit(_assemble_full)
+    try:
+        bundle = future.result(timeout=timeout_ms / 1000.0)
+        context = _render_context_bundle(bundle)
+        if context:
+            executor.shutdown(wait=True)
+            return context
+    except _FutureTimeoutError:
+        logger.warning(
+            "Context assembly timed out after %dms for query=%r; falling back to stable-only context",
+            timeout_ms,
+            query[:80],
+        )
+    except Exception as e:
+        logger.warning("Context assembly failed before fallback: %s", e)
+
+    # Non-success path: do not wait for a slow or failed worker before
+    # building the stable-only fallback.
+    executor.shutdown(wait=False)
+
+    try:
+        fallback_bundle = _build_context_bundle(query, max_tokens=budget, stable_only=True)
+        return _render_context_bundle(fallback_bundle)
+    except Exception as e:
+        logger.warning("Stable-only context fallback failed: %s", e)
+        return None
+
+
 # === Hooks ===
 def _on_session_start(**kwargs) -> None:
     global _turns_since_reflect
     with _turns_since_reflect_lock:
         _turns_since_reflect = 0
     _reset_current_session_memory_ids()
+    ctx = kwargs.get("ctx") or _plugin_ctx
+    checkpoint_cfg = None
+    try:
+        checkpoint_cfg = get_plugin_config_model().checkpoint
+    except Exception:
+        checkpoint_cfg = None
+    try:
+        mem_store = _lb("_get_mem_store")()
+
+        def _reflection_runner(_session_id: str, entry: Dict[str, Any]) -> None:
+            _run_full_reflection(ctx, entry.get("messages") or [])
+
+        def _compaction_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
+            from ..reflection.runtime import _compact_episode_zone as _compact
+            from .. import _config_compaction as _cc
+            if _cc():
+                _compact(mem_store, ctx)
+
+        def _curator_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
+            from ..memory.curator import _curator_enabled, _run_curator
+            if _curator_enabled(mem_store):
+                _run_curator(ctx, mem_store)
+
+        def _diagnostic_logger(entry: Dict[str, Any]) -> None:
+            try:
+                _lb("_append_reflect_log")(entry)
+            except Exception:
+                logger.debug("Failed to write checkpoint recovery diagnostic", exc_info=True)
+
+        if checkpoint_cfg is None or (checkpoint_cfg.enabled and checkpoint_cfg.recover_on_session_start):
+            recovered = _checkpoint_recover_pending_work(
+                reflection_runner=_reflection_runner,
+                compaction_runner=_compaction_runner,
+                curator_runner=_curator_runner,
+                diagnostic_logger=_diagnostic_logger,
+            )
+            if any(recovered.values()):
+                logger.info("Recovered pending runtime work on session start: %s", recovered)
+    except Exception:
+        logger.warning("Pending runtime recovery failed during session start", exc_info=True)
     logger.debug("mem-reflection-hermes: session started")
 
 
@@ -135,6 +248,7 @@ def _on_session_start(**kwargs) -> None:
 def _on_session_end(**kwargs) -> None:
     session_id = kwargs.get("session_id", "")
     reason = kwargs.get("reason", "")  # v0.16.0: "shutdown" | "session_expired" | "new_session"
+    ctx = kwargs.get("ctx") or _plugin_ctx
     with _session_messages_lock:
         messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
 
@@ -148,6 +262,11 @@ def _on_session_end(**kwargs) -> None:
     stats = _session_states.get(session_id, {})
     api_errors = stats.get("api_error_count", 0)
     subagent_count = stats.get("subagent_count", 0)
+    if session_id:
+        try:
+            _checkpoint_snapshot_session_state(session_id, stats)
+        except Exception:
+            logger.debug("Failed to checkpoint session state for %s", session_id, exc_info=True)
 
     # ── Periodic graph decay ──────────────────────────────
     try:
@@ -160,10 +279,24 @@ def _on_session_end(**kwargs) -> None:
     try:
         if not messages:
             return
-        ctx = kwargs.get("ctx") or _plugin_ctx
+        if session_id:
+            try:
+                _checkpoint_mark_pending_stage(session_id, "reflection", {
+                    "reason": reason,
+                    "messages": messages[-80:],
+                    "message_count": len(messages),
+                    "api_error_count": api_errors,
+                    "subagent_count": subagent_count,
+                })
+            except Exception:
+                logger.debug("Failed to mark reflection pending for %s", session_id, exc_info=True)
         if ctx is not None:
             try:
                 _run_full_reflection(ctx, messages)
+                if session_id:
+                    _checkpoint_mark_stage_completed(session_id, "reflection", {
+                        "message_count": len(messages),
+                    })
             except Exception as e:
                 logger.warning("Full reflection failed: %s", e)
                 logger.warning("Full reflection traceback:", exc_info=True)
@@ -182,10 +315,20 @@ def _on_session_end(**kwargs) -> None:
         # ── Episode compaction (v1.1) ──────────────────────
         # Run after reflection to compact raw episode entries into summaries.
         try:
-            from .runtime_reflection import _compact_episode_zone as _compact
-            from . import _config_compaction as _cc
+            from ..reflection.runtime import _compact_episode_zone as _compact
+            from .. import _config_compaction as _cc
             if _cc():
+                if session_id:
+                    _checkpoint_mark_pending_stage(session_id, "compaction", {
+                        "reason": reason,
+                        "message_count": len(messages),
+                    })
                 result = _compact(_lb("_get_mem_store")(), ctx)
+                if session_id:
+                    _checkpoint_mark_stage_completed(session_id, "compaction", {
+                        "compacted": result.get("compacted", 0),
+                        "total_raw_consumed": result.get("total_raw_consumed", 0),
+                    })
                 if result.get("compacted", 0) > 0:
                     logger.info(
                         "Episode compaction: %d clusters compressed "
@@ -198,10 +341,21 @@ def _on_session_end(**kwargs) -> None:
 
         # ── Memory curator (v1.2) — runs after compaction ─────
         try:
-            from .memory_curator import _curator_enabled, _run_curator
+            from ..memory.curator import _curator_enabled, _run_curator
             mem_store = _lb("_get_mem_store")()
             if _curator_enabled(mem_store):
+                if session_id:
+                    _checkpoint_mark_pending_stage(session_id, "curator", {
+                        "reason": reason,
+                        "message_count": len(messages),
+                    })
                 cur_result = _run_curator(ctx, mem_store)
+                if session_id:
+                    _checkpoint_mark_stage_completed(session_id, "curator", {
+                        "archived": cur_result.get("archived", 0),
+                        "superseded": cur_result.get("superseded", 0),
+                        "similar": cur_result.get("similar", 0),
+                    })
                 if cur_result.get("archived", 0) or cur_result.get("superseded", 0) or cur_result.get("similar", 0):
                     logger.info("Memory curator: %s", cur_result.get("report", "done"))
         except Exception as _cue:
@@ -277,31 +431,22 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
             if isinstance(query, str):
                 break
             query = ""
-    try:
-        context = _build_context_block(query)
-    except Exception as e:
-        # P2-22: phase failure should silently skip rather than fail the whole hook
-        logger.warning("Context block build failed in pre_llm_call, skipping injection: %s", e)
-        context = None
+    budget = _context_token_budget()
+    context = _build_context_with_timeout(query, budget)
 
     # Token budget enforcement (beta3: truncate or skip if context too large)
     if context:
         try:
             tok = _estimate_tokens(context)
-            # Default 2000-token budget for injected context; overridable via config
-            budget = 2000
-            try:
-                from .store import plugin_config
-                budget = plugin_config().get("memory", {}).get("context_token_budget", 2000)
-            except Exception:
-                pass
             if tok > budget:
                 # Hard truncate to budget (rough: 4 chars/token for ASCII)
                 trunc_len = int(budget * 3.5)
                 context = context[:trunc_len] + "\n...[context truncated]"
                 logger.debug("Context truncated from %d to ~%d tokens", tok, budget)
-        except Exception:
-            pass  # Budget check failure is non-fatal
+        except Exception as e:
+            logger.warning("Token budget check failed, applying hard truncation: %s", e)
+            trunc_len = int(budget * 4)
+            context = context[:trunc_len] + "\n...[context truncated]"
         return {"context": context}
     return None
 
@@ -351,9 +496,9 @@ def _post_tool_call(**kwargs) -> None:
                 old_text = args.get("old_text", "")
                 entries_after = result_obj.get("entries", None)
 
-                from .memory_bridge import bridge_enabled as _bridge_enabled
+                from ..memory.bridge import bridge_enabled as _bridge_enabled
                 if _bridge_enabled():
-                    from .memory_bridge import mirror_builtin_to_plugin as _mirror
+                    from ..memory.bridge import mirror_builtin_to_plugin as _mirror
                     try:
                         _mirror(
                             action=action,
@@ -487,6 +632,11 @@ def _get_graph_neighbors(memory_ids: List[str], max_results: int = 5,
     Returns deduplicated (memory_id, weight) pairs, sorted by weight descending.
     If zone_filter is provided, only returns neighbors whose zone matches.
     Gracefully returns empty list if graph data is not available or has no data.
+
+    Note: Graph expansion is scope-agnostic. Scope filtering (user_id/agent_id/run_id)
+    is applied to the primary search results, but graph neighbors may include memories
+    from different scopes. In multi-tenant scenarios, treat graph_expanded as hints
+    rather than authoritative results.
     """
     try:
         gm = _get_graph_mgr()

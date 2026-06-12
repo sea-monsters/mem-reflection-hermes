@@ -306,8 +306,10 @@ class _GraphStoreShim:
     def stats(self) -> dict:
         stats = self._gi.stats()
         stats["healthy"] = True
-        stats["node_count"] = stats.get("nodes", 0)
-        stats["edge_count"] = stats.get("edges", 0)
+        stats["nodes"] = stats.get("nodes", 0)
+        stats["edges"] = stats.get("edges", 0)
+        stats["node_count"] = stats["nodes"]
+        stats["edge_count"] = stats["edges"]
         return stats
 
     def _connect(self):
@@ -741,39 +743,79 @@ def srh_associate(args: dict, **kwargs) -> str:
 
 
 def srh_graph_retrieve(args: dict, **kwargs) -> str:
-    from .. import _get_graph_mgr
+    try:
+        from .. import _get_graph_mgr
+    except ImportError:
+        from mem_reflection_hermes import _get_graph_mgr
     gm = _get_graph_mgr()
-    seed_ids = args.get("seed_ids", [])
+    seed_ids = args.get("memory_ids", [])
     max_results = int(args.get("max_results", 10))
-    tier = args.get("tier", "count")
-    results = gm.retrieve(seed_ids, max_results=max_results, tier=tier)
+    tier = args.get("tier", "list")
+    if tier == "all":
+        tier = "detail"
+    results = gm.retrieve_related(
+        seed_ids,
+        task_type="reasoning",
+        max_results=max_results,
+        tier=tier,
+    )
     return json.dumps({"results": results}, ensure_ascii=False)
 
 
 def srh_graph_stats(args: dict, **kwargs) -> str:
-    from .. import _get_graph_mgr
+    try:
+        from .. import _get_graph_mgr
+    except ImportError:
+        from mem_reflection_hermes import _get_graph_mgr
     gm = _get_graph_mgr()
-    stats = gm.stats()
+    stats = gm.get_stats(tier="summary")
     return json.dumps(stats, ensure_ascii=False)
 
 
 def srh_graph_viz(args: dict, **kwargs) -> str:
-    from .. import _get_graph_mgr
+    try:
+        from .. import _get_graph_mgr
+    except ImportError:
+        from mem_reflection_hermes import _get_graph_mgr
     gm = _get_graph_mgr()
-    fmt = args.get("format", "adjacency")
-    depth = int(args.get("depth", 2))
-    viz = gm.visualize(format=fmt, depth=depth)
-    return json.dumps(viz, ensure_ascii=False)
+    stats = gm.get_stats(tier="detail")
+    if stats.get("node_count", 0) == 0:
+        return json.dumps({"nodes": [], "edges": [], "stats": stats})
+    try:
+        nodes = [
+            {"id": n["memory_id"], "zone": n.get("zone")}
+            for n in gm.store.get_all_nodes()
+        ]
+        edges = [
+            {"source": src, "target": tgt, "weight": w}
+            for src, tgt, w in gm.store.get_all_edges(min_weight=0.1)
+        ]
+        return json.dumps(
+            {
+                "nodes": nodes,
+                "edges": edges,
+                "stats": {**stats, "graph_semantics": "associative_coactivation"},
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "stats": stats}, ensure_ascii=False)
 
 
 def srh_memory_health(args: dict, **kwargs) -> str:
-    from .. import _get_mem_store, _get_graph_mgr
+    try:
+        from .. import _get_mem_store, _get_graph_mgr
+    except ImportError:
+        from mem_reflection_hermes import _get_mem_store, _get_graph_mgr
     mem_store = _get_mem_store()
     gm = _get_graph_mgr()
-    stats = gm.stats()
-    total = stats.get("total_edges", 0)
-    return json.dumps({
-        "graph_edges": total,
-        "memories_indexed": len(mem_store.list_active()),
-        "status": "healthy" if total > 0 else "empty",
-    }, ensure_ascii=False)
+    stats = gm.get_stats(tier="summary")
+    total = stats.get("edges", 0)
+    return json.dumps(
+        {
+            "graph_edges": total,
+            "memories_indexed": len(mem_store.list_active()),
+            "status": "healthy" if total > 0 else "empty",
+        },
+        ensure_ascii=False,
+    )

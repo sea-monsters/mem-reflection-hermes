@@ -23,27 +23,48 @@ Plugins do **not** implement their own auth layer — the host guarantees auth f
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 15 routes (v1.2-beta2).
+Current surface: 15 routes (v1.6).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/memories` | List all active memories |
+| `GET` | `/memories` | List all active memories (optional `zone`, `query`, `user_id`, `agent_id`, `run_id`) |
 | `POST` | `/memories` | Create new memory (auto-associates in graph) |
 | `PUT` | `/memories/{id}` | **Atomic update** (write-then-delete swap, cache + index) |
 | `DELETE` | `/memories/{id}` | Delete memory + cleanup graph edges |
 | `POST` | `/memories/reorder` | **Atomic reorder** via explicit `rank` assignment |
 | `GET` | `/zones` | All zones with counts |
-| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes |
+| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes (optional `user_id`, `agent_id`, `run_id`) |
 | `GET` | `/graph/neighbors/{id}` | Graph neighbors for a memory with metadata enrichment |
 | `GET` | `/graph/zones` | Cross-zone bridge analysis (includes `zone_degree`) |
 | `GET` | `/query` | Runtime memory/search/graph query API |
 | `GET` | `/skills` | All skills with metadata |
 | `GET` | `/reflections` | Recent reflection outcomes (optional `mode` filter) |
 | `GET` | `/reflections/audit` | Flattened reflection audit entries (optional `decision` filter) |
-| `GET` | `/stats` | Aggregate statistics (memory count, zones, graph stats, cache stats) |
+| `GET` | `/stats` | Aggregate statistics (optional `user_id`, `agent_id`, `run_id`) |
 | `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.2) |
 
-## Reflection Audit Log (v0.9.2-beta2)
+## Scope Filters (v1.6)
+
+The `/memories`, `/graph`, and `/stats` endpoints accept optional `user_id`,
+`agent_id`, and `run_id` query parameters. When provided, results are filtered
+to memories matching all supplied scope fields. Omitting them preserves the
+original global view.
+
+```bash
+# Memories scoped to a specific user and run
+GET /memories?user_id=alice&run_id=sess-001
+
+# Graph for a specific agent
+GET /graph?agent_id=claude
+
+# Stats for a specific run
+GET /stats?run_id=sess-001
+```
+
+Memory objects returned by the dashboard now include the `user_id`, `agent_id`,
+and `run_id` fields when present.
+
+## Reflection Audit Log (v0.9.2-beta)
 
 The reflection pipeline now writes structured `audit_entries` into each reflect
 log record. These entries explain why a candidate was accepted, skipped,

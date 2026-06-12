@@ -23,6 +23,7 @@ from ..reflection.runtime import (
     _run_full_reflection, _run_micro_reflection,
     _run_embedding_reflection, _run_embedding_micro_reflection,
 )
+from ._lb import _lb
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,6 @@ def _jd(obj, **kw) -> str:
     if "ensure_ascii" not in kw:
         kw["ensure_ascii"] = False
     return json.dumps(obj, default=str, **kw)
-
-def _lb(name: str):
-    from mem_reflection_hermes import __dict__ as _pkg_dict
-    return _pkg_dict[name]
 
 __all__ = [
     "register",
@@ -94,9 +91,6 @@ def _get_graph_neighbors(*a, **kw):
 def _enrich_with_graph(*a, **kw):
     return _lb("_enrich_with_graph")(*a, **kw)
 
-def build_palace_index(*a, **kw):
-    return _lb("build_palace_index")(*a, **kw)
-
 def load_zone_summary(zone):
     return _lb("load_zone_summary")(zone)
 
@@ -124,14 +118,33 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     k = int(args.get("k", 5))
     zone_filter = args.get("zone")  # Optional zone scope
     include_history = bool(args.get("include_history", False))
+    explain = bool(args.get("explain", False))
+    filters = args.get("filters") or None
     mem_store = _get_mem_store()
     # ── Scheme C: Fusion search (BM25 × Graph × Supersedes) instead of two-stage ──
-    results = mem_store.fusion_search(query, k, zone=_normalize_zone(zone_filter) if zone_filter else None,
-                                       include_history=include_history)
+    normalized_zone = _normalize_zone(zone_filter) if zone_filter else None
+    explain_payload = None
+    if explain:
+        explain_payload = mem_store.fusion_search_explain(
+            query,
+            k,
+            zone=normalized_zone,
+            include_history=include_history,
+            filters=filters,
+        )
+        results = explain_payload.get("results", [])
+    else:
+        results = mem_store.fusion_search(
+            query,
+            k,
+            zone=normalized_zone,
+            include_history=include_history,
+            filters=filters,
+        )
     out = []
     for m in results:
         is_superseded = mem_store.is_superseded(m.id())
-        out.append({
+        item = {
             "id": m.id(),
             "scope": m.scope,
             "confidence": m.frontmatter.confidence,
@@ -140,18 +153,32 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
             "zone": m.frontmatter.zone,
             "body": m.body[:500],
             "lineage_status": "superseded" if is_superseded else "active",
-        })
+        }
+        for field in ("user_id", "agent_id", "run_id"):
+            val = getattr(m.frontmatter, field, None)
+            if val is not None:
+                item[field] = val
+        if explain and explain_payload is not None:
+            item["explain"] = explain_payload.get("explain", {}).get(m.id(), {})
+        out.append(item)
         record_memory_stat(m.id(), "accessed")
 
     # ── Enrich with graph neighbors (now as supplement, not primary ranking) ──
-    graph_expanded = _get_graph_neighbors([m.id() for m in results], max_results=k,
-                                          zone_filter=_normalize_zone(zone_filter) if zone_filter else None)
+    # v1.6: graph expansion is scope-agnostic — when scope filters are active,
+    # skip graph expansion to avoid leaking cross-scope memories as hints.
+    graph_expanded: List[Tuple[str, float]] = []
+    if not filters:
+        graph_expanded = _get_graph_neighbors([m.id() for m in results], max_results=k,
+                                              zone_filter=normalized_zone)
     for neigh_id, _ in graph_expanded:
         record_memory_stat(neigh_id, "accessed")
-    return json.dumps({
+    response = {
         "results": out,
         "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],
-    }, ensure_ascii=False)
+    }
+    if explain and explain_payload is not None:
+        response["meta"] = explain_payload.get("meta", {})
+    return json.dumps(response, ensure_ascii=False)
 
 
 def _tool_srh_memory_write(args: dict, **kwargs) -> str:
@@ -170,7 +197,8 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
     # Validate supersedes targets exist and no cycles
     if supersedes:
         for sid in supersedes:
-            if mem_store.get(sid) is None:
+            target = mem_store.get(sid)
+            if target is None:
                 return _jd({
                     "error": f"supersedes target not found: {sid}",
                     "missing_id": sid,
@@ -184,9 +212,39 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
                     "cycle": cycle,
                 })
 
+    # Extract scope fields before conflict check so scoped writes only
+    # conflict-detect within their own scope (v1.6).
+    user_id = args.get("user_id")
+    agent_id = args.get("agent_id")
+    run_id = args.get("run_id")
+
+    # Cross-scope supersedes guard — prevent scoped writes from superseding
+    # memories owned by a different scope (v1.6).
+    if supersedes and (user_id or agent_id or run_id):
+        for sid in supersedes:
+            target = mem_store.get(sid)
+            if target is None:
+                continue
+            tfm = target.frontmatter
+            for key, val in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)):
+                if val is not None and getattr(tfm, key, None) is not None and getattr(tfm, key, None) != val:
+                    return _jd({
+                        "error": f"supersedes target {sid} belongs to a different scope ({key}: {getattr(tfm, key, None)} != {val})",
+                        "conflict_id": sid,
+                        "scope_field": key,
+                    })
+    scope_filters = {}
+    if user_id is not None:
+        scope_filters["user_id"] = user_id
+    if agent_id is not None:
+        scope_filters["agent_id"] = agent_id
+    if run_id is not None:
+        scope_filters["run_id"] = run_id
+
     # Conflict check — skip targets being superseded to avoid rejecting
-    # intentional replacements (P1)
-    conflict = mem_store.check_conflict(body, exclude_ids=supersedes)
+    # intentional replacements (P1).  Pass scope_filters so scoped writes
+    # only compare against memories in the same scope.
+    conflict = mem_store.check_conflict(body, exclude_ids=supersedes, filters=scope_filters)
     if conflict:
         existing_id, score = conflict
         existing = mem_store.get(existing_id)
@@ -204,17 +262,18 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
             "existing_zone": existing.frontmatter.zone if existing else None,
         })
 
-    fm = MemoryFrontmatter.new(source="user", confidence=confidence, tags=tags, zone=zone)
-    fm.pinned = pinned
-    fm.supersedes = supersedes
-    fm.supersedes_reason = supersedes_reason
+    fm = MemoryFrontmatter.new(
+        source="user", confidence=confidence, tags=tags, zone=zone,
+        pinned=pinned, supersedes=supersedes, supersedes_reason=supersedes_reason,
+        user_id=user_id, agent_id=agent_id, run_id=run_id,
+    )
     path = mem_store.put(scope, fm, body)
 
     # ── Dir B: Mirror qualifying plugin writes to built-in MEMORY.md ────
     try:
-        from .memory_bridge import bridge_enabled as _b_enabled
+        from ..memory.bridge import bridge_enabled as _b_enabled
         if _b_enabled():
-            from .memory_bridge import mirror_plugin_to_builtin as _mirror_b
+            from ..memory.bridge import mirror_plugin_to_builtin as _mirror_b
             _mirror_b(
                 body=body,
                 zone=zone,
@@ -235,8 +294,15 @@ def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     mem_id = args.get("id", "")
     scope = args.get("scope", "user")
-    if not mem_id:
-        return _jd({"error": "id is required"})
+    filters = args.get("filters")
+    if not mem_id and not filters:
+        return _jd({"error": "id or filters is required"})
+    if filters:
+        try:
+            count = mem_store.delete_by_filters(filters)
+            return _jd({"success": True, "deleted_count": count})
+        except ValueError as e:
+            return _jd({"error": str(e)})
 
     ok = mem_store.delete(scope, mem_id)
     return _jd({"success": ok, "id": mem_id})
@@ -250,6 +316,7 @@ def _tool_srh_memory_history(args: dict, **kwargs) -> str:
     if not memory_id:
         return _jd({"error": "id is required"})
     max_depth = min(int(args.get("max_depth", 5)), 20)
+    include_events = bool(args.get("include_events", False))
 
     mem_store = _get_mem_store()
     # Cycle guard
@@ -286,13 +353,38 @@ def _tool_srh_memory_history(args: dict, **kwargs) -> str:
             "status": "current" if is_current else ("superseded" if is_superseded else "root"),
         })
 
-    return json.dumps({
+    payload = {
         "memory_id": memory_id,
         "chain_length": len(chain),
         "chain_depth": len(chain) - 1,
         "current_id": latest_id,
         "chain": chain,
-    }, ensure_ascii=False)
+    }
+    if include_events:
+        event_types = args.get("event_types")
+        session_id = args.get("session_id")
+        if event_types or session_id:
+            events = mem_store.get_memory_events(
+                memory_id,
+                event_types=event_types,
+                session_id=session_id,
+            )
+        else:
+            history = mem_store.get_memory_history(memory_id, include_events=True)
+            events = history.get("events", [])
+        events_out = []
+        for e in events:
+            e_out = dict(e)
+            for key in ("old_frontmatter", "new_frontmatter"):
+                raw = e_out.get(key)
+                if raw:
+                    try:
+                        e_out[key] = json.loads(raw)
+                    except json.JSONDecodeError:
+                        pass
+            events_out.append(e_out)
+        payload["events"] = events_out
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _tool_srh_skill_search(args: dict, **kwargs) -> str:
@@ -457,13 +549,10 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
 
     mem_store = _get_mem_store()
-    results = mem_store.search(query, k=k * 3)  # Over-fetch for zone filtering
-
-    # Apply zone filter if specified
     if zone:
-        results = [m for m in results if m.frontmatter.zone == zone][:k]
+        results = mem_store.search(query, k=k, zone=zone)
     else:
-        results = results[:k]
+        results = mem_store.search(query, k=k * 3)[:k]
 
     if not results:
         scope_msg = f" in zone '{zone}'" if zone else ""
@@ -607,7 +696,6 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
         Dict with 'success', 'path', 'mode', 'token_count' or 'error'
     """
     # P2-32: quick return when profile mode is disabled
-    from .store import profile_mode_enabled as _profile_mode_enabled
     if not _profile_mode_enabled():
         return {"error": "Profile mode is disabled (enable via config.yaml memory.palace_mode or memory.profile_mode)"}
 
@@ -726,250 +814,18 @@ def _tool_srh_compile_profile(args: dict, **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Hooks
+# Backward-compatible registration entrypoint
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    """Register the mem-reflection-hermes plugin."""
-    # Register tools
-    ctx.register_tool(
-        name="srh_memory_search",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_search",
-            "description": "Search active memories by TF-IDF relevance (or embedding if available). Use 'zone' parameter to filter by zone.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "k": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 100},
-                    "zone": {"type": "string", "description": "Optional: filter to a specific zone (core/work/episode/general/project:xxx)"},
-                    "include_history": {"type": "boolean", "description": "Include superseded memories in search results (lineage-aware recall)", "default": False},
-                },
-                "required": ["query"],
-            },
-        },
-        handler=_tool_srh_memory_search,
-        description="Search memories by relevance",
-        emoji="🧠",
-    )
-    ctx.register_tool(
-        name="srh_memory_write",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_write",
-            "description": "Write a new structured memory with YAML frontmatter. Checks for conflicts. Specify zone to organize memories.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "body": {"type": "string", "description": "Memory content (one short fact)"},
-                    "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
-                    "confidence": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 20},
-                    "pinned": {"type": "boolean", "default": False},
-                    "supersedes": {"type": "array", "items": {"type": "string"}, "default": [], "maxItems": 5},
-                    "supersedes_reason": {"type": "string", "description": "Human-readable reason why this memory supersedes the referenced memory IDs", "default": ""},
-                    "zone": {"type": "string", "description": "Memory zone: core (identity/preferences), work (current focus), episode (session summaries), general (default), or project:<name>"},
-                },
-                "required": ["body"],
-            },
-        },
-        handler=_tool_srh_memory_write,
-        description="Write a structured memory",
-        emoji="📝",
-    )
-    ctx.register_tool(
-        name="srh_memory_delete",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_delete",
-            "description": "Delete a memory by id from a scope.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Memory id"},
-                    "scope": {"type": "string", "enum": ["user", "project"], "default": "user"},
-                },
-                "required": ["id"],
-            },
-        },
-        handler=_tool_srh_memory_delete,
-        description="Delete a memory",
-        emoji="🗑️",
-    )
+    """Register the mem-reflection-hermes plugin.
 
-    # ── P2-4: srh_memory_history — supersedes chain lineage ──
-    ctx.register_tool(
-        name="srh_memory_history",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_memory_history",
-            "description": "Trace the supersedes chain for a memory, returning its full version lineage — from the current active memory back through all archived predecessors.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Memory ID to trace history for"},
-                    "max_depth": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20, "description": "Max chain depth to follow"},
-                },
-                "required": ["id"],
-            },
-        },
-        handler=_tool_srh_memory_history,
-        description="Trace supersedes chain history",
-        emoji="📜",
-    )
-
-    ctx.register_tool(
-        name="srh_skill_search",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_skill_search",
-            "description": "Search skills by token overlap relevance.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 100},
-                },
-                "required": ["query"],
-            },
-        },
-        handler=_tool_srh_skill_search,
-        description="Search skills by relevance",
-        emoji="🔧",
-    )
-    ctx.register_tool(
-        name="srh_reflect_now",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_reflect_now",
-            "description": "Trigger or check status of reflection pipeline.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        handler=_tool_srh_reflect_now,
-        description="Trigger reflection",
-        emoji="🔍",
-    )
-
-    # Palace tools (zone-based memory navigation)
-    ctx.register_tool(
-        name="srh_palace_zones",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_zones",
-            "description": "List all Memory Palace zones with memory counts. Use this to discover what zones exist before reading details.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        handler=_tool_srh_palace_zones,
-        description="List memory zones",
-        emoji="🏰",
-    )
-    ctx.register_tool(
-        name="srh_palace_read_zone",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_read_zone",
-            "description": "Load all memories from a specific zone. Returns cached zone summary if available, otherwise raw memory bodies.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "zone": {"type": "string", "description": "Zone name (core, work, episode, general, or project:<name>)"},
-                },
-                "required": ["zone"],
-            },
-        },
-        handler=_tool_srh_palace_read_zone,
-        description="Read a memory zone",
-        emoji="📂",
-    )
-    ctx.register_tool(
-        name="srh_palace_recall",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_recall",
-            "description": "Search memories by topic, optionally scoped to a zone. More focused than srh_memory_search — use this for palace navigation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "What to recall (e.g. 'editor preference', 'error handling convention')"},
-                    "limit": {"type": "integer", "description": "Max results", "default": 5, "minimum": 1, "maximum": 50},
-                    "zone": {"type": "string", "description": "Optional: restrict to a specific zone"},
-                },
-                "required": ["topic"],
-            },
-        },
-        handler=_tool_srh_palace_recall,
-        description="Recall by topic",
-        emoji="🔎",
-    )
-
-    # ── P2-1: srh_palace_search — cross-zone aggregate search ──
-    ctx.register_tool(
-        name="srh_palace_search",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_search",
-            "description": "Search across all zones, returning results grouped by zone with counts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "limit": {"type": "integer", "description": "Max results per zone", "default": 10, "minimum": 1, "maximum": 50},
-                },
-                "required": ["query"],
-            },
-        },
-        handler=_tool_srh_palace_search,
-        description="Cross-zone search grouped by zone",
-        emoji="🔍",
-    )
-
-    # ── P2-2: srh_palace_rebalance — zone auto-rebalance ──
-    ctx.register_tool(
-        name="srh_palace_rebalance",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_palace_rebalance",
-            "description": "Rebalance memory zones: split zones with >20 memories, merge zones with <3 into general. Default is dry_run (no changes). Pass dry_run=false to execute.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dry_run": {"type": "boolean", "description": "If true (default), only report what would be done without making changes.", "default": True},
-                },
-            },
-        },
-        handler=_tool_srh_palace_rebalance,
-        description="Auto-rebalance memory zones",
-        emoji="⚖️",
-    )
-
-    # Profile compilation tool (LLM-driven)
-    ctx.register_tool(
-        name="srh_compile_profile",
-        toolset="mem_reflection_hermes",
-        schema={
-            "name": "srh_compile_profile",
-            "description": "Compile all active memories into a structured profile document via LLM. Modes: 'profile' (profile.md), 'palace_index' (palace index), 'zone' (per-zone summaries).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "default": "profile", "description": "Compilation mode"},
-                },
-            },
-        },
-        handler=_tool_srh_compile_profile,
-        description="Compile memories into profile",
-        emoji="📋",
-    )
-
-    # Hooks are registered separately by runtime_hooks.register_hooks(ctx)
-    # to avoid duplicate registration with runtime_graph.register_graph_features().
+    Deprecated: this function exists only for backward compatibility with
+    callers importing from runtime.tools. The canonical registration logic
+    lives in runtime.registration and uses the schemas in runtime.schemas.
+    """
+    from .registration import register as _canonical_register
+    return _canonical_register(ctx)
 
 
 # Hooks imported from the public runtime facade for backward compat.
@@ -986,6 +842,7 @@ __all__ = list(__all__) + ["register_tools"]
 srh_memory_write = _tool_srh_memory_write
 srh_memory_search = _tool_srh_memory_search
 srh_memory_delete = _tool_srh_memory_delete
+srh_memory_history = _tool_srh_memory_history
 srh_palace_navigate = _tool_srh_palace_recall  # palace_navigate maps to palace_recall
 srh_reflect_now = _tool_srh_reflect_now
 srh_skill_query = _tool_srh_skill_search  # skill_query maps to skill_search

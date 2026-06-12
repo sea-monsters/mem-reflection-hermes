@@ -2,7 +2,7 @@
 
 > 日期: 2026-06-08
 > mem0 版本: v2.0.4 (D:\Codex_lib\code_reference\mem0)
-> mem-reflection-hermes 版本: v1.2-beta2
+> mem-reflection-hermes 版本: v1.4-beta
 
 ---
 

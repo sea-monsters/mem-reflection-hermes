@@ -62,6 +62,8 @@ _bridge_stats_lock = threading.Lock()
 
 def _incr_stat(key: str) -> None:
     with _bridge_stats_lock:
+        if key not in _bridge_stats:
+            logger.warning("Unknown bridge stat key: %s", key)
         _bridge_stats[key] = _bridge_stats.get(key, 0) + 1
 
 
@@ -273,7 +275,7 @@ def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
                 if zone is None or r.frontmatter.zone == zone:
                     return True
     except Exception:
-        pass
+        logger.warning("Duplicate check in plugin store failed", exc_info=True)
     return False
 
 def _find_plugin_entry_by_substring(
@@ -297,7 +299,7 @@ def _find_plugin_entry_by_substring(
                 if substring in r.body:
                     return r
     except Exception:
-        pass
+        logger.warning("Plugin entry substring search failed", exc_info=True)
     return None
 
 
@@ -443,20 +445,22 @@ def _write_to_plugin(
         from .store import MemoryFrontmatter  # type: ignore[import-untyped]
     except ImportError:
         try:
-            from store import MemoryFrontmatter  # type: ignore[import-untyped]
+            from core.store import MemoryFrontmatter  # type: ignore[import-untyped]
         except ImportError:
-            logger.debug("Dir A: cannot import MemoryFrontmatter")
-            return
+            try:
+                from mem_reflection_hermes.core.store import MemoryFrontmatter  # noqa: F401
+            except ImportError:
+                logger.debug("Dir A: cannot import MemoryFrontmatter")
+                return
 
     fm = MemoryFrontmatter.new(
         source="bridge",
         confidence="medium",
         tags=["bridge", "built-in-sync"],
         zone=zone,
+        supersedes=supersedes,
+        supersedes_reason="Auto-synced from built-in memory update" if supersedes else None,
     )
-    if supersedes:
-        fm.supersedes = supersedes
-        fm.supersedes_reason = "Auto-synced from built-in memory update"
     try:
         mem_store.put("user", fm, _refine_body(body))
     except ValueError:
@@ -618,7 +622,8 @@ def _replace_in_builtin(target: str, remove_bodies: List[str], add_body: str) ->
         content = ENTRY_DELIMITER.join(filtered)
         path.write_text(content, encoding="utf-8")
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning("Built-in memory replace failed for %s: %s", target, e)
         return False
     finally:
         if fd is not None:

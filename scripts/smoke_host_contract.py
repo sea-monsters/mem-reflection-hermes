@@ -349,17 +349,17 @@ def test_register_contract():
     # Simulate minimal plugin bootstrap
     fake = FakeCtx()
     try:
-        from mem_reflection_hermes.runtime.tools import register_tools as _register_tools
-        _register_tools(fake)
+        from mem_reflection_hermes.runtime.registration import register as _register_impl
+        _register_impl(fake)
     except Exception as e:
         fail("runtime_tools.register_tools", str(e))
         return
 
-    # 12 base tools from runtime_tools
-    if len(fake.tools) == 12:
-        ok("runtime_tools.register_tools: 12 tools")
+    # 13 base tools from runtime_registration
+    if len(fake.tools) == 13:
+        ok("runtime_registration.register: 13 tools")
     else:
-        fail("runtime_tools.register_tools: 12 tools", f"got {len(fake.tools)}")
+        fail("runtime_registration.register: 13 tools", f"got {len(fake.tools)}")
 
     # 8 unique hooks from runtime_hooks.register_hooks() (v0.16.0 enhanced)
     from mem_reflection_hermes.runtime.hooks import register_hooks as _rh_register_hooks
@@ -396,11 +396,11 @@ def test_register_contract():
             ok("post_tool_call hook registered")
         else:
             fail("post_tool_call hook registered", f"hooks={fake2.hooks}")
-        # Full plugin: 12 tools (7 base tools + 5 graph/health tools)
-        if len(fake2.tools) == 12:
-            ok("register(ctx): 12 tools total")
+        # Full plugin: 13 tools (8 base tools + 5 graph/health tools)
+        if len(fake2.tools) == 13:
+            ok("register(ctx): 13 tools total")
         else:
-            fail("register(ctx): 12 tools total", f"got {len(fake2.tools)}")
+            fail("register(ctx): 13 tools total", f"got {len(fake2.tools)}")
         manifest_tools = _read_manifest_list("provides_tools")
         if set(fake2.tools) == manifest_tools:
             ok("plugin.yaml provides_tools matches register(ctx)")

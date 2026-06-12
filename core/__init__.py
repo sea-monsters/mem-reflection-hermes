@@ -22,6 +22,16 @@ from .search import (
     _bm25_search_scored,
 )
 
+from .config import (
+    get_plugin_config_model,
+    get_config_diagnostics,
+)
+
+from .backend import (
+    SearchBackendCapabilities,
+    default_sqlite_backend_capabilities,
+)
+
 from .graph import (
     GraphIndex,
 )
@@ -39,6 +49,10 @@ __all__ = [
     "_embed_single",
     "_cosine_sim",
     "_bm25_search_scored",
+    "get_plugin_config_model",
+    "get_config_diagnostics",
+    "SearchBackendCapabilities",
+    "default_sqlite_backend_capabilities",
     # Graph exports
     "GraphIndex",
 ]
