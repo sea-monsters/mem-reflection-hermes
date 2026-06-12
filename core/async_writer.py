@@ -93,7 +93,10 @@ def _file_flush_worker() -> None:
     while True:
         try:
             item = _write_queue.get(timeout=1)
+        except queue.Empty:
+            continue
         except Exception:
+            logger.warning("Async writer queue get failed", exc_info=True)
             continue
         if item is None:
             break

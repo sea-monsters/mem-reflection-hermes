@@ -190,6 +190,26 @@ class TestBuildContextPriority:
         assert bundle.prepend_context == ""
         assert bundle.debug["stable_only"] is True
 
+    def test_context_bundle_stable_only_omits_compacted_episodes(self, temp_store):
+        """Stable-only mode must skip compacted episode summaries entirely."""
+        store = temp_store
+        pinned = MemoryFrontmatter.new(source="test", pinned=True, zone="core")
+        store.put("user", pinned, "Pinned memory only")
+
+        # Create a compacted episode summary in the episode zone
+        episode = MemoryFrontmatter.new(source="test", zone="episode", tags=["compacted"])
+        store.put("user", episode, "Earlier we discussed project goals and timelines.")
+
+        search = SearchIndex(store)
+        skills = FakeSkills([])
+        bundle = build_context_bundle(store, search, skills, "project", stable_only=True, max_tokens=4000)
+
+        assert "Pinned Memories" in bundle.append_system_context
+        assert "Episode Summaries" not in bundle.prepend_context
+        assert "Earlier we discussed" not in bundle.prepend_context
+        assert bundle.prepend_context == ""
+        assert bundle.debug["stable_only"] is True
+
 
 # ---------------------------------------------------------------------------
 # Token budget

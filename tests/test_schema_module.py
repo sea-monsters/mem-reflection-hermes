@@ -82,6 +82,43 @@ class TestSchemaDefinitions:
         mode = schemas._SRH_COMPILE_PROFILE_SCHEMA["properties"]["mode"]
         assert mode["enum"] == ["profile", "palace_index", "zone"]
 
+    def test_memory_delete_schema_requires_id_or_filters(self):
+        """_SRH_MEMORY_DELETE_SCHEMA accepts {id} or {filters} but rejects {}."""
+        import jsonschema
+        from mem_reflection_hermes.runtime import schemas
+
+        schema = schemas._SRH_MEMORY_DELETE_SCHEMA
+        # should accept id-only
+        jsonschema.validate({"id": "x"}, schema)
+        # should accept filters-only
+        jsonschema.validate({"filters": {}}, schema)
+        # should reject empty object
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({}, schema)
+
+    def test_graph_retrieve_schema_tier_enum_matches_handler(self):
+        """_SRH_GRAPH_RETRIEVE_SCHEMA tier enum matches GraphManagerCompat.retrieve_related."""
+        from mem_reflection_hermes.runtime import schemas
+
+        tier = schemas._SRH_GRAPH_RETRIEVE_SCHEMA["properties"]["tier"]
+        assert tier["enum"] == ["count", "list", "detail"]
+
+    def test_graph_stats_schema_has_no_unused_properties(self):
+        """_SRH_GRAPH_STATS_SCHEMA does not contain unused format or depth keys."""
+        from mem_reflection_hermes.runtime import schemas
+
+        props = schemas._SRH_GRAPH_STATS_SCHEMA.get("properties", {})
+        assert "format" not in props
+        assert "depth" not in props
+
+    def test_graph_viz_schema_has_no_unused_properties(self):
+        """_SRH_GRAPH_VIZ_SCHEMA does not contain unused format or depth keys."""
+        from mem_reflection_hermes.runtime import schemas
+
+        props = schemas._SRH_GRAPH_VIZ_SCHEMA.get("properties", {})
+        assert "format" not in props
+        assert "depth" not in props
+
 
 class TestPackageReExport:
     """Package root re-exports schemas from runtime/schemas.py."""

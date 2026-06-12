@@ -376,12 +376,21 @@ class SearchIndex:
             if _HAS_NUMPY and isinstance(self._embed_array, np.ndarray):
                 qarr = np.array(qvec, dtype=np.float32)
                 scores = self._embed_array @ qarr  # dot product (all normalized)
-                top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
-                return {
-                    self._embed_ids[i]: float(scores[i])
-                    for i in top_idx
-                    if allowed_ids is None or self._embed_ids[i] in allowed_ids
-                }
+                if allowed_ids is not None:
+                    # Mask out-of-scope IDs before selecting top-k so scoped
+                    # matches are not discarded just because out-of-scope entries
+                    # score higher globally.
+                    masked_scores = np.copy(scores)
+                    for i, mid in enumerate(self._embed_ids):
+                        if mid not in allowed_ids:
+                            masked_scores[i] = -np.inf
+                    finite_count = int(np.isfinite(masked_scores).sum())
+                    if finite_count == 0:
+                        return {}
+                    top_idx = np.argpartition(-masked_scores, min(k, finite_count - 1))[:k]
+                else:
+                    top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+                return {self._embed_ids[i]: float(scores[i]) for i in top_idx}
             else:
                 # Pure Python fallback
                 scores = {}
@@ -391,7 +400,7 @@ class SearchIndex:
                     scores[mid] = _cosine_sim(qvec, vec)
                 return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k])
         except Exception as e:
-            logger.debug("Embedding search failed: %s", e)
+            logger.warning("Embedding search failed: %s", e)
             return None
 
     def _ensure_bm25_index(self) -> bool:
@@ -448,25 +457,42 @@ class SearchIndex:
         except Exception as e:
             logger.warning("BM25 score computation failed: %s", e)
             return {}
-        # top-k via argpartition (numpy) or sort (pure Python)
-        if _HAS_NUMPY:
-            top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
-        else:
-            indexed = [(float(scores[i]), i) for i in range(len(scores))]
-            indexed.sort(reverse=True)
-            top_idx = [idx for _, idx in indexed[:k]]
-        results: Dict[str, float] = {}
+        # Resolve scope-filtered active set before ranking so in-scope matches
+        # are not discarded by global top-k truncation.
         list_kwargs: Dict[str, Any] = {"active_only": True}
         if filters:
             list_kwargs["filters"] = filters
         active_map = {m.id(): m for m in self.store.list(**list_kwargs)}
+        allowed_ids = set(active_map.keys()) if filters else None
+
+        # top-k via argpartition (numpy) or sort (pure Python)
+        if _HAS_NUMPY:
+            if allowed_ids is not None:
+                masked_scores = np.copy(scores)
+                for i, mid in enumerate(self._bm25_ids):
+                    if mid not in allowed_ids:
+                        masked_scores[i] = -np.inf
+                finite_count = int(np.isfinite(masked_scores).sum())
+                if finite_count == 0:
+                    return {}
+                top_idx = np.argpartition(-masked_scores, min(k, finite_count - 1))[:k]
+            else:
+                top_idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+        else:
+            indexed = [(float(scores[i]), i) for i in range(len(scores))]
+            if allowed_ids is not None:
+                indexed = [(s, i) for s, i in indexed if self._bm25_ids[i] in allowed_ids]
+            indexed.sort(reverse=True)
+            top_idx = [idx for _, idx in indexed[:k]]
+        results: Dict[str, float] = {}
         for idx in top_idx:
             score = float(scores[idx])
             if score <= 0:
                 continue
             mid = self._bm25_ids[idx]
-            if mid not in active_map:
-                continue
+            # allowed_ids was already applied before ranking; active_map is still
+            # needed for effectiveness lookup.
+            assert mid in active_map, f"BM25 top-k ID {mid} missing from active_map"
             if effectiveness:
                 eff = effectiveness.get(mid)
                 if eff:
@@ -644,7 +670,7 @@ class SearchIndex:
             try:
                 bm25_results = self._bm25_search_bm25s(query, recall_k, effectiveness, filters=filters)
             except Exception as e:
-                logger.debug("bm25s search failed, falling back to handrolled: %s", e)
+                logger.warning("bm25s search failed, falling back to handrolled: %s", e)
         if not bm25_results:
             bm25_scored = _bm25_search_scored(active, query, recall_k, effectiveness)
             bm25_results = {m.id(): s for m, s in bm25_scored}
@@ -692,7 +718,7 @@ class SearchIndex:
                 candidate_ids=set(active_map.keys()),
             )
         except Exception as e:
-            logger.debug("Entity recall skipped: %s", e)
+            logger.warning("Entity recall skipped: %s", e)
 
         # Layer 3: Rerank — recency, effectiveness, Hebbian, supersedes
         reranked: List[Tuple[float, LoadedMemory]] = []
@@ -773,7 +799,7 @@ class SearchIndex:
                             info["hebbian_boost"] = hebbian_score
                             info["final_score"] = score + hebbian_score
             except Exception as e:
-                logger.debug("Hebbian boost skipped: %s", e)
+                logger.warning("Hebbian boost skipped: %s", e)
 
         reranked.sort(key=lambda x: x[0], reverse=True)
         results = [m for _, m in reranked]
@@ -1031,8 +1057,7 @@ class SearchIndex:
                     if best_score > threshold and best_id:
                         return (best_id, best_score)
             except Exception as e:
-                logger.debug("Embedding conflict detection failed, falling back to BM25: %s", e)
-                pass
+                logger.warning("Embedding conflict detection failed, falling back to BM25: %s", e)
 
         # Path 2: BM25
         scored = _bm25_search_scored(active, body, 1, query_tokens=tokens)

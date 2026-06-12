@@ -44,6 +44,10 @@ _SRH_MEMORY_DELETE_SCHEMA = {
         "filters": {"type": "object", "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
     },
     "required": [],
+    "anyOf": [
+        {"required": ["id"]},
+        {"required": ["filters"]},
+    ],
 }
 
 _SRH_PALACE_NAVIGATE_SCHEMA = {
@@ -98,26 +102,20 @@ _SRH_GRAPH_RETRIEVE_SCHEMA = {
     "properties": {
         "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs to start retrieval from"},
         "max_results": {"type": "integer", "description": "Maximum number of results (default 10)"},
-        "tier": {"type": "string", "enum": ["count", "rank", "all"], "description": "Result tier"},
+        "tier": {"type": "string", "enum": ["count", "list", "detail"], "description": "Result tier"},
     },
     "required": ["seed_ids"],
 }
 
 _SRH_GRAPH_STATS_SCHEMA = {
     "type": "object",
-    "properties": {
-        "format": {"type": "string", "enum": ["adjacency", "nodes", "edges"], "description": "Output format"},
-        "depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
-    },
+    "properties": {},
     "required": [],
 }
 
 _SRH_GRAPH_VIZ_SCHEMA = {
     "type": "object",
-    "properties": {
-        "format": {"type": "string", "enum": ["adjacency", "nodes", "edges"], "description": "Visualization format"},
-        "depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
-    },
+    "properties": {},
     "required": [],
 }
 

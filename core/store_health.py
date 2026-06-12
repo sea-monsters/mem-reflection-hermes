@@ -125,11 +125,32 @@ def validate_index(store: "MemoryStore") -> Dict[str, Any]:
 def rebuild_index(store: "MemoryStore") -> Dict[str, Any]:
     with store._lock:
         conn = store._get_conn()
+        # Collect IDs being dropped so callbacks and events can fire after.
+        dropped_ids = [
+            r["id"] for r in conn.execute("SELECT id FROM memories").fetchall()
+        ]
         for tbl in ("entity_links", "entities", "stats", "supersedes", "tags", "memories"):
             conn.execute(f"DROP TABLE IF EXISTS {tbl}")
         conn.commit()
         store._init_db()
         store._sync_from_disk()
+        # Fire post-delete callbacks and record events for dropped memories.
+        if dropped_ids:
+            store._mark_changed()
+            for mem_id in dropped_ids:
+                store._record_memory_event(
+                    conn,
+                    memory_id=mem_id,
+                    event_type="DELETE",
+                    old_body="",
+                    old_frontmatter={},
+                )
+                for cb in store._post_delete_callbacks:
+                    try:
+                        cb(mem_id)
+                    except Exception:
+                        logger.warning("Post-delete callback failed for %s", mem_id, exc_info=True)
+            conn.commit()
     return validate_index(store)
 
 
@@ -157,4 +178,17 @@ def prune_index(store: "MemoryStore") -> Dict[str, Any]:
         conn.commit()
         if removed:
             store._mark_changed()
+            for mem_id in removed:
+                store._record_memory_event(
+                    conn,
+                    memory_id=mem_id,
+                    event_type="DELETE",
+                    old_body="",
+                    old_frontmatter={},
+                )
+                for cb in store._post_delete_callbacks:
+                    try:
+                        cb(mem_id)
+                    except Exception:
+                        logger.warning("Post-delete callback failed for %s", mem_id, exc_info=True)
     return {"pruned": len(removed), "pruned_ids": removed}

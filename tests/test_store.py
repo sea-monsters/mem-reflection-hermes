@@ -271,6 +271,55 @@ class TestPostDeleteCallbacks:
         assert result is True
         assert mid in called
 
+    def test_callbacks_invoked_on_sync_from_disk(self, temp_store):
+        """_sync_from_disk must fire post-delete callbacks for removed IDs."""
+        store = temp_store
+        called: list = []
+        store._post_delete_callbacks.append(lambda mid: called.append(mid))
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then sync")
+        mid = fm.id
+
+        # Sanity: memory exists before deletion
+        assert store.get(mid) is not None
+
+        path.unlink()
+        store._sync_from_disk()
+
+        assert mid in called, f"expected callback for {mid}, got {called}"
+        assert store.get(mid) is None
+
+    def test_callbacks_invoked_on_prune_index(self, temp_store):
+        """prune_index must fire post-delete callbacks for pruned IDs."""
+        store = temp_store
+        called: list = []
+        store._post_delete_callbacks.append(lambda mid: called.append(mid))
+
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then prune")
+        mid = fm.id
+
+        path.unlink()
+        result = store.prune_index()
+
+        assert result["pruned"] == 1
+        assert mid in called, f"expected callback for {mid}, got {called}"
+
+    def test_prune_index_records_delete_event(self, temp_store):
+        """prune_index must record a DELETE memory event for each pruned ID."""
+        store = temp_store
+        fm = MemoryFrontmatter.new(source="test", zone="general")
+        path = store.put("user", fm, "delete file then prune")
+        mid = fm.id
+
+        path.unlink()
+        store.prune_index()
+
+        events = store.get_memory_events(mid, event_types=["DELETE"])
+        assert len(events) == 1
+        assert events[0]["event_type"] == "DELETE"
+
     def test_callback_failure_does_not_block_delete(self, temp_store):
         """A failing callback does not prevent the delete from succeeding."""
         store = temp_store

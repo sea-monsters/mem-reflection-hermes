@@ -497,10 +497,19 @@ class MemoryStore:
                 disk_ids.add(m.id())
                 self._upsert_memory_row(conn, m)
         existing = {r["id"] for r in conn.execute("SELECT id FROM memories").fetchall()}
-        for sid in existing - disk_ids:
+        deleted_ids = list(existing - disk_ids)
+        for sid in deleted_ids:
             conn.execute("DELETE FROM memories WHERE id = ?", (sid,))
         self._cleanup_orphan_entities(conn)
         conn.commit()
+        if deleted_ids:
+            self._mark_changed()
+            for mem_id in deleted_ids:
+                for cb in self._post_delete_callbacks:
+                    try:
+                        cb(mem_id)
+                    except Exception:
+                        logger.warning("Post-delete callback failed for %s", mem_id, exc_info=True)
 
     def _upsert_memory_row(self, conn: sqlite3.Connection, m: LoadedMemory) -> None:
         fm = m.frontmatter
@@ -980,6 +989,7 @@ class MemoryStore:
                 raise ValueError("filters dict must contain at least one scope key")
             where = " AND ".join(clauses)
             rows = conn.execute(f"SELECT id, scope, path, body, zone, rank, pinned, confidence, source, created, version, supersedes_reason, valid_from, valid_until, context_scope, user_id, agent_id, run_id FROM memories WHERE {where}", params).fetchall()
+            deleted_ids: List[str] = []
             deleted = 0
             for row in rows:
                 mem_id = row["id"]
@@ -1003,9 +1013,16 @@ class MemoryStore:
                 )
                 conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
                 deleted += 1
+                deleted_ids.append(mem_id)
             self._cleanup_orphan_entities(conn)
             conn.commit()
             self._mark_changed()
+            for mem_id in deleted_ids:
+                for cb in self._post_delete_callbacks:
+                    try:
+                        cb(mem_id)
+                    except Exception:
+                        logger.warning("Post-delete callback failed for %s", mem_id, exc_info=True)
             return deleted
 
     def _get_search_index(self):
@@ -1111,8 +1128,14 @@ class MemoryStore:
     def reorder(self, memory_ids: List[str]) -> List[str]:
         with self._lock:
             conn = self._get_conn()
+            was_in_transaction = conn.in_transaction
             for idx, mid in enumerate(memory_ids):
                 conn.execute("UPDATE memories SET rank = ? WHERE id = ?", (len(memory_ids) - idx, mid))
-            conn.commit()
+                self._record_memory_event(
+                    conn, memory_id=mid, event_type="UPDATE",
+                    new_frontmatter={"rank": len(memory_ids) - idx},
+                )
+            if not was_in_transaction:
+                conn.commit()
             self._mark_changed()
             return list(memory_ids)

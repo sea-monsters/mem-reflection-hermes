@@ -192,6 +192,92 @@ class TestSubagentLifecycleHooks:
 
 
 # ---------------------------------------------------------------------------
+# _build_context_with_timeout
+# ---------------------------------------------------------------------------
+
+class TestContextTimeoutFallback:
+    def test_timeout_does_not_wait_for_slow_worker(self, monkeypatch):
+        """When full context assembly times out, stable-only fallback must run
+        promptly without blocking on the slow worker's completion.
+        """
+        import time
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="stable-only", prepend_context="")
+            time.sleep(2.0)  # much longer than the test timeout
+            return SimpleNamespace(append_system_context="dynamic", prepend_context="")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=100, compression=SimpleNamespace(enabled=True))
+        ))
+
+        # First call: full context times out, fallback should be invoked
+        start = time.monotonic()
+        result = _hooks._build_context_with_timeout("query", 100)
+        elapsed = time.monotonic() - start
+
+        # Fallback must be returned well before the slow worker finishes (2s)
+        assert elapsed < 1.0, f"fallback blocked for {elapsed:.2f}s"
+        # The function returns the rendered stable-only fallback text
+        assert result is not None
+        assert "stable-only" in result
+        assert calls["stable"] == 1
+
+    def test_exception_before_timeout_uses_fallback(self, monkeypatch):
+        """If full context assembly raises before timeout, stable-only fallback runs."""
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="fallback", prepend_context="")
+            raise RuntimeError("full context assembly exploded")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=5000, compression=SimpleNamespace(enabled=True))
+        ))
+
+        result = _hooks._build_context_with_timeout("query", 100)
+        assert "fallback" in result
+        assert calls["full"] == 2  # once for full, once for stable
+        assert calls["stable"] == 1
+
+    def test_successful_full_context_returns_without_fallback(self, monkeypatch):
+        from types import SimpleNamespace
+
+        calls = {"full": 0, "stable": 0}
+
+        def _build_context_bundle(query, max_tokens, stable_only):
+            calls["full"] += 1
+            if stable_only:
+                calls["stable"] += 1
+                return SimpleNamespace(append_system_context="fallback", prepend_context="")
+            assert stable_only is False
+            return SimpleNamespace(append_system_context="full-context", prepend_context="")
+
+        monkeypatch.setattr(_hooks, "_build_context_bundle", _build_context_bundle)
+        monkeypatch.setattr(_hooks, "get_plugin_config_model", lambda: SimpleNamespace(
+            context=SimpleNamespace(token_budget=100, recall_timeout_ms=5000, compression=SimpleNamespace(enabled=True))
+        ))
+
+        result = _hooks._build_context_with_timeout("query", 100)
+        assert "full-context" in result
+        assert calls["full"] == 1
+        assert calls["stable"] == 0
+
+
+# ---------------------------------------------------------------------------
 # _on_session_reset
 # ---------------------------------------------------------------------------
 
@@ -215,3 +301,83 @@ class TestSessionResetHook:
         # When IDs are missing, empty strings are logged (not "unknown")
         assert "session rotated" in caplog.text
         assert "reason=manual" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _pre_llm_call token budget fallback
+# ---------------------------------------------------------------------------
+
+class TestPreLlmCallTokenBudgetFallback:
+    def test_estimate_tokens_raises_truncates_context(self, monkeypatch):
+        """If _estimate_tokens raises, context longer than budget must be hard-truncated."""
+        from types import SimpleNamespace
+
+        budget = 10
+        long_context = "x" * 500  # far exceeds budget
+
+        def _build_context_with_timeout(query, b):
+            return long_context
+
+        def _estimate_tokens(text):
+            raise RuntimeError("tokenizer exploded")
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        ctx = result["context"]
+        # Must be truncated and contain the sentinel
+        assert "...[context truncated]" in ctx
+        # Length should be roughly budget*4 + sentinel length
+        assert len(ctx) <= int(budget * 4) + len("\n...[context truncated]")
+
+    def test_estimate_tokens_ok_no_truncation(self, monkeypatch):
+        """If _estimate_tokens works and tokens are under budget, context is untouched."""
+        from types import SimpleNamespace
+
+        budget = 1000
+        short_context = "short context"
+
+        def _build_context_with_timeout(query, b):
+            return short_context
+
+        def _estimate_tokens(text):
+            return 5
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        assert result["context"] == short_context
+        assert "...[context truncated]" not in result["context"]
+
+    def test_estimate_tokens_over_budget_truncates_normally(self, monkeypatch):
+        """Normal path: tokens exceed budget, context truncated with 3.5 multiplier."""
+        from types import SimpleNamespace
+
+        budget = 10
+        long_context = "a" * 500
+
+        def _build_context_with_timeout(query, b):
+            return long_context
+
+        def _estimate_tokens(text):
+            return 100
+
+        monkeypatch.setattr(_hooks, "_build_context_with_timeout", _build_context_with_timeout)
+        monkeypatch.setattr(_hooks, "_estimate_tokens", _estimate_tokens)
+        monkeypatch.setattr(_hooks, "_context_token_budget", lambda: budget)
+        monkeypatch.setattr(_hooks, "_micro_reflection_enabled", lambda: False)
+
+        result = _hooks._pre_llm_call(user_message="hi", messages=[])
+        assert result is not None
+        ctx = result["context"]
+        assert "...[context truncated]" in ctx
+        # Normal truncation uses budget * 3.5
+        assert len(ctx) <= int(budget * 3.5) + len("\n...[context truncated]")

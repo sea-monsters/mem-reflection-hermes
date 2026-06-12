@@ -166,12 +166,13 @@ def _build_context_with_timeout(query: str, budget: int) -> Optional[str]:
     def _assemble_full():
         return _build_context_bundle(query, max_tokens=budget, stable_only=False)
 
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="srh-context")
+    future = executor.submit(_assemble_full)
     try:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="srh-context") as executor:
-            future = executor.submit(_assemble_full)
-            bundle = future.result(timeout=timeout_ms / 1000.0)
+        bundle = future.result(timeout=timeout_ms / 1000.0)
         context = _render_context_bundle(bundle)
         if context:
+            executor.shutdown(wait=True)
             return context
     except _FutureTimeoutError:
         logger.warning(
@@ -181,6 +182,10 @@ def _build_context_with_timeout(query: str, budget: int) -> Optional[str]:
         )
     except Exception as e:
         logger.warning("Context assembly failed before fallback: %s", e)
+
+    # Non-success path: do not wait for a slow or failed worker before
+    # building the stable-only fallback.
+    executor.shutdown(wait=False)
 
     try:
         fallback_bundle = _build_context_bundle(query, max_tokens=budget, stable_only=True)
@@ -438,8 +443,10 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
                 trunc_len = int(budget * 3.5)
                 context = context[:trunc_len] + "\n...[context truncated]"
                 logger.debug("Context truncated from %d to ~%d tokens", tok, budget)
-        except Exception:
-            pass  # Budget check failure is non-fatal
+        except Exception as e:
+            logger.warning("Token budget check failed, applying hard truncation: %s", e)
+            trunc_len = int(budget * 4)
+            context = context[:trunc_len] + "\n...[context truncated]"
         return {"context": context}
     return None
 

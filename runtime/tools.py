@@ -549,13 +549,10 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
     zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
 
     mem_store = _get_mem_store()
-    results = mem_store.search(query, k=k * 3)  # Over-fetch for zone filtering
-
-    # Apply zone filter if specified
     if zone:
-        results = [m for m in results if m.frontmatter.zone == zone][:k]
+        results = mem_store.search(query, k=k, zone=zone)
     else:
-        results = results[:k]
+        results = mem_store.search(query, k=k * 3)[:k]
 
     if not results:
         scope_msg = f" in zone '{zone}'" if zone else ""

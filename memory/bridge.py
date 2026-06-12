@@ -62,6 +62,8 @@ _bridge_stats_lock = threading.Lock()
 
 def _incr_stat(key: str) -> None:
     with _bridge_stats_lock:
+        if key not in _bridge_stats:
+            logger.warning("Unknown bridge stat key: %s", key)
         _bridge_stats[key] = _bridge_stats.get(key, 0) + 1
 
 
@@ -273,7 +275,7 @@ def _is_duplicate_in_plugin(body: str, mem_store, zone: str = None) -> bool:
                 if zone is None or r.frontmatter.zone == zone:
                     return True
     except Exception:
-        pass
+        logger.warning("Duplicate check in plugin store failed", exc_info=True)
     return False
 
 def _find_plugin_entry_by_substring(
@@ -297,7 +299,7 @@ def _find_plugin_entry_by_substring(
                 if substring in r.body:
                     return r
     except Exception:
-        pass
+        logger.warning("Plugin entry substring search failed", exc_info=True)
     return None
 
 
@@ -620,7 +622,8 @@ def _replace_in_builtin(target: str, remove_bodies: List[str], add_body: str) ->
         content = ENTRY_DELIMITER.join(filtered)
         path.write_text(content, encoding="utf-8")
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning("Built-in memory replace failed for %s: %s", target, e)
         return False
     finally:
         if fd is not None:

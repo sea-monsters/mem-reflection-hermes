@@ -142,7 +142,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
     result["similar"] = sum(r.similar_pairs for r in action_results if r.action_name == "MergeSimilar")
     result["merged"] = sum(r.merged for r in action_results if r.action_name == "MergeSimilar")
     result["orphan_edges"] = sum(r.orphan_edges for r in action_results if r.action_name == "CleanOrphanEdges")
-    result["total_archived"] = result["archived"] + result["superseded"] + result["compacted"] + result["merged"]
+    result["total_archived"] = result["archived"] + result["superseded"] + result["merged"]
     result["errors"] = list(pipeline_ctx.errors)
 
     # Generate and persist report

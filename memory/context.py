@@ -162,6 +162,7 @@ def build_context_bundle(
             try:
                 active = search.search(query, k=10)
             except Exception:
+                logger.warning("Context search failed, falling back to list_active", exc_info=True)
                 active = store.list_active()[:10]
         else:
             active = store.list_active()[:10]
@@ -188,13 +189,21 @@ def build_context_bundle(
         compression_enabled = bool(get_plugin_config_model().context.compression.enabled)
     except Exception:
         compression_enabled = True
-    dynamic_parts, compression_level, dropped_labels, included_labels = _build_dynamic_context_parts(
-        active=active,
-        triggered=triggered,
-        store=store,
-        budget=remaining_budget,
-        compression_enabled=compression_enabled,
-    )
+    if stable_only:
+        # Stable-only fallback contract: do not invoke the dynamic builder at
+        # all, so compacted episodes and other dynamic sections are excluded.
+        dynamic_parts: List[str] = []
+        compression_level = "none"
+        dropped_labels: List[str] = []
+        included_labels: List[str] = []
+    else:
+        dynamic_parts, compression_level, dropped_labels, included_labels = _build_dynamic_context_parts(
+            active=active,
+            triggered=triggered,
+            store=store,
+            budget=remaining_budget,
+            compression_enabled=compression_enabled,
+        )
     debug["compression_level"] = compression_level
     for label in dropped_labels:
         if label not in debug["dropped_sections"]:

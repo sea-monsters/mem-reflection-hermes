@@ -390,6 +390,7 @@ class MergeSimilar(CuratorAction):
         try:
             all_active = mem_store.list_active()
         except Exception:
+            logger.warning("MergeSimilar: list_active failed", exc_info=True)
             return []
 
         if len(all_active) < 2:
@@ -421,6 +422,7 @@ class MergeSimilar(CuratorAction):
         try:
             all_active = sorted(all_active, key=_sort_key)[:500]
         except Exception:
+            logger.warning("MergeSimilar sort failed, using fallback", exc_info=True)
             all_active = sorted(
                 all_active,
                 key=lambda m: getattr(getattr(m, "frontmatter", None), "created", ""),

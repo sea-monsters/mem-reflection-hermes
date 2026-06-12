@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +11,27 @@ from mem_reflection_hermes import memory as memory_pkg
 from mem_reflection_hermes.reflection import runtime as reflection_runtime
 from mem_reflection_hermes.runtime import hooks as hooks_mod
 from mem_reflection_hermes.runtime import tools as tools_mod
+
+
+def test_top_level_init_loads_with_empty_package():
+    """__init__.py must tolerate pytest-style top-level import (empty __package__)."""
+    init_path = Path(__file__).resolve().parent.parent / "__init__.py"
+    assert init_path.exists()
+    spec = importlib.util.spec_from_file_location("__init__", str(init_path))
+    mod = importlib.util.module_from_spec(spec)
+    # pytest from repo root imports __init__.py with __package__ == ""
+    mod.__package__ = ""
+    sys.modules["__init__"] = mod
+    try:
+        # The importlib workaround intentionally sets __package__ != __spec__.parent;
+        # suppress the resulting DeprecationWarning since this is the scenario under test.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop("__init__", None)
+    # Should reach here without ImportError; core exports should be present
+    assert hasattr(mod, "MemoryStore")
 
 
 def test_runtime_hooks_session_recovery_runs_v15_stage_runners(monkeypatch):

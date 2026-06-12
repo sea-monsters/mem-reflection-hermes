@@ -30,7 +30,7 @@ if __name__ != "__main__" and __name__ not in sys.modules:
 # Ensure __package__ is set for relative imports when loaded via importlib
 # without submodule_search_locations (e.g. spec_from_file_location with no
 # package context).  Relative imports need __package__ to resolve '.'.
-if __package__ is None:
+if not __package__:
     __package__ = "mem_reflection_hermes"
 
 

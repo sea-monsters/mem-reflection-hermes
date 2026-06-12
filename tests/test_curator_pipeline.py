@@ -1107,8 +1107,8 @@ class TestErrorIsolation:
 class TestPipelineAggregation:
     """Tests for result aggregation in _run_curator."""
 
-    def test_total_archived_sums_all_sources(self, empty_store):
-        """total_archived includes stale, superseded, compacted, and merged."""
+    def test_total_archived_sums_archived_sources_only(self, empty_store):
+        """total_archived includes stale, superseded, and merged but not compacted."""
         from memory.curator import _run_curator
 
         # Stale memory
@@ -1122,7 +1122,7 @@ class TestPipelineAggregation:
 
         result = _run_curator(None, empty_store)
 
-        expected = result["archived"] + result["superseded"] + result["compacted"] + result["merged"]
+        expected = result["archived"] + result["superseded"] + result["merged"]
         assert result["total_archived"] == expected
 
     def test_all_expected_keys_present(self, empty_store):

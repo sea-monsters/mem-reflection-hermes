@@ -197,6 +197,88 @@ class TestScopedSearch:
         assert "m-a2" in ids
         assert "m-null" in ids
 
+    def test_bm25_filter_applied_before_topk_truncation(self, temp_store):
+        """Scoped BM25 must consider in-scope memories even if out-of-scope
+        memories score higher globally.
+        """
+        # Out-of-scope memory matches multiple query terms → high BM25 score
+        fm_out = _fm_with_scope(
+            "m-bm25-out", "apple banana cherry date elderberry", user_id="u2"
+        )
+        temp_store.put("user", fm_out, "apple banana cherry date elderberry")
+        # In-scope memory matches only one term → lower global BM25 score
+        fm_in = _fm_with_scope("m-bm25-in", "apple", user_id="u1")
+        temp_store.put("user", fm_in, "apple")
+
+        si = SearchIndex(temp_store)
+        si.invalidate_cache()
+
+        # k=1: global top-1 would be m-bm25-out, but it is out of scope.
+        # Test the BM25 channel directly to avoid rescue by embedding fusion.
+        bm25_results = si._bm25_search_bm25s(
+            "apple banana cherry", k=1, filters={"user_id": "u1"}
+        )
+        assert "m-bm25-in" in bm25_results
+        assert "m-bm25-out" not in bm25_results
+
+        # Public search should also surface the in-scope memory.
+        results = si.search("apple banana cherry", k=1, filters={"user_id": "u1"})
+        ids = [r.id() for r in results]
+        assert "m-bm25-in" in ids
+        assert "m-bm25-out" not in ids
+
+    def test_embedding_filter_applied_before_topk_truncation(self, temp_store, monkeypatch):
+        """Scoped embedding search must consider in-scope memories even if
+        out-of-scope memories are more similar to the query globally.
+        """
+        import functools
+
+        # Clear any real embedding cache before replacing the function.
+        try:
+            _search_mod._embed_single.cache_clear()
+        except Exception:
+            pass
+
+        # Provide deterministic vectors so we can control ranking precisely.
+        @functools.lru_cache(maxsize=500)
+        def _fake_embed(text: str):
+            text = text or ""
+            if "relevant" in text.lower():
+                return [1.0, 0.0]
+            if "apple" in text.lower():
+                return [0.9, 0.1]
+            return [0.0, 1.0]
+
+        monkeypatch.setattr(_search_mod, "_embed_single", _fake_embed)
+
+        # Out-of-scope memory is closer to the query vector
+        fm_out = _fm_with_scope("m-emb-out", "relevant", user_id="u2")
+        temp_store.put("user", fm_out, "relevant")
+        # In-scope memory is still relevant but scores lower globally
+        fm_in = _fm_with_scope("m-emb-in", "apple", user_id="u1")
+        temp_store.put("user", fm_in, "apple")
+
+        si = SearchIndex(temp_store)
+        si.invalidate_cache()
+        si._embed_array = None  # force rebuild with mocked embeddings
+
+        # Test the embedding channel directly.
+        embed_results = si._embed_search("relevant", k=1, filters={"user_id": "u1"})
+        assert "m-emb-in" in embed_results
+        assert "m-emb-out" not in embed_results
+
+        # k=1: global top-1 would be m-emb-out, but it is out of scope.
+        results = si.search("relevant", k=1, filters={"user_id": "u1"})
+        ids = [r.id() for r in results]
+        assert "m-emb-in" in ids
+        assert "m-emb-out" not in ids
+
+        # Clear the fake cache so it cannot leak after monkeypatch restores.
+        try:
+            _fake_embed.cache_clear()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # 3. Scoped List
@@ -279,6 +361,26 @@ class TestScopedDelete:
         assert deleted_count == 1
         assert temp_store.get("m-del-f-1") is None
         assert temp_store.get("m-del-f-2") is not None
+
+    def test_delete_by_filters_invokes_post_delete_callbacks(self, temp_store):
+        """Batch delete must run registered post-delete callbacks like single delete()."""
+        fm1 = _fm_with_scope("m-del-cb-1", "body", user_id="u1")
+        fm2 = _fm_with_scope("m-del-cb-2", "body", user_id="u1")
+        fm3 = _fm_with_scope("m-del-cb-3", "body", user_id="u2")
+        temp_store.put("user", fm1, "body")
+        temp_store.put("user", fm2, "body")
+        temp_store.put("user", fm3, "body")
+
+        deleted_ids: list[str] = []
+
+        def _capture_callback(mem_id: str) -> None:
+            deleted_ids.append(mem_id)
+
+        temp_store._post_delete_callbacks.append(_capture_callback)
+
+        deleted_count = temp_store.delete_by_filters({"user_id": "u1"})
+        assert deleted_count == 2
+        assert set(deleted_ids) == {"m-del-cb-1", "m-del-cb-2"}
 
     def test_delete_without_id_or_filters_rejected(self, temp_store):
         with pytest.raises((ValueError, TypeError)):

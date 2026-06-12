@@ -122,8 +122,10 @@ def _get_graph_interface():
             from mem_reflection_hermes.store import plugin_data_dir
             return GraphManagerCompat(plugin_data_dir() / "graph.db")
         except Exception:
+            logger.warning("Graph init (runtime_graph) failed", exc_info=True)
             return None
     except Exception:
+        logger.warning("Graph init failed", exc_info=True)
         return None
 
 
@@ -185,6 +187,7 @@ class _CrossLayerQueryCompat:
             try:
                 pagerank_scores = self.gm.pagerank()
             except Exception:
+                logger.warning("PageRank computation failed in cross-layer query", exc_info=True)
                 pagerank_scores = {}
 
         results: List[_CrossLayerResult] = []
@@ -331,7 +334,7 @@ async def update_memory(mem_id: str, payload: MemoryUpdate):
             try:
                 gm.store.ensure_meta(mem_id, zone=payload.zone)
             except Exception:
-                pass
+                logger.warning("Graph meta update failed for %s", mem_id, exc_info=True)
     return _memory_to_dict(mem)
 
 
@@ -515,6 +518,7 @@ async def get_graph(
                         "type": "skill",
                     })
     except Exception:
+        logger.warning("Cross-layer query skill enrichment failed", exc_info=True)
         pass
 
     return {
@@ -690,7 +694,7 @@ async def get_stats(
                 **gm.store.stats(),
             }
         except Exception:
-            pass
+            logger.warning("Graph stats collection failed in dashboard", exc_info=True)
 
     # Cache stats
     cache_stats = {"available": False}
@@ -709,7 +713,7 @@ async def get_stats(
                 **_get_cache().stats(),
             }
         except Exception:
-            pass
+            logger.warning("Cache stats collection failed in dashboard", exc_info=True)
 
     # Health metrics (WS-5)
     health = _get_store().health_metrics()
@@ -769,11 +773,13 @@ async def get_curator():
     try:
         result["enabled"] = _curator_enabled(store)
     except Exception:
+        logger.warning("Curator enabled check failed", exc_info=True)
         result["enabled"] = False
 
     try:
         result["config"] = _curator_config(store)
     except Exception:
+        logger.warning("Curator config check failed", exc_info=True)
         result["config"] = {}
 
     # Cold storage stats
@@ -795,6 +801,7 @@ async def get_curator():
                     # Fall back to showing only the filename
                     display_path = cold_path.name
             except Exception:
+                logger.debug("Path display normalization failed: %s", cold_path)
                 display_path = cold_path.name
 
             result["cold_storage"] = {
@@ -820,6 +827,7 @@ async def get_curator():
         else:
             result["last_run"] = None
     except Exception:
+        logger.warning("Curator report read failed", exc_info=True)
         result["last_run"] = None
 
     result["available"] = True
