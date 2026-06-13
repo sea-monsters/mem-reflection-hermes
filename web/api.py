@@ -794,7 +794,12 @@ async def get_curator():
             import sys
             # Only use absolute import if the memory package is already in sys.modules
             # (i.e., the package namespace was explicitly set up)
-            if "mem_reflection_hermes.memory.curator" in sys.modules:
+            # Hermes loads plugins under hermes_plugins.<name> — check both bare
+            # name and the loader-prefixed form.
+            if (
+                "mem_reflection_hermes.memory.curator" in sys.modules
+                or "hermes_plugins.mem_reflection_hermes.memory.curator" in sys.modules
+            ):
                 from mem_reflection_hermes.memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
                 curator = True
             else:
