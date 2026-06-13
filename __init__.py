@@ -33,6 +33,13 @@ if __name__ != "__main__" and __name__ not in sys.modules:
 if not __package__:
     __package__ = "mem_reflection_hermes"
 
+# Ensure the plugin directory is on sys.path so importlib.util-based loaders
+# (Hermes _load_directory_module) can resolve sub-packages (core/, reflection/,
+# etc.) even when __path__ propagation fails.
+_plugin_root = os.path.dirname(os.path.abspath(__file__))
+if _plugin_root not in sys.path:
+    sys.path.insert(0, _plugin_root)
+
 
 # ── Core exports ───────────────────────────────────────────────────────
 from .core.store import (  # noqa: F401
