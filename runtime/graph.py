@@ -90,6 +90,18 @@ class _GraphStoreShim:
         ).fetchall()
         return [(r["source_id"], r["target_id"], r["weight"]) for r in rows]
 
+    def record_typed_fact(self, *args, **kwargs):
+        return self._gi.record_typed_fact(*args, **kwargs)
+
+    def record_entity_mentions(self, *args, **kwargs):
+        return self._gi.record_entity_mentions(*args, **kwargs)
+
+    def invalidate_typed_fact(self, *args, **kwargs):
+        return self._gi.invalidate_typed_fact(*args, **kwargs)
+
+    def typed_facts(self, *args, **kwargs):
+        return self._gi.typed_facts(*args, **kwargs)
+
     def upsert_edge(
         self,
         source: str,

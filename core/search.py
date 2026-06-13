@@ -24,6 +24,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
+    from .scope import filter_memories_by_scope, normalize_scope_filters, scope_cache_key
+except ImportError:
+    from core.scope import filter_memories_by_scope, normalize_scope_filters, scope_cache_key
+
+try:
     import numpy as np
     _HAS_NUMPY = True
 except Exception:
@@ -588,7 +593,8 @@ class SearchIndex:
             hebbian_beta: Hebbian boost coefficient (default 0 = off)
         """
         normalized_zone = zone.lower().strip() if zone else None
-        filter_tuple = tuple(sorted((str(k), str(v or "")) for k, v in (filters or {}).items()))
+        filters = normalize_scope_filters(filters)
+        filter_tuple = scope_cache_key(filters)
         cache_key = (
             query.lower().strip(),
             k,
@@ -755,7 +761,7 @@ class SearchIndex:
                 score += entity_bonus
             else:
                 # Weighted: recency and eff are additive terms in the weighted sum
-                score = (base_score * sup_factor) + entity_bonus
+                score = (base_score * sup_factor) + (gamma * recency) + (delta * eff_factor) + entity_bonus
 
             if explain:
                 info = _entry(mid)
@@ -777,7 +783,7 @@ class SearchIndex:
             try:
                 pool_ids = [mid for mid in fused_scores]
                 activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
-                scale = max_rerank_score if max_rerank_score > 0 else 1.0
+                scale = max_rerank_score if max_rerank_score > 0 else 0.0
                 # Merge graph-only neighbors into the rerank pool so strongly
                 # associated but semantically distant memories are recoverable.
                 for nid, act in activation.items():
@@ -1008,13 +1014,14 @@ class SearchIndex:
             if len(tokens) < 20:
                 threshold = max(0.65, threshold - 0.05)
 
-        active = self.store.list_active()
+        filters = normalize_scope_filters(filters)
+        active = self.store.list_active(filters=filters)
+        # list_active already applies scope filtering; the redundant in-memory
+        # filter below was a v1.6 double-guard. Kept as a defensive fallback
+        # because some standalone test fixtures inject memories without scope
+        # columns. TODO: remove once all callers pass normalized filters.
         if filters:
-            # Apply scope filters to conflict check so scoped writes only
-            # compare against memories in the same scope (v1.6).
-            active = [m for m in active if all(
-                getattr(m.frontmatter, k, None) == v for k, v in filters.items()
-            )]
+            active = filter_memories_by_scope(active, filters)
         if exclude_ids:
             exclude = set(exclude_ids)
             active = [m for m in active if m.id() not in exclude]

@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.7 — Scope-Aware Reflection Propagation (release hardening)
+
+### Phase A: Reflection Scope Context
+
+- **Central scope helper**: `core/scope.py` now exposes a shared `scope_from_context()` helper so hooks, curator, and reflection can resolve `user_id` / `agent_id` / `run_id` the same way.
+- **Reflection write paths**: `_run_full_reflection()`, `_run_micro_reflection()`, `_run_embedding_reflection()`, `_run_raw_chunk_reflection()`, and `_compact_episode_zone()` now stamp scope fields onto new memories when the host provides them.
+- **Reflection reads and conflict checks**: scoped reflection paths now pass `filters` into `list_active()`, `check_conflict()`, and compaction reads instead of falling back to global store reads.
+- **Hook propagation**: `pre_llm_call` and `on_session_end` now forward scope filters into context assembly, micro-reflection, full reflection, compaction, and curator runs.
+- **Manual reflection tool**: `srh_reflect_now` now accepts optional `filters` so agents can manually run reflection without accidentally widening the scope.
+
+### Phase B: Refined Extraction Baseline
+
+- **Shared extraction module**: `reflection/extraction.py` now centralizes refined candidate extraction so runtime and engine stop drifting apart.
+- **Typed candidate kinds**: extracted candidates now carry `kind` / `priority` metadata for `intent`, `correction`, `decision`, `todo`, `preference`, `policy`, and `procedure`.
+- **Lossless propagation**: `kind` now survives from extraction into `memory_candidates` and `accepted_memories`, so downstream callers can inspect what kind of memory was stored.
+- **Regression coverage**: new `tests/test_reflection_refinement.py` locks the decision / todo / preference behavior before future tuning.
+
+### Phase C: Semantic Supersedes Start
+
+- **Semantic resolver**: `reflection/supersedes_resolver.py` now separates correction, merge, store, skip, and scope-split decisions from raw conflict detection.
+- **Heuristic reflection update**: embedding-based micro/full reflection paths now preserve explicit memory intent without automatically promoting it to supersedes, while true correction flows still supersede the prior memory.
+- **LLM reflection update**: full/micro LLM reflection paths now route candidate supersedes through the same resolver so generic intent strips replacement edges instead of writing them blindly.
+- **Scope guard**: `MemoryStore.put()` now rejects supersedes targets that belong to a different scope or tenant root.
+- **Regression coverage**: `tests/test_semantic_supersedes.py` locks correction, merge, store, scope-split, and cross-scope rejection behavior.
+
+### Phase D: Typed Fact Sidecar Start
+
+- **Typed sidecar table**: `core/graph.py` now stores typed fact rows with source memory, target memory, episode lineage, relation, kind, and invalidation metadata.
+- **Reflection writes**: micro/full/raw-chunk reflection now best-effort record typed sidecar facts when a graph backend is attached to the store.
+- **Distillation lineage**: `GraphIndex.distill()` now records both the semantic summary row and member-of relations in the typed sidecar.
+- **Regression coverage**: `tests/test_typed_fact_sidecar.py` locks sidecar write, invalidation, and distill lineage behavior.
+
+### Phase E: Compaction Quality
+
+- **Scored fallback**: `_compact_episode_zone()` and the LLM fallback now prefer concise, conclusion-like fragments instead of the longest raw transcript chunk.
+- **Conservative merge**: the fallback may join up to two non-duplicate high-signal fragments when they complement each other.
+- **Token accounting**: compaction summaries now report source/summary token counts and compression ratio so fallback quality can be inspected directly.
+- **Quality gate**: verbose or noisy LLM summaries are rejected when they score worse than the scored fallback, and the fallback summary is used instead.
+- **Regression coverage**: `tests/test_compaction.py` now locks the representative-fragment behavior, token accounting, and noisy LLM fallback regressions.
+
+### Phase F: Release Hardening
+
+- **Windows test isolation**: pytest now uses a per-run plugin-specific `basetemp`, avoiding stale Windows temp-directory ACL conflicts during suite setup.
+- **Recovery callback compatibility**: runtime import-hygiene tests now accept scoped recovery kwargs, matching the current checkpoint recovery contract.
+- **Scoped compaction boundary**: reflection scope tests now assert that compacting one tenant scope does not supersede another scope's raw episodes.
+- **Coverage index sync**: `docs/testing/test-coverage.md` has been synchronized with the current `615` collected tests and v1.7 acceptance surfaces.
+- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `615 passed`.
+
+### Development Notes
+
+- Scope propagation, refined extraction, semantic supersedes, typed fact sidecar, compaction quality, and release-hardening coverage are now all represented in code and tests.
+- Remaining future work is deeper relation-aware recall and more advanced fact-level temporal querying, not a blocker for the v1.7 scope/quality release line.
+
 ## v1.6 — Memory Event Ledger & Scoped Filters
 
 ### Memory Event Ledger (Wave 1)

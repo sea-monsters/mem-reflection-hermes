@@ -95,6 +95,23 @@ class TestCuratorContext:
         assert ctx.errors == []
         assert isinstance(ctx.errors, list)
 
+    def test_context_filters_active_memories_by_scope(self, empty_store):
+        """CuratorContext.list_active applies scope filters unless admin_global is explicit."""
+        from memory.curator.actions import CuratorContext
+
+        empty_store.memories["u1"] = MockMemory("u1", "body")
+        empty_store.memories["u2"] = MockMemory("u2", "body")
+        setattr(empty_store.memories["u1"].frontmatter, "user_id", "u1")
+        setattr(empty_store.memories["u2"].frontmatter, "user_id", "u2")
+
+        scoped = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        admin = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"}, admin_global=True)
+
+        assert [m.id() for m in scoped.list_active()] == ["u1"]
+        assert {m.id() for m in admin.list_active()} == {"u1", "u2"}
+        assert scoped.scope_label == "scoped"
+        assert admin.scope_label == "global_admin"
+
 
 class TestCuratorResult:
     """Tests for CuratorResult dataclass."""
@@ -466,6 +483,26 @@ class TestArchiveStaleAction:
         assert result.archived == 1
         assert "low_eff" in empty_store.deleted
 
+    def test_scoped_run_archives_only_matching_scope(self, empty_store):
+        """ArchiveStale must not archive stale memories from other scopes."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        empty_store.memories["stale_u1"] = MockMemory("stale_u1", "old u1")
+        empty_store.memories["stale_u2"] = MockMemory("stale_u2", "old u2")
+        setattr(empty_store.memories["stale_u1"].frontmatter, "user_id", "u1")
+        setattr(empty_store.memories["stale_u2"].frontmatter, "user_id", "u2")
+        empty_store.eff_data = {
+            "stale_u1": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.01},
+            "stale_u2": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.01},
+        }
+
+        ctx = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 1
+        assert "stale_u1" in empty_store.deleted
+        assert "stale_u2" not in empty_store.deleted
+
     def test_recent_high_effectiveness_is_not_archived(self, empty_store):
         """Recent access and high effectiveness keep memory active."""
         from memory.curator.actions import ArchiveStale, CuratorContext
@@ -814,6 +851,32 @@ class TestCleanOrphanEdgesAction:
         assert result.orphan_edges == 7
         assert cleaned["count"] == 2
 
+    def test_scoped_run_skips_global_orphan_cleanup(self, empty_store, monkeypatch):
+        """Scoped curator must not feed scoped IDs into global graph cleanup."""
+        from memory.curator.actions import CleanOrphanEdges, CuratorContext
+
+        called = {"clean": False}
+
+        class FakeGraphStore:
+            def clean_orphan_edges(self, active_ids):
+                called["clean"] = True
+                return 7
+
+        class FakeManager:
+            store = FakeGraphStore()
+
+        import memory.curator.actions as _actions_mod
+
+        monkeypatch.setattr(_actions_mod, "get_graph_manager_compat", lambda: FakeManager())
+        empty_store.memories["u1"] = MockMemory("u1", "body")
+        setattr(empty_store.memories["u1"].frontmatter, "user_id", "u1")
+
+        ctx = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        result = CleanOrphanEdges().execute(ctx)
+
+        assert result.orphan_edges == 0
+        assert called["clean"] is False
+
 
 class TestGenerateReportAction:
     """Tests for GenerateReport action."""
@@ -926,6 +989,19 @@ class TestReportPersistence:
         assert payload["report"] == result["report"]
         assert payload["total_archived"] == result["total_archived"]
         assert reflected and reflected[0]["summary"] == result["report"]
+
+    def test_run_curator_reports_scope_policy(self, empty_store):
+        """Pipeline result exposes whether the run was scoped or admin global."""
+        from memory.curator import _run_curator
+
+        result = _run_curator(None, empty_store, filters={"user_id": "u1"})
+        admin_result = _run_curator(None, empty_store, filters={"user_id": "u1"}, admin_global=True)
+
+        assert result["scope"] == "scoped"
+        assert result["filters"] == {"user_id": "u1"}
+        assert result["admin_global"] is False
+        assert admin_result["scope"] == "global_admin"
+        assert admin_result["admin_global"] is True
 
 
 # ---------------------------------------------------------------------------

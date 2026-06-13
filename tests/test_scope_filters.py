@@ -443,3 +443,28 @@ class TestScopedMigration:
         ids = {m.id() for m in results}
         assert "m-null-match-1" in ids
         assert "m-null-match-2" not in ids
+
+    def test_empty_scope_value_is_normalized_to_null(self, temp_store):
+        """Empty scope strings should not create a separate pseudo-tenant."""
+        fm = _fm_with_scope("m-empty-scope", "body", user_id="")
+        temp_store.put("user", fm, "body")
+
+        row = temp_store._get_conn().execute(
+            "SELECT user_id FROM memories WHERE id = ?", ("m-empty-scope",)
+        ).fetchone()
+        assert row["user_id"] is None
+        assert [m.id() for m in temp_store.list(filters={"user_id": None})] == ["m-empty-scope"]
+        assert temp_store.list(filters={"user_id": ""})[0].id() == "m-empty-scope"
+
+    def test_search_cache_distinguishes_absent_filter_from_null_filter(self, temp_store):
+        """Unfiltered search and explicit NULL-scope search must not share cache entries."""
+        temp_store.put("user", _fm_with_scope("m-cache-u1", "cache probe body", user_id="u1"), "cache probe body")
+        temp_store.put("user", _fm_with_scope("m-cache-null", "cache probe body"), "cache probe body")
+
+        si = SearchIndex(temp_store)
+        unfiltered = [m.id() for m in si.search("cache probe", k=10)]
+        null_scoped = [m.id() for m in si.search("cache probe", k=10, filters={"user_id": None})]
+
+        assert "m-cache-u1" in unfiltered
+        assert "m-cache-null" in null_scoped
+        assert "m-cache-u1" not in null_scoped

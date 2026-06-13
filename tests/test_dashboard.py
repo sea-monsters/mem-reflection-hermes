@@ -106,16 +106,28 @@ def temp_dashboard():
         client = TestClient(app)
         yield client, store, graph
 
+    try:
+        if _HAS_FASTAPI and "client" in locals():
+            client.close()
+    except Exception:
+        pass
+
     # Restore real package to avoid mock pollution in later tests
     if _real_srh is not None:
         sys.modules["mem_reflection_hermes"] = _real_srh
     else:
         sys.modules.pop("mem_reflection_hermes", None)
 
+    # Reset singleton graph manager so later tests with different temp dirs
+    # do not inherit a stale db_path from this fixture.
     try:
-        conn = getattr(store._local, "conn", None)
-        if conn is not None:
-            conn.close()
+        import mem_reflection_hermes.runtime.graph as _rt_graph
+        _rt_graph._graph_manager_compat = None
+    except Exception:
+        pass
+
+    try:
+        store.close()
     except Exception:
         pass
     graph.close()
@@ -165,6 +177,30 @@ class TestMemoriesCRUD:
         assert data["status"] == "ok"
 
     @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_create_memory_passes_scope_fields_to_tool(self, temp_dashboard):
+        client, store, graph = temp_dashboard
+        payload = {
+            "body": "Scoped memory content",
+            "zone": "work",
+            "confidence": "high",
+            "tags": ["important"],
+            "pinned": False,
+            "scope": "user",
+            "user_id": "u1",
+            "agent_id": "a1",
+            "run_id": "r1",
+        }
+
+        resp = client.post("/api/memories", json=payload)
+
+        assert resp.status_code == 200
+        sys.modules["mem_reflection_hermes"]._tool_srh_memory_write.assert_called()
+        args = sys.modules["mem_reflection_hermes"]._tool_srh_memory_write.call_args.args[0]
+        assert args["user_id"] == "u1"
+        assert args["agent_id"] == "a1"
+        assert args["run_id"] == "r1"
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
     def test_delete_memory(self, temp_dashboard):
         client, store, graph = temp_dashboard
         fm = MemoryFrontmatter.new(source="test")
@@ -197,6 +233,35 @@ class TestMemoriesCRUD:
         assert resp.status_code == 200
         data = resp.json()
         assert all(m["zone"] == "work" for m in data["memories"])
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_list_memories_scope_filter(self, temp_dashboard):
+        client, store, graph = temp_dashboard
+        fm_u1 = MemoryFrontmatter.new(source="test", zone="general", user_id="u1")
+        fm_u2 = MemoryFrontmatter.new(source="test", zone="general", user_id="u2")
+        store.put("user", fm_u1, "Scoped dashboard item u1")
+        store.put("user", fm_u2, "Scoped dashboard item u2")
+
+        resp = client.get("/api/memories?user_id=u1")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [m["user_id"] for m in data["memories"]] == ["u1"]
+        assert [m["body"] for m in data["memories"]] == ["Scoped dashboard item u1"]
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_query_endpoint_scope_filter(self, temp_dashboard):
+        client, store, graph = temp_dashboard
+        fm_u1 = MemoryFrontmatter.new(source="test", zone="general", user_id="u1")
+        fm_u2 = MemoryFrontmatter.new(source="test", zone="general", user_id="u2")
+        store.put("user", fm_u1, "Cross layer scoped query banana u1")
+        store.put("user", fm_u2, "Cross layer scoped query banana u2")
+
+        resp = client.get("/api/query?q=banana&user_id=u1")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [r["memory_id"] for r in data["results"]] == [fm_u1.id]
 
 
 # ---------------------------------------------------------------------------

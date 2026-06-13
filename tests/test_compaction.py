@@ -162,12 +162,125 @@ class TestCompactEpisodeZone:
         assert result["total_raw_consumed"] == 21
 
     def test_fallback_longest_body(self, temp_store):
-        """Without LLM, fallback should pick the longest body."""
+        """Without LLM, fallback should still produce a compact summary."""
         _seed_episode_entries(temp_store, 25)
         result = _compact_episode_zone(temp_store, ctx=None)
         assert result["compacted"] >= 1
         for s in result["summaries"]:
             assert len(s["summary"]) > 0
+
+    def test_fallback_prefers_representative_conclusion(self, temp_store):
+        """Fallback should prefer the concise conclusion over a longer noisy body."""
+        long_noise = (
+            "This is a long session note with repeated scaffolding and process chatter. "
+            "It explains many setup details, but it never states the actual decision. "
+            "The point is to keep the scoped filters on by default for hosted sessions."
+        )
+        conclusion = "We decided to keep scoped filters on by default for hosted sessions."
+
+        for idx in range(19):
+            fm = MemoryFrontmatter.new(
+                source="session",
+                confidence="low",
+                tags=["raw_chunk"],
+                zone="episode",
+            )
+            fm.created = f"2026-06-05T{10 + idx % 12:02d}:00:00+00:00"
+            temp_store.put("user", fm, f"Routine episode entry {idx} about housekeeping.")
+
+        fm_noise = MemoryFrontmatter.new(
+            source="session",
+            confidence="low",
+            tags=["raw_chunk"],
+            zone="episode",
+        )
+        fm_noise.created = "2026-06-05T20:00:00+00:00"
+        temp_store.put("user", fm_noise, long_noise)
+
+        fm_decision = MemoryFrontmatter.new(
+            source="session",
+            confidence="low",
+            tags=["raw_chunk"],
+            zone="episode",
+        )
+        fm_decision.created = "2026-06-05T21:00:00+00:00"
+        temp_store.put("user", fm_decision, conclusion)
+
+        result = _compact_episode_zone(temp_store, ctx=None)
+
+        assert result["compacted"] >= 1
+        summaries = " ".join(item["summary"] for item in result["summaries"])
+        assert "scoped filters on by default" in summaries
+        assert "never states the actual decision" not in summaries
+
+    def test_compaction_reports_token_accounting(self, temp_store):
+        """Compaction should report source and summary token accounting."""
+        _seed_episode_entries(temp_store, 25)
+        result = _compact_episode_zone(temp_store, ctx=None)
+
+        assert result["compacted"] >= 1
+        assert result["total_source_tokens"] > 0
+        assert result["total_summary_tokens"] > 0
+        assert result["total_source_tokens"] >= result["total_summary_tokens"]
+
+        sample = result["summaries"][0]
+        assert sample["source_tokens"] > 0
+        assert sample["summary_tokens"] > 0
+        assert 0 < sample["compression_ratio"] <= 1
+        assert sample["summary_mode"] in {"fallback", "llm", "llm_fallback"}
+
+    def test_llm_summary_quality_gate_rejects_verbose_output(self, temp_store, monkeypatch):
+        """Verbose LLM output should fail the quality gate and fall back to the scored summary."""
+        monkeypatch.setattr(_ref_mod, "_estimate_tokens", lambda text: len((text or "").split()))
+
+        conclusion = "We decided to keep scoped filters on by default for hosted sessions."
+        verbose_llm_summary = (
+            "This summary mostly repeats implementation chatter and setup details. "
+            "It never states the decision directly and instead rambles about scaffolding, "
+            "process notes, and how the scoped filters may or may not be used. "
+            "There is no crisp conclusion here."
+        )
+
+        for idx in range(20):
+            fm = MemoryFrontmatter.new(
+                source="session",
+                confidence="low",
+                tags=["raw_chunk"],
+                zone="episode",
+            )
+            fm.created = f"2026-06-05T{10 + idx % 12:02d}:00:00+00:00"
+            temp_store.put("user", fm, f"Routine episode entry {idx} about housekeeping.")
+
+        fm_noise = MemoryFrontmatter.new(
+            source="session",
+            confidence="low",
+            tags=["raw_chunk"],
+            zone="episode",
+        )
+        fm_noise.created = "2026-06-05T20:00:00+00:00"
+        temp_store.put("user", fm_noise, (
+            "This is a long session note with repeated scaffolding and process chatter. "
+            "It explains many setup details, but it never states the actual decision. "
+            "The point is to keep the scoped filters on by default for hosted sessions."
+        ))
+
+        fm_decision = MemoryFrontmatter.new(
+            source="session",
+            confidence="low",
+            tags=["raw_chunk"],
+            zone="episode",
+        )
+        fm_decision.created = "2026-06-05T21:00:00+00:00"
+        temp_store.put("user", fm_decision, conclusion)
+
+        ctx = types.SimpleNamespace(llm=lambda _prompt: verbose_llm_summary)
+        result = _compact_episode_zone(temp_store, ctx=ctx)
+
+        assert result["compacted"] >= 1
+        summaries = " ".join(item["summary"] for item in result["summaries"])
+        assert "scoped filters on by default" in summaries
+        assert "implementation chatter" not in summaries
+        assert result["summaries"][0]["summary_mode"] == "llm_fallback"
 
     def test_compaction_can_run_multiple_times(self, temp_store):
         """Running compaction again should not re-compact already compacted entries."""

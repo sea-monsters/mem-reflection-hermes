@@ -2,12 +2,12 @@
 
 Self-evolving memory & reflection system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Ported from [small-rust-hermes](https://github.com/coder-brzhang/small-rust-hermes) with significant performance enhancements, a full-featured dashboard, and graph memory integration.
 
-**Current version: v1.6** — Memory Event Ledger, Scoped Filters, curator action pipeline, context reliability, entity recall, graph memory, and reflection system. See [CHANGELOG](docs/CHANGELOG.md) for full history.
+**Current version: v1.7** — Memory Event Ledger, Scoped Filters, scope-aware reflection propagation, curator action pipeline, context reliability, entity recall, graph memory, and reflection system. See [CHANGELOG](docs/CHANGELOG.md) for full history.
 
 ## Features
 
 - **Structured Memories**: Markdown + YAML frontmatter with zone, rank, version, supersedes chains
-- **Dual Scope**: User-level (`~/.hermes/memories/`) and project-level (`./.hermes/memories/`)
+- **Scoped Memories**: Optional `user_id` / `agent_id` / `run_id` metadata with NULL = globally visible; compatible with user- and project-level storage roots
 - **Memory Palace**: Zone-based organization (core, work, episode, general, project:*) with tool-driven navigation
 - **BM25 Search**: Pure Python, zero dependencies, ~0.8ms for 50 memories
 - **Semantic Search**: ONNX Runtime + all-MiniLM-L6-v2, 16x faster than PyTorch (optional)
@@ -18,14 +18,17 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Skill Auto-Matching**: Token overlap + optional embedding hybrid
 - **Profile Compilation**: LLM-driven compilation into structured profile documents
 - **Runtime Graph Memory**: GraphIndex-backed Hebbian co-occurrence learning, decay, PageRank, and adaptive retrieval
+- **Typed Fact Sidecar** (v1.7): GraphIndex now keeps a lightweight typed-fact sidecar for self-contained facts, relation lineage, and invalidation trails alongside the associative graph.
 - **Runtime Query APIs**: Dashboard/search query paths combine MemoryStore, search templates/cache, graph neighbors, and supersedes-aware recall
 - **PageRank**: Centrality scores for hub memory identification
 - **Cross-Zone Analysis**: Bridge memories, zone centrality, zone recommendations
 - **Episode Compaction** (v1.1): Clusters raw episode entries into daily summaries via LLM
-- **Memory Curator** (v1.2 → v1.3 → v1.5): Automated 5-phase lifecycle — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping. v1.5 refactored into composable action pipeline (`memory/curator/`)
+- **Compaction Fallback Quality** (v1.7): When LLM summarization is unavailable, episode compaction now scores candidate fragments and prefers concise conclusion-like summaries over longest-body truncation.
+- **Memory Curator** (v1.2 → v1.3 → v1.5 → v1.6 → v1.7): Automated lifecycle maintenance — TTL expiry, staleness detection, supersedes archiving, similarity detection, orphan graph-edge cleanup, cold storage with tool-noise stripping. v1.7 starts propagating scope context through reflection, compaction, and manual reflection entrypoints so hosted or multi-user/multi-agent runs can keep maintenance per-scope; use explicit `admin_global=True` only for deliberate full-store maintenance; no-filter local mode remains global for single-user compatibility.
 - **Context Reliability** (v1.4): Stable/dynamic context split, timeout-protected assembly, graded compression (`none/mild/aggressive/emergency`)
 - **Memory Event Ledger** (v1.6): Append-only `memory_events` log tracks all write/update/delete/archive/reflect events with `user_id`, `agent_id`, `run_id`, `memory_key`, `event_type`, and ISO timestamp; event search via `srh_memory_history` tool
-- **Scoped Filters** (v1.6): `scope_filter` parameter on search & history — `"general"` | `"user"` | `"project"` — controls which memory scope to query, with `scope=None` (default) returning cross-scope results
+- **Scoped Filters** (v1.6): `user_id` / `agent_id` / `run_id` filters on search, delete, palace, compile, and dashboard APIs; `None` matches NULL-scoped memories, while omitted filters preserve the global view
+- **Scope-Aware Reflection** (v1.7): Micro/full reflection, raw chunk capture, compaction, and manual `srh_reflect_now` now inherit scope filters when the host provides them, so writes no longer fall back to accidental global scope in hosted or multi-agent sessions. Semantic supersedes resolution has also started so generic memory intents no longer auto-promote to replacement edges.
 - **Explainable Search** (v1.4): Opt-in `explain=true` flag returns structured score breakdown per hit (BM25, embedding, recency, effectiveness, entity, Hebbian)
 - **Entity Recall** (v1.4): SQLite-backed entity index with lifecycle hooks; entity boost in search + explain output
 - **Session Checkpoint** (v1.4): Atomic JSON persistence with pending-stage recovery and corrupt-failopen behavior

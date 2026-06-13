@@ -209,13 +209,14 @@ class _RecordingMemStore:
         self.check_conflict_calls = []
         self.put_calls = []
 
-    def list_active(self):
+    def list_active(self, filters=None):
         return []
 
-    def check_conflict(self, body: str, exclude_ids=None):
+    def check_conflict(self, body: str, exclude_ids=None, filters=None):
         self.check_conflict_calls.append({
             "body": body,
             "exclude_ids": list(exclude_ids or []),
+            "filters": filters,
         })
         return None
 
@@ -409,7 +410,7 @@ class TestHookReflectionCadence:
         monkeypatch.setattr(_lifecycle_mod, "_context_timeout_ms", lambda: 10)
         monkeypatch.setattr(_lifecycle_mod, "_estimate_tokens", lambda _text: 1)
 
-        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             if stable_only:
                 return SimpleNamespace(
                     append_system_context="## Pinned Memories\n- [core] stable",
@@ -447,7 +448,7 @@ class TestHookReflectionCadence:
 
         call_count = {"n": 0}
 
-        def _fake_slow_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_slow_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             call_count["n"] += 1
             if stable_only:
                 return SimpleNamespace(
@@ -513,7 +514,7 @@ class TestHookReflectionCadence:
 
         call_log = []
 
-        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             call_log.append(("stable" if stable_only else "full"))
             if stable_only:
                 return SimpleNamespace(
@@ -568,7 +569,7 @@ class TestReflectionSupersedesRegression:
             "conflicts": [],
         }))
 
-        result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "remember this"}])
+        result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "Actually, I was wrong. Update my deployment preference."}])
 
         assert result["accepted_memories"]
         assert mem_store.check_conflict_calls[0]["exclude_ids"] == ["mem-old"]
@@ -625,7 +626,7 @@ class TestReflectionSupersedesRegression:
             "conflicts": [],
         }))
 
-        parsed = _engine._run_micro_reflection(ctx, "remember my new editor", "noted")
+        parsed = _engine._run_micro_reflection(ctx, "Actually, I was wrong about my editor preference", "noted")
 
         assert parsed is not None
         assert mem_store.check_conflict_calls[0]["exclude_ids"] == ["mem-editor-old"]

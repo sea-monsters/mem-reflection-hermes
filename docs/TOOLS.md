@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: **13 registered tools** (v1.6).
+Current SRH tool surface: **13 registered tools** (v1.7).
 
 The 13 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 
@@ -72,13 +72,16 @@ srh_memory_history(id="mem_abc123", include_events=True, session_id="sess-001")
 
 ### `srh_palace_navigate`
 
-Topic-based recall within the Memory Palace, optionally scoped to a zone. Under the hood this delegates to `srh_palace_recall`.
+Topic-based recall within the Memory Palace, optionally scoped to a zone and tenant scope. Under the hood this delegates to `srh_palace_recall`.
 
 ```python
 srh_palace_navigate(topic="editor preference", zone="work", limit=5)
+srh_palace_navigate(topic="editor preference", zone="work", limit=5, filters={"user_id": "u1"})
 ```
 
 > **Note**: Earlier versions exposed separate tools (`srh_palace_zones`, `srh_palace_read_zone`, `srh_palace_search`, `srh_palace_rebalance`, `srh_palace_recall`). These have been consolidated into the single `srh_palace_navigate` tool surface. The internal functions remain in `runtime/tools.py` for backward-compat dashboard routes.
+>
+> **Scope rule**: In hosted or multi-user/multi-agent scenarios, pass `filters={"user_id": ..., "agent_id": ..., "run_id": ...}` to keep palace recall tenant-safe. Leave filters empty only for local single-user compatibility or explicit admin-only inspection.
 
 ## Reflection & Profile (2)
 
@@ -88,9 +91,11 @@ Trigger reflection pipeline manually.
 
 ```python
 srh_reflect_now(messages=[...], mode="full")
+srh_reflect_now(messages=[...], mode="full", filters={"user_id": "u1"})
 ```
 
 Modes: `full` (session-end structured summary), `micro` (per-turn background), `embedding` (vector-only, zero LLM).
+Use `filters` when you want the reflection write path to stay tenant-safe in hosted or multi-agent sessions.
 
 ### `srh_compile_profile`
 
@@ -100,7 +105,10 @@ Compile memories into a structured profile.
 srh_compile_profile(mode="profile")       # profile.md format
 srh_compile_profile(mode="palace_index")  # compiled palace index
 srh_compile_profile(mode="zone")          # per-zone summaries
+srh_compile_profile(mode="profile", filters={"user_id": "u1"})  # scoped profile
 ```
+
+**v1.6 curator policy**: Curator is scoped by default in hosted/multi-user/multi-agent runs. Pass `user_id` / `agent_id` / `run_id` filters for tenant-safe maintenance. Use explicit `admin_global=True` only when you intend a full-store maintenance pass. No-filter mode remains global for single-user compatibility.
 
 ## Skills (1)
 
@@ -174,10 +182,10 @@ Returns:
 | `srh_memory_write` | Memory | `runtime/tools.py` | v1.6: `user_id`/`agent_id`/`run_id` |
 | `srh_memory_delete` | Memory | `runtime/tools.py` | v1.6: `filters` for batch delete |
 | `srh_memory_history` | Memory | `runtime/tools.py` | v1.6: `include_events` + event filtering |
-| `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall` |
-| `srh_reflect_now` | Reflection | `runtime/tools.py` | |
+| `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall`; supports zone + scope filters |
+| `srh_reflect_now` | Reflection | `runtime/tools.py` | v1.7: optional scope filters for scoped reflection runs |
 | `srh_skill_query` | Skills | `runtime/tools.py` | Delegates to `_tool_srh_skill_search` |
-| `srh_compile_profile` | Profile | `runtime/tools.py` | |
+| `srh_compile_profile` | Profile | `runtime/tools.py` | v1.6: optional scope filters for per-tenant profile/palace/zone compilation |
 | `srh_associate` | Graph | `runtime/graph.py` | |
 | `srh_graph_retrieve` | Graph | `runtime/graph.py` | |
 | `srh_graph_stats` | Graph | `runtime/graph.py` | |

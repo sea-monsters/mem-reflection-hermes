@@ -13,14 +13,19 @@ def _build_context_block(query: str = "") -> str:
     return build_context_block(query)
 
 
-def _build_context_bundle(query: str = "", max_tokens: int = 4000, stable_only: bool = False):
+def _build_context_bundle(
+    query: str = "",
+    max_tokens: int = 4000,
+    stable_only: bool = False,
+    filters=None,
+):
     """Build structured context bundle using memory.context module."""
     from ..memory.context import build_context_bundle
     # Import singleton getters lazily to avoid circular import during package init.
     from .. import _get_mem_store, _get_search_index, _get_skill_store
     return build_context_bundle(
         _get_mem_store(), _get_search_index(), _get_skill_store(),
-        query, max_tokens=max_tokens, stable_only=stable_only,
+        query, max_tokens=max_tokens, stable_only=stable_only, filters=filters,
     )
 
 

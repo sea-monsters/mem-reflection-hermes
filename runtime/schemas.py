@@ -5,6 +5,11 @@ All registered Hermes tool schemas live here so the package entrypoint
 """
 from __future__ import annotations
 
+try:
+    from ..core.scope import SCOPE_FILTER_SCHEMA
+except ImportError:
+    from core.scope import SCOPE_FILTER_SCHEMA
+
 _SRH_MEMORY_WRITE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -31,7 +36,7 @@ _SRH_MEMORY_SEARCH_SCHEMA = {
         "zone": {"type": "string", "description": "Filter to a specific zone"},
         "include_history": {"type": "boolean", "description": "Include superseded memories"},
         "explain": {"type": "boolean", "description": "Include score breakdown metadata"},
-        "filters": {"type": "object", "description": "Optional scope filters (user_id, agent_id, run_id). None means IS NULL (universally visible)."},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
     },
     "required": ["query"],
 }
@@ -41,7 +46,7 @@ _SRH_MEMORY_DELETE_SCHEMA = {
     "properties": {
         "id": {"type": "string", "description": "Memory ID to delete"},
         "scope": {"type": "string", "enum": ["user", "project"], "description": "User or project scope"},
-        "filters": {"type": "object", "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
     },
     "required": [],
     "anyOf": [
@@ -56,6 +61,7 @@ _SRH_PALACE_NAVIGATE_SCHEMA = {
         "topic": {"type": "string", "description": "Topic to recall memories for"},
         "limit": {"type": "integer", "description": "Maximum memories to return (default 5)"},
         "zone": {"type": "string", "description": "Specific zone to search, or null for active zone"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id)."},
     },
     "required": ["topic"],
 }
@@ -65,6 +71,7 @@ _SRH_REFLECT_NOW_SCHEMA = {
     "properties": {
         "messages": {"type": "array", "description": "Conversation messages to reflect on"},
         "mode": {"type": "string", "enum": ["full", "micro", "embedding"], "description": "Reflection mode"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters for reflection writes and context assembly."},
     },
     "required": ["messages"],
 }
@@ -82,6 +89,7 @@ _SRH_COMPILE_PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
         "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "description": "Compilation mode"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters for per-scope profile compilation."},
     },
     "required": ["mode"],
 }

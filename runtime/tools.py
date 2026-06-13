@@ -18,6 +18,7 @@ from ..core.store import (
     _is_expired, _is_context_mismatch, _classify_update_intent,
 )
 from ..core.search import _extract_keywords
+from ..core.scope import normalize_scope_filters, scope_from_values
 from ..reflection.runtime import (
     _append_reflect_log, _recent_reflect_outcomes,
     _run_full_reflection, _run_micro_reflection,
@@ -119,7 +120,10 @@ def _tool_srh_memory_search(args: dict, **kwargs) -> str:
     zone_filter = args.get("zone")  # Optional zone scope
     include_history = bool(args.get("include_history", False))
     explain = bool(args.get("explain", False))
-    filters = args.get("filters") or None
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
     mem_store = _get_mem_store()
     # ── Scheme C: Fusion search (BM25 × Graph × Supersedes) instead of two-stage ──
     normalized_zone = _normalize_zone(zone_filter) if zone_filter else None
@@ -214,9 +218,9 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
 
     # Extract scope fields before conflict check so scoped writes only
     # conflict-detect within their own scope (v1.6).
-    user_id = args.get("user_id")
-    agent_id = args.get("agent_id")
-    run_id = args.get("run_id")
+    user_id = scope_from_values(user_id=args.get("user_id")).get("user_id")
+    agent_id = scope_from_values(agent_id=args.get("agent_id")).get("agent_id")
+    run_id = scope_from_values(run_id=args.get("run_id")).get("run_id")
 
     # Cross-scope supersedes guard — prevent scoped writes from superseding
     # memories owned by a different scope (v1.6).
@@ -233,13 +237,7 @@ def _tool_srh_memory_write(args: dict, **kwargs) -> str:
                         "conflict_id": sid,
                         "scope_field": key,
                     })
-    scope_filters = {}
-    if user_id is not None:
-        scope_filters["user_id"] = user_id
-    if agent_id is not None:
-        scope_filters["agent_id"] = agent_id
-    if run_id is not None:
-        scope_filters["run_id"] = run_id
+    scope_filters = scope_from_values(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
     # Conflict check — skip targets being superseded to avoid rejecting
     # intentional replacements (P1).  Pass scope_filters so scoped writes
@@ -294,7 +292,10 @@ def _tool_srh_memory_delete(args: dict, **kwargs) -> str:
     mem_store = _get_mem_store()
     mem_id = args.get("id", "")
     scope = args.get("scope", "user")
-    filters = args.get("filters")
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
     if not mem_id and not filters:
         return _jd({"error": "id or filters is required"})
     if filters:
@@ -547,12 +548,16 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
         return _jd({"error": "topic is required"})
     k = int(args.get("limit", 5))
     zone = _normalize_zone(args.get("zone")) if args.get("zone") else None
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
 
     mem_store = _get_mem_store()
     if zone:
-        results = mem_store.search(query, k=k, zone=zone)
+        results = mem_store.search(query, k=k, zone=zone, filters=filters)
     else:
-        results = mem_store.search(query, k=k * 3)[:k]
+        results = mem_store.search(query, k=k * 3, filters=filters)[:k]
 
     if not results:
         scope_msg = f" in zone '{zone}'" if zone else ""
@@ -567,19 +572,24 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
 
     out = []
     for i, m in enumerate(results):
-        out.append({
+        item = {
             "rank": i + 1,
             "id": m.id(),
             "zone": m.frontmatter.zone,
             "confidence": m.frontmatter.confidence,
             "tags": m.frontmatter.tags,
             "body": m.body[:500],
-        })
+        }
+        for field in ("user_id", "agent_id", "run_id"):
+            val = getattr(m.frontmatter, field, None)
+            if val is not None:
+                item[field] = val
+        out.append(item)
     # ── Graph-enhanced expansion ─────────────────────────
     # Enrich palace recall results with graph-neighbor memories.
     result_mids = [m.id() for m in results]
     return json.dumps(
-        _enrich_with_graph(result_mids, out, k, zone_filter=zone),
+        {"results": out} if filters else _enrich_with_graph(result_mids, out, k, zone_filter=zone),
         ensure_ascii=False,
     )
 
@@ -597,9 +607,13 @@ def _tool_srh_palace_search(args: dict, **kwargs) -> str:
     if not query:
         return _jd({"error": "query is required"})
     k = int(args.get("limit", 10))
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
 
     mem_store = _get_mem_store()
-    results = mem_store.fusion_search(query, k=k * 2)
+    results = mem_store.fusion_search(query, k=k * 2, filters=filters)
 
     if not results:
         return json.dumps({
@@ -612,12 +626,17 @@ def _tool_srh_palace_search(args: dict, **kwargs) -> str:
     grouped = {}
     for m in results:
         zone = m.frontmatter.zone
-        grouped.setdefault(zone, []).append({
+        item = {
             "id": m.id(),
             "confidence": m.frontmatter.confidence,
             "tags": m.frontmatter.tags,
             "body": m.body[:500],
-        })
+        }
+        for field in ("user_id", "agent_id", "run_id"):
+            val = getattr(m.frontmatter, field, None)
+            if val is not None:
+                item[field] = val
+        grouped.setdefault(zone, []).append(item)
         record_memory_stat(m.id(), "accessed")
 
     # Sort zones by result count (descending)
@@ -636,6 +655,10 @@ def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
     """Trigger a full reflection on the current session messages."""
     ctx = args.get("ctx")
     messages = args.get("messages", [])
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
     if not ctx:
         return _jd({
             "error": "Reflection requires ctx with LLM access. Run via /reflect slash command or wait for session-end auto-reflection.",
@@ -644,7 +667,7 @@ def _tool_srh_reflect_now(args: dict, **kwargs) -> str:
     if not messages:
         return _jd({"error": "No messages to reflect on"})
     try:
-        result = _run_full_reflection(ctx, messages)
+        result = _run_full_reflection(ctx, messages, scope_filters=filters)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return _jd({"error": str(e)})
@@ -685,7 +708,7 @@ Rules:
 - Output ONLY the summary markdown, no preamble"""
 
 
-def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
+def _compile_profile_via_llm(ctx, mode: str = "profile", filters: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Any]:
     """Compile active memories into a structured markdown document via LLM.
 
     Args:
@@ -703,7 +726,11 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
         return {"error": "No LLM available for compilation"}
 
     mem_store = _get_mem_store()
-    active = mem_store.list_active()
+    filters = normalize_scope_filters(filters)
+    try:
+        active = mem_store.list_active(filters=filters)
+    except TypeError:
+        active = mem_store.list_active()
     if not active:
         return {"error": "No active memories to compile"}
 
@@ -719,7 +746,10 @@ def _compile_profile_via_llm(ctx, mode: str = "profile") -> Dict[str, Any]:
         elif mode == "zone":
             # Compile all zones
             results = {}
-            groups = mem_store.group_by_zone()
+            try:
+                groups = mem_store.group_by_zone(filters=filters)
+            except TypeError:
+                groups = mem_store.group_by_zone()
             for zone, mems in groups.items():
                 prompt = _build_compile_zone_prompt(zone, mems)
                 result = ctx.llm.complete_structured(
@@ -809,7 +839,11 @@ def _tool_srh_compile_profile(args: dict, **kwargs) -> str:
             "error": "Compilation requires ctx with LLM access. Use /compile-profile slash command.",
         })
     mode = args.get("mode", "profile")
-    result = _compile_profile_via_llm(ctx, mode)
+    try:
+        filters = normalize_scope_filters(args.get("filters") or None)
+    except ValueError as e:
+        return _jd({"error": str(e)})
+    result = _compile_profile_via_llm(ctx, mode, filters=filters)
     return json.dumps(result, ensure_ascii=False)
 
 

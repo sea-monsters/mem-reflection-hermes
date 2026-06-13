@@ -13,6 +13,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from ...core.scope import normalize_scope_filters
+except ImportError:
+    try:
+        from core.scope import normalize_scope_filters
+    except ImportError:
+        def normalize_scope_filters(filters):  # type: ignore[no-redef]
+            return filters
+
 logger = logging.getLogger(__name__)
 
 # Resolve the shared late-binding helper safely for both package and standalone
@@ -64,7 +73,23 @@ _DEFAULT_CFG: Dict[str, Any] = {
 class CuratorContext:
     """Input context shared by all actions in a pipeline run."""
     mem_store: Any
+    filters: Optional[Dict[str, Optional[str]]] = None
+    admin_global: bool = False
+    scope_label: str = "local_global"
     errors: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.filters = normalize_scope_filters(self.filters)
+        if self.admin_global:
+            self.scope_label = "global_admin"
+        elif self.filters:
+            self.scope_label = "scoped"
+
+    def list_active(self):
+        """Return active memories according to this curator run's scope policy."""
+        if self.admin_global or not self.filters:
+            return self.mem_store.list_active()
+        return self.mem_store.list_active(filters=self.filters)
 
 
 @dataclass

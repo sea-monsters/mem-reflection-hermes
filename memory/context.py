@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 try:
     from ..core.store import LoadedMemory, LoadedSkill, _tokenise, _memory_tokens, plugin_config
     from ..core.config import get_plugin_config_model
+    from ..core.scope import filter_memories_by_scope, normalize_scope_filters
 except ImportError:
     import sys
     from pathlib import Path
@@ -29,6 +30,18 @@ except ImportError:
     _tokenise = _store_mod._tokenise
     _memory_tokens = _store_mod._memory_tokens
     plugin_config = _store_mod.plugin_config
+    try:
+        from core.scope import filter_memories_by_scope, normalize_scope_filters
+    except ImportError:
+        def normalize_scope_filters(filters):
+            return filters
+        def filter_memories_by_scope(memories, filters):
+            if not filters:
+                return list(memories)
+            return [
+                m for m in memories
+                if all(getattr(getattr(m, "frontmatter", m), k, None) == v for k, v in filters.items())
+            ]
     def get_plugin_config_model():
         class _DummyCompression:
             enabled = True
@@ -112,6 +125,7 @@ def build_context_bundle(
     query: str = "",
     max_tokens: int = 4000,
     stable_only: bool = False,
+    filters: Optional[Dict[str, Any]] = None,
 ) -> ContextBundle:
     """Build a structured context bundle for host injection.
 
@@ -146,8 +160,28 @@ def build_context_bundle(
         debug["dropped_sections"].append(label)
         return False
 
+    filters = normalize_scope_filters(filters)
+
+    def _list_pinned_scoped() -> List[LoadedMemory]:
+        try:
+            return store.list_pinned(filters=filters)
+        except TypeError:
+            return filter_memories_by_scope(store.list_pinned(), filters)
+
+    def _list_active_scoped() -> List[LoadedMemory]:
+        try:
+            return store.list_active(filters=filters)
+        except TypeError:
+            return filter_memories_by_scope(store.list_active(), filters)
+
+    def _search_scoped() -> List[LoadedMemory]:
+        try:
+            return search.search(query, k=10, filters=filters)
+        except TypeError:
+            return filter_memories_by_scope(search.search(query, k=10), filters)
+
     # 1. Stable: pinned memories
-    pinned = store.list_pinned()
+    pinned = _list_pinned_scoped()
     if pinned:
         block = "## Pinned Memories\n" + "\n".join(_format_memory(m) for m in pinned)
         _try_add(stable_parts, "pinned_memories", block)
@@ -160,12 +194,12 @@ def build_context_bundle(
     if not stable_only:
         if query and query.strip():
             try:
-                active = search.search(query, k=10)
+                active = _search_scoped()
             except Exception:
                 logger.warning("Context search failed, falling back to list_active", exc_info=True)
-                active = store.list_active()[:10]
+                active = _list_active_scoped()[:10]
         else:
-            active = store.list_active()[:10]
+            active = _list_active_scoped()[:10]
 
         triggered = _match_triggered_skills(skills, query)
 
@@ -179,7 +213,7 @@ def build_context_bundle(
         try:
             cfg = plugin_config()
             if cfg.get("context_compacted_episode", True):
-                episode_block = _build_compacted_episode_block(store, detail_level="mild")
+                episode_block = _build_compacted_episode_block(store, detail_level="mild", filters=filters)
         except Exception:
             debug["dropped_sections"].append("compacted_episode_summaries")
 
@@ -224,9 +258,9 @@ def build_context_bundle(
     )
 
 
-def build_context(store, search, skills, query: str = "", max_tokens: int = 4000) -> str:
+def build_context(store, search, skills, query: str = "", max_tokens: int = 4000, filters: Optional[Dict[str, Any]] = None) -> str:
     """Build a backward-compatible single-string context block for injection."""
-    bundle = build_context_bundle(store, search, skills, query, max_tokens=max_tokens)
+    bundle = build_context_bundle(store, search, skills, query, max_tokens=max_tokens, filters=filters)
     parts = [bundle.append_system_context, bundle.prepend_context]
     return "\n\n".join(p for p in parts if p)
 
@@ -236,17 +270,19 @@ def build_context(store, search, skills, query: str = "", max_tokens: int = 4000
 # ---------------------------------------------------------------------------
 
 
-def _build_compacted_episode_block(store, detail_level: str = "mild") -> str:
+def _build_compacted_episode_block(store, detail_level: str = "mild", filters: Optional[Dict[str, Any]] = None) -> str:
     """Load compacted episode summaries from the episode zone.
 
     Searches for entries tagged 'compacted' and formats as a digest.
     """
     try:
         compacted = store.search_by_tags(["compacted"], zone="episode", limit=20)
+        compacted = filter_memories_by_scope(compacted, filters)
     except Exception:
         # Fallback: scan episode zone for compacted entries
         try:
             all_ep = store.list_by_zone("episode")
+            all_ep = filter_memories_by_scope(all_ep, filters)
             compacted = [m for m in all_ep if "compacted" in (m.frontmatter.tags or [])]
         except Exception:
             return ""

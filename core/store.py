@@ -44,6 +44,7 @@ try:
         MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
         parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
     )
+    from .scope import build_scope_clauses, normalize_scope_value
     from .skill_store import SkillStore, _read_skill_file  # noqa: F401
     from .tokenization import (  # noqa: F401
         _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
@@ -79,6 +80,7 @@ except ImportError:
         MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
         parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
     )
+    from core.scope import build_scope_clauses, normalize_scope_value
     from core.skill_store import SkillStore, _read_skill_file  # noqa: F401
     from core.tokenization import (  # noqa: F401
         _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
@@ -229,7 +231,7 @@ def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
         "rank": fm.rank,
     }
     for k in ("user_id", "agent_id", "run_id"):
-        v = getattr(fm, k, None)
+        v = normalize_scope_value(getattr(fm, k, None))
         if v is not None:
             d[k] = v
     return d
@@ -405,6 +407,7 @@ class MemoryStore:
         self.project_root = project_root
         self._lock = threading.RLock()
         self._local = threading.local()
+        self._connections: Set[sqlite3.Connection] = set()
         self._db_path = db_path if db_path is not None else plugin_data_dir() / "memories.db"
         self._search_index = None
         self._graph = None
@@ -432,13 +435,42 @@ class MemoryStore:
                     conn.close()
                 except Exception:
                     pass
+                with self._lock:
+                    self._connections.discard(conn)
+                self._local.conn = None
                 conn = None
-        conn = sqlite3.connect(str(self._db_path), timeout=10)
+        conn = sqlite3.connect(str(self._db_path), timeout=10, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
         self._local.conn = conn
+        with self._lock:
+            self._connections.add(conn)
         return conn
+
+    def close(self) -> None:
+        """Checkpoint WAL and close all thread-local SQLite connections."""
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if hasattr(self._local, "conn"):
+            self._local.conn = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for tests or hosts that drop the store without close()."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -538,9 +570,9 @@ class MemoryStore:
                 body_hash,
                 str(m.source_path),
                 m.body,
-                fm.user_id,
-                fm.agent_id,
-                fm.run_id,
+                normalize_scope_value(fm.user_id),
+                normalize_scope_value(fm.agent_id),
+                normalize_scope_value(fm.run_id),
             ),
         )
         conn.execute("DELETE FROM tags WHERE memory_id = ?", (fm.id,))
@@ -673,14 +705,42 @@ class MemoryStore:
             result["events"] = self.get_memory_events(memory_id)
         return result
 
-    def _validate_supersedes_targets(self, conn: sqlite3.Connection, fm: MemoryFrontmatter) -> None:
-        missing = [
-            old
-            for old in fm.supersedes or []
-            if conn.execute("SELECT 1 FROM memories WHERE id = ?", (old,)).fetchone() is None
-        ]
+    def _validate_supersedes_targets(self, conn: sqlite3.Connection, scope: str, fm: MemoryFrontmatter) -> None:
+        missing: List[str] = []
+        mismatched: List[str] = []
+        new_scope = (
+            normalize_scope_value(getattr(fm, "user_id", None)),
+            normalize_scope_value(getattr(fm, "agent_id", None)),
+            normalize_scope_value(getattr(fm, "run_id", None)),
+        )
+        for old in fm.supersedes or []:
+            row = conn.execute(
+                "SELECT scope, user_id, agent_id, run_id FROM memories WHERE id = ?",
+                (old,),
+            ).fetchone()
+            if row is None:
+                missing.append(old)
+                continue
+            old_scope = (
+                normalize_scope_value(row["user_id"]),
+                normalize_scope_value(row["agent_id"]),
+                normalize_scope_value(row["run_id"]),
+            )
+            if row["scope"] != scope or old_scope != new_scope:
+                mismatched.append(old)
         if missing:
             raise ValueError(f"Cannot supersede missing memory id(s): {', '.join(missing)}")
+        if mismatched:
+            raise ValueError(
+                f"Cannot supersede memory id(s) from a different scope: {', '.join(mismatched)}"
+            )
+        if not fm.supersedes:
+            return
+        # Preserve the existing cycle guard after the existence/scope checks.
+        for old in fm.supersedes:
+            cycle = _lineage_cycle_check(self, old)
+            if cycle is not None:
+                raise ValueError(f"supersedes would create a cycle: {' -> '.join(cycle)}")
 
     def _row_to_loaded(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
         body = row["body"] or ""
@@ -745,7 +805,7 @@ class MemoryStore:
             was_in_transaction = conn.in_transaction
             if conn.execute("SELECT id FROM memories WHERE id = ?", (fm.id,)).fetchone():
                 raise ValueError(f"Duplicate memory id: {fm.id}")
-            self._validate_supersedes_targets(conn, fm)
+            self._validate_supersedes_targets(conn, scope, fm)
             root = self._root_for(scope)
             raw_date = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
             date_part = re.sub(r'[\\/]', '_', raw_date)
@@ -940,18 +1000,26 @@ class MemoryStore:
     def list_active(self, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
         return self.list(active_only=True, filters=filters)
 
-    def list_pinned(self) -> List[LoadedMemory]:
+    def list_pinned(self, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        clauses = ["m.pinned = 1", "m.id NOT IN (SELECT old_id FROM supersedes)"]
+        params: List[Any] = []
+        if filters:
+            f_clauses, f_params = self._build_scope_clauses(filters)
+            clauses.extend(f"m.{clause}" for clause in f_clauses)
+            params.extend(f_params)
+        where = " AND ".join(clauses)
         rows = self._get_conn().execute(
-            "SELECT m.* FROM memories m WHERE m.pinned = 1 AND m.id NOT IN (SELECT old_id FROM supersedes) ORDER BY m.rank DESC, m.created DESC"
+            f"SELECT m.* FROM memories m WHERE {where} ORDER BY m.rank DESC, m.created DESC",
+            params,
         ).fetchall()
         return [m for r in rows if (m := self._row_to_loaded(r)) is not None]
 
-    def list_by_zone(self, zone: str) -> List[LoadedMemory]:
-        return self.list(zone=zone, active_only=True)
+    def list_by_zone(self, zone: str, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        return self.list(zone=zone, active_only=True, filters=filters)
 
-    def group_by_zone(self) -> Dict[str, List[LoadedMemory]]:
+    def group_by_zone(self, filters: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, List[LoadedMemory]]:
         groups: Dict[str, List[LoadedMemory]] = {}
-        for memory in self.list_active():
+        for memory in self.list_active(filters=filters):
             groups.setdefault(memory.frontmatter.zone, []).append(memory)
         return groups
 
@@ -962,21 +1030,7 @@ class MemoryStore:
         Returns (clauses, params). Callers must validate that clauses is non-empty
         if they require at least one filter.
         """
-        clauses: List[str] = []
-        params: List[Any] = []
-        allowed_keys = {"user_id", "agent_id", "run_id"}
-        unknown = set(filters.keys()) - allowed_keys
-        if unknown:
-            raise ValueError(f"Unknown filter keys: {unknown}")
-        for key in ("user_id", "agent_id", "run_id"):
-            if key in filters:
-                val = filters[key]
-                if val is None:
-                    clauses.append(f"{key} IS NULL")
-                else:
-                    clauses.append(f"{key} = ?")
-                    params.append(val)
-        return clauses, params
+        return build_scope_clauses(filters)
 
     def delete_by_filters(self, filters: Dict[str, Optional[str]]) -> int:
         """Batch delete memories matching scope filters."""

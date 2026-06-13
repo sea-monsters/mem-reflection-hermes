@@ -29,17 +29,22 @@ class MockStore:
 
     def __init__(self, memories):
         self._memories = {m.id(): m for m in memories}
+        self.search_calls: list[dict[str, Any]] = []
 
     def get(self, mem_id):
         return self._memories.get(mem_id)
 
     def search(self, query: str, k: int = 5, zone: str | None = None, **kwargs) -> list:
         """Return memories matching query, optionally filtered by zone before truncation."""
+        self.search_calls.append({"query": query, "k": k, "zone": zone, **kwargs})
         # Simple relevance: count term overlap
         query_terms = set(query.lower().split())
         scored = []
         for m in self._memories.values():
             if zone is not None and m.frontmatter.zone != zone:
+                continue
+            filters = kwargs.get("filters") or {}
+            if any(getattr(m.frontmatter, key, None) != value for key, value in filters.items()):
                 continue
             mem_terms = set(m.body.lower().split())
             score = len(query_terms & mem_terms)
@@ -152,3 +157,30 @@ class TestPalaceRecallZoneFilter:
         # MockStore.search filters by zone, so nonexistent zone returns no results
         assert result.get("results") == []
         assert "nonexistent" in result.get("message", "")
+
+    def test_scope_filters_are_passed_to_search(self, monkeypatch):
+        """Palace recall must not bypass v1.6 scope filters."""
+        mem_u1 = make_memory_with_id("mem-u1", "apple scoped", zone="work")
+        object.__setattr__(mem_u1.frontmatter, "user_id", "u1")
+        mem_u2 = make_memory_with_id("mem-u2", "apple scoped", zone="work")
+        object.__setattr__(mem_u2.frontmatter, "user_id", "u2")
+        mock_store = MockStore([mem_u1, mem_u2])
+
+        monkeypatch.setattr(_tools_mod, "_get_mem_store", lambda: mock_store)
+        monkeypatch.setattr(
+            _tools_mod,
+            "_enrich_with_graph",
+            lambda result_mids, out, k, zone_filter=None: {"results": out},
+        )
+        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+
+        result_json = _tools_mod._tool_srh_palace_recall({
+            "topic": "apple",
+            "limit": 5,
+            "zone": "work",
+            "filters": {"user_id": "u1"},
+        })
+        result = json.loads(result_json)
+
+        assert mock_store.search_calls[-1]["filters"] == {"user_id": "u1"}
+        assert [m["id"] for m in result["results"]] == ["mem-u1"]

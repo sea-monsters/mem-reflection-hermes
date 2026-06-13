@@ -23,7 +23,6 @@ Plugins do **not** implement their own auth layer — the host guarantees auth f
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 15 routes (v1.6).
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -41,7 +40,7 @@ Current surface: 15 routes (v1.6).
 | `GET` | `/reflections` | Recent reflection outcomes (optional `mode` filter) |
 | `GET` | `/reflections/audit` | Flattened reflection audit entries (optional `decision` filter) |
 | `GET` | `/stats` | Aggregate statistics (optional `user_id`, `agent_id`, `run_id`) |
-| `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.2) |
+| `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.6 scoped maintenance) |
 
 ## Scope Filters (v1.6)
 

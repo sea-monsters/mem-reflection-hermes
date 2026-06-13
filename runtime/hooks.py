@@ -18,6 +18,7 @@ from .checkpoint import (
     snapshot_session_state as _checkpoint_snapshot_session_state,
 )
 from ..core.config import get_plugin_config_model
+from ..core.scope import normalize_scope_filters, scope_from_context
 from ..core.store import (
     LoadedMemory, MemoryFrontmatter, record_memory_stat,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
@@ -104,8 +105,8 @@ def _get_skill_store():
 def _build_context_block(query=""):
     return _lb("_build_context_block")(query)
 
-def _build_context_bundle(query="", max_tokens=4000, stable_only=False):
-    return _lb("_build_context_bundle")(query, max_tokens=max_tokens, stable_only=stable_only)
+def _build_context_bundle(query="", max_tokens=4000, stable_only=False, filters=None):
+    return _lb("_build_context_bundle")(query, max_tokens=max_tokens, stable_only=stable_only, filters=filters)
 
 def _estimate_tokens(text):
     return _lb("_estimate_tokens")(text)
@@ -125,6 +126,22 @@ def _recent_reflect_outcomes(n=10):
 
 def _micro_reflection_enabled():
     return _lb("_micro_reflection_enabled")()
+
+
+def _scope_filters_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Optional[str]]]:
+    explicit = kwargs.get("scope_filters")
+    if explicit is not None:
+        return normalize_scope_filters(explicit) or None
+    ctx = kwargs.get("ctx") or _plugin_ctx
+    scope_filters = scope_from_context(ctx)
+    if scope_filters:
+        return scope_filters
+    direct = {
+        "user_id": kwargs.get("user_id"),
+        "agent_id": kwargs.get("agent_id"),
+        "run_id": kwargs.get("run_id"),
+    }
+    return normalize_scope_filters({k: v for k, v in direct.items() if v is not None}) or None
 
 _turns_since_reflect: int = 0
 _turns_since_reflect_lock = threading.Lock()  # H21: protect concurrent access
@@ -160,11 +177,11 @@ def _render_context_bundle(bundle: Any) -> Optional[str]:
     return text or None
 
 
-def _build_context_with_timeout(query: str, budget: int) -> Optional[str]:
+def _build_context_with_timeout(query: str, budget: int, filters: Optional[Dict[str, Any]] = None) -> Optional[str]:
     timeout_ms = max(1, _context_timeout_ms())
 
     def _assemble_full():
-        return _build_context_bundle(query, max_tokens=budget, stable_only=False)
+        return _build_context_bundle(query, max_tokens=budget, stable_only=False, filters=filters)
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="srh-context")
     future = executor.submit(_assemble_full)
@@ -183,12 +200,16 @@ def _build_context_with_timeout(query: str, budget: int) -> Optional[str]:
     except Exception as e:
         logger.warning("Context assembly failed before fallback: %s", e)
 
-    # Non-success path: do not wait for a slow or failed worker before
-    # building the stable-only fallback.
+    # Cancel the background worker if possible; if not, let it finish with a
+    # short grace period before the fallback path discards its result.
+    try:
+        future.cancel()
+    except Exception:
+        pass
     executor.shutdown(wait=False)
 
     try:
-        fallback_bundle = _build_context_bundle(query, max_tokens=budget, stable_only=True)
+        fallback_bundle = _build_context_bundle(query, max_tokens=budget, stable_only=True, filters=filters)
         return _render_context_bundle(fallback_bundle)
     except Exception as e:
         logger.warning("Stable-only context fallback failed: %s", e)
@@ -202,6 +223,7 @@ def _on_session_start(**kwargs) -> None:
         _turns_since_reflect = 0
     _reset_current_session_memory_ids()
     ctx = kwargs.get("ctx") or _plugin_ctx
+    scope_filters = _scope_filters_from_kwargs(kwargs)
     checkpoint_cfg = None
     try:
         checkpoint_cfg = get_plugin_config_model().checkpoint
@@ -211,18 +233,18 @@ def _on_session_start(**kwargs) -> None:
         mem_store = _lb("_get_mem_store")()
 
         def _reflection_runner(_session_id: str, entry: Dict[str, Any]) -> None:
-            _run_full_reflection(ctx, entry.get("messages") or [])
+            _run_full_reflection(ctx, entry.get("messages") or [], scope_filters=scope_filters)
 
         def _compaction_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
             from ..reflection.runtime import _compact_episode_zone as _compact
             from .. import _config_compaction as _cc
             if _cc():
-                _compact(mem_store, ctx)
+                _compact(mem_store, ctx, filters=scope_filters)
 
         def _curator_runner(_session_id: str, _entry: Dict[str, Any]) -> None:
             from ..memory.curator import _curator_enabled, _run_curator
             if _curator_enabled(mem_store):
-                _run_curator(ctx, mem_store)
+                _run_curator(ctx, mem_store, filters=scope_filters)
 
         def _diagnostic_logger(entry: Dict[str, Any]) -> None:
             try:
@@ -249,6 +271,7 @@ def _on_session_end(**kwargs) -> None:
     session_id = kwargs.get("session_id", "")
     reason = kwargs.get("reason", "")  # v0.16.0: "shutdown" | "session_expired" | "new_session"
     ctx = kwargs.get("ctx") or _plugin_ctx
+    scope_filters = _scope_filters_from_kwargs(kwargs)
     with _session_messages_lock:
         messages = kwargs.get("messages") or _session_messages.pop(session_id, [])
 
@@ -269,6 +292,8 @@ def _on_session_end(**kwargs) -> None:
             logger.debug("Failed to checkpoint session state for %s", session_id, exc_info=True)
 
     # ── Periodic graph decay ──────────────────────────────
+    # Decay is intentionally run even when there are no messages, so the graph
+    # does not retain stale co-activation weights across idle sessions.
     try:
         gm = _get_graph_mgr()
         if gm is not None:
@@ -276,23 +301,24 @@ def _on_session_end(**kwargs) -> None:
     except Exception as e:
         logger.warning("graph decay skipped: %s", e)
 
-    try:
-        if not messages:
-            return
-        if session_id:
-            try:
-                _checkpoint_mark_pending_stage(session_id, "reflection", {
-                    "reason": reason,
-                    "messages": messages[-80:],
-                    "message_count": len(messages),
-                    "api_error_count": api_errors,
-                    "subagent_count": subagent_count,
-                })
-            except Exception:
-                logger.debug("Failed to mark reflection pending for %s", session_id, exc_info=True)
+    # No substantive content to reflect on
+    if not messages:
+        return
+
+    if session_id:
+        try:
+            _checkpoint_mark_pending_stage(session_id, "reflection", {
+                "reason": reason,
+                "messages": messages[-80:],
+                "message_count": len(messages),
+                "api_error_count": api_errors,
+                "subagent_count": subagent_count,
+            })
+        except Exception:
+            logger.debug("Failed to mark reflection pending for %s", session_id, exc_info=True)
         if ctx is not None:
             try:
-                _run_full_reflection(ctx, messages)
+                _run_full_reflection(ctx, messages, scope_filters=scope_filters)
                 if session_id:
                     _checkpoint_mark_stage_completed(session_id, "reflection", {
                         "message_count": len(messages),
@@ -311,58 +337,58 @@ def _on_session_end(**kwargs) -> None:
                 "mem-reflection-hermes: session ended with %d messages%s — full reflection queued (no ctx)",
                 len(messages), extra_info,
             )
-    finally:
-        # ── Episode compaction (v1.1) ──────────────────────
-        # Run after reflection to compact raw episode entries into summaries.
-        try:
-            from ..reflection.runtime import _compact_episode_zone as _compact
-            from .. import _config_compaction as _cc
-            if _cc():
-                if session_id:
-                    _checkpoint_mark_pending_stage(session_id, "compaction", {
-                        "reason": reason,
-                        "message_count": len(messages),
-                    })
-                result = _compact(_lb("_get_mem_store")(), ctx)
-                if session_id:
-                    _checkpoint_mark_stage_completed(session_id, "compaction", {
-                        "compacted": result.get("compacted", 0),
-                        "total_raw_consumed": result.get("total_raw_consumed", 0),
-                    })
-                if result.get("compacted", 0) > 0:
-                    logger.info(
-                        "Episode compaction: %d clusters compressed "
-                        "(consumed %d raw entries)",
-                        result["compacted"],
-                        result.get("total_raw_consumed", 0),
-                    )
-        except Exception as _ce:
-            logger.debug("Episode compaction skipped: %s", _ce)
 
-        # ── Memory curator (v1.2) — runs after compaction ─────
-        try:
-            from ..memory.curator import _curator_enabled, _run_curator
-            mem_store = _lb("_get_mem_store")()
-            if _curator_enabled(mem_store):
-                if session_id:
-                    _checkpoint_mark_pending_stage(session_id, "curator", {
-                        "reason": reason,
-                        "message_count": len(messages),
-                    })
-                cur_result = _run_curator(ctx, mem_store)
-                if session_id:
-                    _checkpoint_mark_stage_completed(session_id, "curator", {
-                        "archived": cur_result.get("archived", 0),
-                        "superseded": cur_result.get("superseded", 0),
-                        "similar": cur_result.get("similar", 0),
-                    })
-                if cur_result.get("archived", 0) or cur_result.get("superseded", 0) or cur_result.get("similar", 0):
-                    logger.info("Memory curator: %s", cur_result.get("report", "done"))
-        except Exception as _cue:
-            logger.warning("Memory curator failed: %s", _cue)
+    # ── Episode compaction (v1.1) ──────────────────────
+    # Run after reflection to compact raw episode entries into summaries.
+    try:
+        from ..reflection.runtime import _compact_episode_zone as _compact
+        from .. import _config_compaction as _cc
+        if _cc():
+            if session_id:
+                _checkpoint_mark_pending_stage(session_id, "compaction", {
+                    "reason": reason,
+                    "message_count": len(messages),
+                })
+            result = _compact(_lb("_get_mem_store")(), ctx, filters=scope_filters)
+            if session_id:
+                _checkpoint_mark_stage_completed(session_id, "compaction", {
+                    "compacted": result.get("compacted", 0),
+                    "total_raw_consumed": result.get("total_raw_consumed", 0),
+                })
+            if result.get("compacted", 0) > 0:
+                logger.info(
+                    "Episode compaction: %d clusters compressed "
+                    "(consumed %d raw entries)",
+                    result["compacted"],
+                    result.get("total_raw_consumed", 0),
+                )
+    except Exception as _ce:
+        logger.debug("Episode compaction skipped: %s", _ce)
 
-        _reset_current_session_memory_ids()
-        _cleanup_session_state(session_id)
+    # ── Memory curator (v1.2) — runs after compaction ─────
+    try:
+        from ..memory.curator import _curator_enabled, _run_curator
+        mem_store = _lb("_get_mem_store")()
+        if _curator_enabled(mem_store):
+            if session_id:
+                _checkpoint_mark_pending_stage(session_id, "curator", {
+                    "reason": reason,
+                    "message_count": len(messages),
+                })
+            cur_result = _run_curator(ctx, mem_store, filters=scope_filters)
+            if session_id:
+                _checkpoint_mark_stage_completed(session_id, "curator", {
+                    "archived": cur_result.get("archived", 0),
+                    "superseded": cur_result.get("superseded", 0),
+                    "similar": cur_result.get("similar", 0),
+                })
+            if cur_result.get("archived", 0) or cur_result.get("superseded", 0) or cur_result.get("similar", 0):
+                logger.info("Memory curator: %s", cur_result.get("report", "done"))
+    except Exception as _cue:
+        logger.warning("Memory curator failed: %s", _cue)
+
+    _reset_current_session_memory_ids()
+    _cleanup_session_state(session_id)
 
 
 def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
@@ -377,6 +403,7 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
         with _session_messages_lock:
             _session_messages[session_id] = list(messages)[-80:]
     ctx = kwargs.get("ctx") or _plugin_ctx
+    scope_filters = _scope_filters_from_kwargs(kwargs)
 
     # Extract latest user query and assistant response for micro-reflection
     # Skip assistant messages that contain tool_calls (these are tool invocations)
@@ -415,7 +442,7 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
                 logger.debug("Micro-reflection skipped: ctx unavailable in llm mode")
             else:
                 try:
-                    _run_micro_reflection(ctx, user_msg, assistant_msg)
+                    _run_micro_reflection(ctx, user_msg, assistant_msg, scope_filters=scope_filters)
                     reflection_ran = True
                 except Exception as e:
                     logger.debug("Micro-reflection failed: %s", e)
@@ -432,7 +459,7 @@ def _pre_llm_call(**kwargs) -> Optional[Dict[str, str]]:
                 break
             query = ""
     budget = _context_token_budget()
-    context = _build_context_with_timeout(query, budget)
+    context = _build_context_with_timeout(query, budget, filters=scope_filters)
 
     # Token budget enforcement (beta3: truncate or skip if context too large)
     if context:

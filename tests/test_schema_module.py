@@ -1,10 +1,9 @@
 """Tests for runtime/schemas.py tool schema extraction.
 
-These tests are written before implementation (RED phase) and verify the
-design intent:
-- All 12 tool schemas live in runtime/schemas.py.
+These tests verify the current tool schema contract:
+- All 13 tool schemas live in runtime/schemas.py.
 - The package root re-exports them so existing imports and _lb lookups work.
-- register() still registers all 12 tools using the relocated schemas.
+- register() still registers all 13 tools using the relocated schemas.
 - __init__.py is under 300 lines.
 """
 from __future__ import annotations
@@ -22,8 +21,8 @@ _REPO = Path(__file__).resolve().parent.parent
 class TestSchemaDefinitions:
     """Schemas are defined in runtime/schemas.py."""
 
-    def test_all_twelve_schemas_defined(self):
-        """runtime/schemas.py contains all 12 _SRH_*_SCHEMA dicts."""
+    def test_all_thirteen_schemas_defined(self):
+        """runtime/schemas.py contains all 13 _SRH_*_SCHEMA dicts."""
         from mem_reflection_hermes.runtime import schemas
 
         expected = [
@@ -75,6 +74,13 @@ class TestSchemaDefinitions:
         props = schemas._SRH_MEMORY_SEARCH_SCHEMA.get("properties", {})
         assert "explain" in props
 
+    def test_reflect_now_schema_exposes_filters(self):
+        """Reflect-now schema includes optional scope filters."""
+        from mem_reflection_hermes.runtime import schemas
+
+        props = schemas._SRH_REFLECT_NOW_SCHEMA.get("properties", {})
+        assert "filters" in props
+
     def test_compile_profile_schema_matches_supported_modes(self):
         """Compile-profile schema advertises the handler's supported modes."""
         from mem_reflection_hermes.runtime import schemas
@@ -95,6 +101,27 @@ class TestSchemaDefinitions:
         # should reject empty object
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate({}, schema)
+
+    def test_scope_filter_schemas_reject_unknown_keys(self):
+        """Tool schemas reject typoed scope filters before runtime dispatch."""
+        import jsonschema
+        from mem_reflection_hermes.runtime import schemas
+
+        jsonschema.validate({"query": "x", "filters": {"user_id": "u1"}}, schemas._SRH_MEMORY_SEARCH_SCHEMA)
+        jsonschema.validate({"filters": {"run_id": None}}, schemas._SRH_MEMORY_DELETE_SCHEMA)
+        jsonschema.validate({"topic": "x", "filters": {"agent_id": "a1"}}, schemas._SRH_PALACE_NAVIGATE_SCHEMA)
+        jsonschema.validate({"mode": "profile", "filters": {"user_id": "u1"}}, schemas._SRH_COMPILE_PROFILE_SCHEMA)
+        jsonschema.validate({"messages": [], "filters": {"user_id": "u1"}}, schemas._SRH_REFLECT_NOW_SCHEMA)
+
+        for schema, payload in [
+            (schemas._SRH_MEMORY_SEARCH_SCHEMA, {"query": "x", "filters": {"bad": "v"}}),
+            (schemas._SRH_MEMORY_DELETE_SCHEMA, {"filters": {"bad": "v"}}),
+            (schemas._SRH_PALACE_NAVIGATE_SCHEMA, {"topic": "x", "filters": {"bad": "v"}}),
+            (schemas._SRH_COMPILE_PROFILE_SCHEMA, {"mode": "profile", "filters": {"bad": "v"}}),
+            (schemas._SRH_REFLECT_NOW_SCHEMA, {"messages": [], "filters": {"bad": "v"}}),
+        ]:
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate(payload, schema)
 
     def test_graph_retrieve_schema_tier_enum_matches_handler(self):
         """_SRH_GRAPH_RETRIEVE_SCHEMA tier enum matches GraphManagerCompat.retrieve_related."""
@@ -165,10 +192,10 @@ class TestLateBinding:
 
 
 class TestRegisterBehavior:
-    """register() registers all 12 tools using relocated schemas."""
+    """register() registers all 13 tools using relocated schemas."""
 
-    def test_register_twelve_tools(self):
-        """register(ctx) calls ctx.register_tool exactly 12 times."""
+    def test_register_thirteen_tools(self):
+        """register(ctx) calls ctx.register_tool exactly 13 times."""
         import mem_reflection_hermes as pkg
 
         ctx = MagicMock()

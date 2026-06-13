@@ -37,7 +37,7 @@
 │    ├── Graph decay                                    │
 │    ├── Generate skill candidates                      │
 │    ├── Write session summary + episode compaction     │
-│    ├── Memory curator (v1.2) — stale/similar/archive  │
+│    ├── Memory curator (v1.7) — scoped maintenance, scope-aware reflection │
 │    └── Session checkpoint (v1.4) — pending recovery   │
 ├──────────────────────────────────────────────────────┤
 │  Background Tasks                                     │
@@ -53,7 +53,7 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.6)
+## Module Layout (v1.7)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
@@ -63,12 +63,12 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 | `core/config.py` | canonical | Typed config models, diagnostics, validation | store |
 | `core/backend.py` | canonical | Backend capability abstraction (SearchBackendLike) | — |
 | `reflection/engine.py` | canonical | ReflectionEngine, raw_chunk default, fact extraction | store |
-| `reflection/runtime.py` | canonical | _run_full_reflection, _run_micro_reflection, audit logging, compaction | store, search, reflection/engine |
-| `memory/curator/` | canonical (v1.5) | Composable action pipeline: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport | store, memory/bridge |
+| `reflection/runtime.py` | canonical | _run_full_reflection, _run_micro_reflection, scope-aware reflection writes, audit logging, compaction | store, search, reflection/engine |
+| `memory/curator/` | canonical (v1.7) | Composable action pipeline with scoped-by-default maintenance: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport; `admin_global` is explicit opt-in for full-store runs | store, memory/bridge |
 | `memory/bridge.py` | canonical | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
 | `memory/context.py` | canonical | Context assembly: stable/dynamic split, token budget, skill matching, graded compression | store, search |
 | `runtime/tools.py` | canonical | 8 base SRH tool handlers (write, search, delete, history, palace, reflect, skill, compile) | store, search, reflection |
-| `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands | store, reflection, search, memory |
+| `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands; scope propagation into reflection/context/compaction | store, reflection, search, memory |
 | `runtime/graph.py` | canonical | 5 graph/health tools + graph manager singleton | core/graph, store |
 | `runtime/checkpoint.py` | canonical | Atomic session checkpoint, pending-stage recovery, corrupt backup | store |
 | `runtime/registration.py` | canonical | Plugin registration entrypoint: wires hooks, commands, tools, post-delete callbacks | hooks, schemas, tools, graph |
@@ -78,7 +78,7 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
 **Tool split**: 8 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py`. All 13 tools are declared in `plugin.yaml` and registered through the package `register(ctx)` path, which delegates to `runtime/registration.py` using schemas from `runtime/schemas.py`.
 
-### Import Order Rules (v1.5)
+### Import Order Rules (v1.7)
 
 When adding new functionality, respect the module boundaries:
 
@@ -96,7 +96,7 @@ When adding new functionality, respect the module boundaries:
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety (v1.5)
+### Thread Safety (v1.7)
 
 Key concurrency protections present in v1.5:
 
@@ -128,13 +128,18 @@ Registered in `runtime_hooks.py` via `register_commands(ctx)`:
 
 ## Context Layering
 
-The `pre_llm_call` hook injects context in this priority order:
+The `pre_llm_call` hook injects context in two sections. The **stable**
+section is preserved across turns to keep prompt caches warm; the
+**dynamic** section varies per turn and is compressed under token pressure.
 
 ```
+Stable section:
 1. Pinned memories (always included)
-2. Active index (zone-based relevance)
-3. Triggered skills (per-turn matching)
-4. Always-active skills (user-configured)
+2. Always-active skills (user-configured)
+
+Dynamic section:
+3. Active index (zone-based relevance)
+4. Triggered skills (per-turn matching)
 ```
 
 Each layer respects the `max_context_token_preference` budget. Token estimation

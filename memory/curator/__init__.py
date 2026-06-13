@@ -1,7 +1,7 @@
 """Curator package — composable action pipeline for memory lifecycle.
 
 Public API:
-- _run_curator(ctx, mem_store) -> dict: run the full pipeline
+- _run_curator(ctx, mem_store, filters=None, admin_global=False) -> dict: run the full pipeline
 - Action classes: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges
 - Helpers: is_protected, build_cold_entry, archive_and_delete, load_last_access
 - Cold store: _cold_store_path, _load_cold_store, _append_to_cold_store, _restore_from_cold
@@ -15,6 +15,21 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+
+try:
+    from ...core.scope import normalize_scope_filters, scope_from_context
+except ImportError:
+    try:
+        from core.scope import normalize_scope_filters, scope_from_context
+    except ImportError:
+        def normalize_scope_filters(filters):  # type: ignore[no-redef]
+            return filters
+        def scope_from_context(ctx=None, filters=None):  # type: ignore[no-redef]
+            if filters is not None:
+                return filters
+            if ctx is None:
+                return None
+            return getattr(ctx, "scope_filters", None)
 
 from .actions import (
     ArchiveStale,
@@ -101,13 +116,27 @@ _ACTION_CLASSES = [
 ]
 
 
-def _run_curator(ctx, mem_store) -> Dict[str, Any]:
+def _ctx_scope_filters(ctx) -> Optional[Dict[str, Optional[str]]]:
+    return scope_from_context(ctx)
+
+
+def _run_curator(
+    ctx,
+    mem_store,
+    filters: Optional[Dict[str, Optional[str]]] = None,
+    admin_global: bool = False,
+) -> Dict[str, Any]:
     """Run the full curator pipeline. Called from on_session_end.
 
     Fail-open: all curation failures are caught and logged.
     """
+    filters = normalize_scope_filters(filters) if filters is not None else _ctx_scope_filters(ctx)
+    scope_label = "global_admin" if admin_global else ("scoped" if filters else "local_global")
     result: Dict[str, Any] = {
         "curator": True,
+        "scope": scope_label,
+        "filters": filters or {},
+        "admin_global": admin_global,
         "stale": 0,
         "archived": 0,
         "superseded": 0,
@@ -119,7 +148,7 @@ def _run_curator(ctx, mem_store) -> Dict[str, Any]:
         "errors": [],
     }
 
-    pipeline_ctx = CuratorContext(mem_store=mem_store)
+    pipeline_ctx = CuratorContext(mem_store=mem_store, filters=filters, admin_global=admin_global)
     action_results: List[CuratorResult] = []
 
     for action_cls in _ACTION_CLASSES:

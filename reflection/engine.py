@@ -25,6 +25,7 @@ try:
         _tokenise,
     )
     from ..core.search import _embed_single, _cosine_sim, _extract_keywords, _bm25_search_scored
+    from .extraction import extract_refined_memory_candidates
     from .runtime import _memory_tokens as estimate_tokens
 except ImportError:
     import sys
@@ -54,6 +55,11 @@ except ImportError:
     _cosine_sim = _search_mod._cosine_sim
     _extract_keywords = _search_mod._extract_keywords
     _bm25_search_scored = _search_mod._bm25_search_scored
+    _extraction_spec = importlib.util.spec_from_file_location("_extraction", str(_repo / "reflection" / "extraction.py"))
+    _extraction_mod = importlib.util.module_from_spec(_extraction_spec)
+    sys.modules["_extraction"] = _extraction_mod
+    _extraction_spec.loader.exec_module(_extraction_mod)
+    extract_refined_memory_candidates = _extraction_mod.extract_refined_memory_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -123,54 +129,8 @@ def _is_correction(text: str) -> bool:
 
 
 def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str, Any]]:
-    """Extract potential facts using heuristics."""
-    facts = []
-    combined = f"{user_msg} {assistant_msg}"
-
-    # Explicit memory intent
-    if _is_explicit_memory_intent(user_msg):
-        for s in re.split(r"[。！？.!?\n]+", user_msg):
-            if _is_explicit_memory_intent(s):
-                s = s.strip()
-                if len(s) > 10 and _is_memorable_content(s):
-                    facts.append({
-                        "text": s, "confidence": "high",
-                        "rationale": "User explicitly requested to remember",
-                        "source": "explicit_intent",
-                    })
-
-    # Corrections
-    if _is_correction(user_msg):
-        for s in re.split(r"[。！？.!?\n]+", user_msg):
-            if _is_correction(s) and len(s) > 10 and _is_memorable_content(s):
-                facts.append({
-                    "text": s.strip(), "confidence": "medium",
-                    "rationale": "User corrected a previous statement",
-                    "source": "correction",
-                })
-
-    # Preferences
-    _NOT_END = r"[^\n。！？.!?]"
-    prefs = [
-        (rf"(?:我|i)\s*(?:喜欢|prefer|like|want|想|要)\s*({_NOT_END}{{5,80}})", "preference"),
-        (rf"(?:用|use)\s*({_NOT_END}{{3,40}})\s*(?:因为|because)", "preference"),
-    ]
-    for pat, src in prefs:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            t = m.group(0).strip()
-            if len(t) > 10 and _is_memorable_content(t):
-                facts.append({"text": t, "confidence": "medium", "rationale": "Preference", "source": src})
-
-    # Deduplicate + filter noise
-    deduped = []
-    seen = []
-    for f in facts:
-        if _is_noise_text(f["text"]):
-            continue
-        if all(len(set(_tokenise(f["text"])) & set(_tokenise(s))) / max(len(_tokenise(f["text"])), len(_tokenise(s)), 1) < 0.8 for s in seen):
-            seen.append(f["text"])
-            deduped.append(f)
-    return deduped
+    """Extract refined fact candidates using the shared refinement helper."""
+    return extract_refined_memory_candidates(user_msg, assistant_msg)
 
 
 def _is_noise_text(text: str) -> bool:
@@ -550,17 +510,26 @@ def _reset_current_session_memory_ids() -> None:
     return _delegate_runtime_reflection("_reset_current_session_memory_ids")()
 
 
-def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return _delegate_runtime_reflection("_run_full_reflection")(ctx, messages)
+def _run_full_reflection(ctx, messages: List[Dict[str, Any]], scope_filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_full_reflection")(ctx, messages, scope_filters=scope_filters)
 
 
-def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    return _delegate_runtime_reflection("_run_micro_reflection")(ctx, user_msg, assistant_msg)
+def _run_micro_reflection(
+    ctx,
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_micro_reflection")(ctx, user_msg, assistant_msg, scope_filters=scope_filters)
 
 
-def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return _delegate_runtime_reflection("_run_embedding_reflection")(messages)
+def _run_embedding_reflection(messages: List[Dict[str, Any]], scope_filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_embedding_reflection")(messages, scope_filters=scope_filters)
 
 
-def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    return _delegate_runtime_reflection("_run_embedding_micro_reflection")(user_msg, assistant_msg)
+def _run_embedding_micro_reflection(
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_embedding_micro_reflection")(user_msg, assistant_msg, scope_filters=scope_filters)

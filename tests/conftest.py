@@ -17,10 +17,11 @@ def pytest_configure(config):
 
     On Windows, the default pytest temp directory (pytest-of-<user>) can accumulate
     stale ACLs from other processes, causing PermissionError during test setup.
-    Using a plugin-specific basetemp avoids this entirely and works on all platforms.
+    Using a per-run plugin-specific basetemp avoids this entirely and works on all platforms.
     """
     if config.option.basetemp is None:
-        config.option.basetemp = str(Path(tempfile.gettempdir()) / "hermes_pytest")
+        unique = f"hermes_pytest_{os.getpid()}_{time.time_ns()}"
+        config.option.basetemp = str(Path(tempfile.gettempdir()) / unique)
 
 
 _FILE_MARKERS = {
@@ -206,10 +207,7 @@ def temp_store(temp_dir):
     store = MemoryStore(user_root=memories_root, db_path=db_path)
     yield store
     try:
-        conn = getattr(store._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            store._local.conn = None
+        store.close()
     except Exception:
         pass
 

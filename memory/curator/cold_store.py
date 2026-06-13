@@ -71,6 +71,10 @@ def _cold_store_path(mem_store) -> Path:
         p = Path(mem_store._cold_store_path_override)
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
+    if hasattr(mem_store, "_test_data_dir"):
+        p = Path(mem_store._test_data_dir) / "memory" / _COLD_STORE_FILENAME
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
     base = _resolve_plugin_data_dir()
     if base is None:
         base = Path.home() / ".hermes" / "memory"

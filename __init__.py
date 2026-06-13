@@ -1,8 +1,8 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.5 Architecture (organized by functionality):
+v1.7 Architecture (organized by functionality):
 - core/: SQLite storage, search engine, graph index
-- reflection/: Reflection engine and runtime
+- reflection/: Reflection engine and runtime, including scope-aware reflection and compaction
 - memory/: Curation, bridge, context assembly
 - runtime/: Tools, schemas, hooks, registration, state
 - web/: FastAPI dashboard endpoints

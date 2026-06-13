@@ -156,8 +156,8 @@ class MockStore:
         self._cold_store: list[dict[str, Any]] = []
         self._plugin_config_override: dict[str, Any] = {}
 
-    def list_active(self) -> list[MockMemory]:
-        return list(self.memories.values())
+    def list_active(self, filters=None) -> list[MockMemory]:
+        return self.list(active_only=True, filters=filters)
 
     def get(self, mid: str):
         return self.memories.get(mid)

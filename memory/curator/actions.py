@@ -54,7 +54,15 @@ except ImportError:
         @dataclass
         class CuratorContext:  # type: ignore[no-redef]
             mem_store: Any
+            filters: Optional[Dict[str, Optional[str]]] = None
+            admin_global: bool = False
+            scope_label: str = "local_global"
             errors: List[str] = field(default_factory=list)
+
+            def list_active(self):
+                if self.admin_global or not self.filters:
+                    return self.mem_store.list_active()
+                return self.mem_store.list_active(filters=self.filters)
 
         @dataclass
         class CuratorResult:  # type: ignore[no-redef]
@@ -121,7 +129,7 @@ class ArchiveStale(CuratorAction):
         result = CuratorResult(action_name=self.name)
 
         try:
-            all_active = mem_store.list_active()
+            all_active = ctx.list_active()
         except Exception as e:
             result.errors.append(f"list_active: {e}")
             logger.warning("Curator ArchiveStale failed to list active memories: %s", e)
@@ -193,7 +201,7 @@ class CompactChains(CuratorAction):
 
         chain_heads: List[str] = []
         try:
-            for mem in mem_store.list_active():
+            for mem in ctx.list_active():
                 if not mem.frontmatter.supersedes:
                     continue
                 if not getattr(mem_store, "is_superseded", lambda _: False)(mem.id()):
@@ -286,9 +294,12 @@ class ArchiveSuperseded(CuratorAction):
 
         try:
             if hasattr(mem_store, "list"):
-                all_items = mem_store.list(active_only=False)
+                all_items = mem_store.list(
+                    active_only=False,
+                    filters=None if getattr(ctx, "admin_global", False) else getattr(ctx, "filters", None),
+                )
             else:
-                all_items = mem_store.list_active()
+                all_items = ctx.list_active()
         except Exception as e:
             result.errors.append(f"list: {e}")
             logger.warning("Curator ArchiveSuperseded failed to list memories: %s", e)
@@ -381,14 +392,14 @@ class MergeSimilar(CuratorAction):
 
         return _fallback
 
-    def _scan_for_similar(self, mem_store) -> List[Tuple[str, str, float]]:
+    def _scan_for_similar(self, mem_store, ctx: Optional[CuratorContext] = None) -> List[Tuple[str, str, float]]:
         cfg = _curator_config(mem_store)
         bm25_threshold = cfg.get("similarity", {}).get("bm25_threshold", 0.6)
         if not cfg.get("similarity", {}).get("enabled", True):
             return []
 
         try:
-            all_active = mem_store.list_active()
+            all_active = ctx.list_active() if ctx is not None else mem_store.list_active()
         except Exception:
             logger.warning("MergeSimilar: list_active failed", exc_info=True)
             return []
@@ -463,7 +474,7 @@ class MergeSimilar(CuratorAction):
         merge_threshold = cfg.get("similarity", {}).get("merge_threshold", 0.7)
         result = CuratorResult(action_name=self.name)
 
-        candidates = self._scan_for_similar(mem_store)
+        candidates = self._scan_for_similar(mem_store, ctx)
         result.similar_pairs = len(candidates)
 
         is_superseded = getattr(mem_store, "is_superseded", lambda _: False)
@@ -541,7 +552,7 @@ def get_graph_manager_compat():
     try:
         return graph_mod.get_graph_manager_compat()
     except Exception as e:
-        logger.debug("get_graph_manager_compat failed: %s", e)
+        logger.warning("get_graph_manager_compat failed: %s", e, exc_info=True)
         return None
 
 
@@ -554,6 +565,12 @@ class CleanOrphanEdges(CuratorAction):
         mem_store = ctx.mem_store
         result = CuratorResult(action_name=self.name)
 
+        if getattr(ctx, "filters", None) and not getattr(ctx, "admin_global", False):
+            msg = "Orphan edge cleanup skipped: scoped run without admin_global"
+            result.errors.append(msg)
+            logger.warning("CleanOrphanEdges %s", msg)
+            return result
+
         try:
             gm = get_graph_manager_compat()
         except Exception as e:
@@ -564,7 +581,7 @@ class CleanOrphanEdges(CuratorAction):
             return result
 
         try:
-            all_ids = {m.id() for m in mem_store.list_active()}
+            all_ids = {m.id() for m in ctx.list_active()}
             result.orphan_edges = gm.store.clean_orphan_edges(all_ids)
         except Exception as e:
             result.errors.append(f"clean_orphan_edges: {e}")
