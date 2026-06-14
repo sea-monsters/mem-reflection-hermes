@@ -57,6 +57,7 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
+| `core/scope.py` | canonical (v1.7) | ScopeIntent enum, `scope_from_context()`, `global_only_scope()`, `normalize_scope_filters()`, `build_scope_clauses()` — shared scope helpers for user_id/agent_id/run_id resolution | store |
 | `core/store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers, memory_events ledger | — |
 | `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain, scope-filtered recall | store |
 | `core/graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
@@ -83,13 +84,14 @@ see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 When adding new functionality, respect the module boundaries:
 
 1. **`core/store.py`**: Data models, store logic, config, paths — no Hermes dependencies
-2. **`core/search.py`**: Search and embedding helpers — imports `core/store` only
-3. **`core/graph.py`**: GraphIndex — imports `core/store` only where cross-zone analysis needs memory metadata
-4. **`core/config.py`** / **`core/backend.py`**: Typed config and backend abstraction — imports `core/store`
-5. **`reflection/engine.py`** / **`reflection/runtime.py`**: Reflection pipelines — import `core/store` + `core/search`
+2. **`core/scope.py`**: Shared scope helper; resolves `user_id` / `agent_id` / `run_id` from host context — imports `core/store` (TYPE_CHECKING) only
+3. **`core/search.py`**: Search and embedding helpers — imports `core/store` + `core/tokenization` + `core/models` + `core/scope`
+4. **`core/graph.py`**: GraphIndex — imports `core/store` only where cross-zone analysis needs memory metadata
+5. **`core/config.py`** / **`core/backend.py`**: Typed config and backend abstraction — imports `core/store`
+5. **`reflection/extraction.py`** / **`reflection/supersedes_resolver.py`** / **`reflection/engine.py`** / **`reflection/runtime.py`**: Reflection pipelines — import `core/store` + `core/search`
 6. **`memory/curator/`**: Composable action pipeline — imports `core/store` + `memory/bridge`; `memory/bridge.py` imports `core/store` only
 7. **`memory/context.py`**: Context assembly — imports `core/store` + `core/search` + `core/config`
-8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features
+8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features — depend on canonical services
 9. **`runtime/registration.py`**, **`runtime/schemas.py`**, **`runtime/state.py`**, **`runtime/helpers.py`**, **`runtime/_lb.py`**: Registration, schemas, singletons, late-binding
 10. **`web/api.py`**: Dashboard — imports package runtime services via `sys.modules` fallback
 11. **`__init__.py`**: Exports public API, backward-compat aliases, delegates `register()` to `runtime/registration`

@@ -468,3 +468,97 @@ class TestScopedMigration:
         assert "m-cache-u1" in unfiltered
         assert "m-cache-null" in null_scoped
         assert "m-cache-u1" not in null_scoped
+
+
+# ---------------------------------------------------------------------------
+# 8. Explicit scope intent (round-3 P2-3): ScopeIntent / global_only_scope.
+# Verifies the None/{}/{field:None} ambiguity flagged in the round-2 audit is
+# resolved without breaking the existing de-facto "no filter" semantics.
+# ---------------------------------------------------------------------------
+
+# Load scope module directly so we can exercise the helpers standalone.
+_spec_scope = importlib.util.spec_from_file_location("_scope_mod", str(_REPO / "core" / "scope.py"))
+_scope_mod = importlib.util.module_from_spec(_spec_scope)
+sys.modules["_scope_mod"] = _scope_mod
+_spec_scope.loader.exec_module(_scope_mod)
+
+ScopeIntent = _scope_mod.ScopeIntent
+global_only_scope = _scope_mod.global_only_scope
+build_scope_clauses = _scope_mod.build_scope_clauses
+normalize_scope_filters = _scope_mod.normalize_scope_filters
+scope_cache_key = _scope_mod.scope_cache_key
+scope_from_context = _scope_mod.scope_from_context
+memory_matches_scope = _scope_mod.memory_matches_scope
+
+
+class TestScopeIntent:
+    """Round-3 P2-3: explicit GLOBAL_ONLY intent vs UNSCOPED vs TENANT."""
+
+    def test_scope_intent_enum_values(self):
+        assert ScopeIntent.UNSCOPED.value == "unscoped"
+        assert ScopeIntent.TENANT.value == "tenant"
+        assert ScopeIntent.GLOBAL_ONLY.value == "global_only"
+
+    def test_global_only_scope_carries_marker(self):
+        g = global_only_scope()
+        assert g  # truthy so the store's `if filters:` gate lets it through
+        assert g["_scope_intent"] == ScopeIntent.GLOBAL_ONLY.value
+
+    def test_build_scope_clauses_global_only_emits_is_null_for_all_columns(self):
+        clauses, params = build_scope_clauses(global_only_scope())
+        assert params == []
+        # All three scope columns must be constrained to NULL.
+        assert sorted(clauses) == sorted([
+            "user_id IS NULL", "agent_id IS NULL", "run_id IS NULL",
+        ])
+
+    def test_build_scope_clauses_empty_dict_still_unscoped(self):
+        """Regression guard: ``{}`` must keep its existing no-filter behaviour
+        (the audit explicitly chose not to overload it as global-only)."""
+        clauses, params = build_scope_clauses({})
+        assert clauses == []
+        assert params == []
+
+    def test_build_scope_clauses_tenant_emits_equality(self):
+        clauses, params = build_scope_clauses({"user_id": "u1"})
+        assert clauses == ["user_id = ?"]
+        assert params == ["u1"]
+
+    def test_normalize_scope_filters_preserves_global_only_marker(self):
+        normalized = normalize_scope_filters(global_only_scope())
+        assert normalized is not None
+        assert normalized["_scope_intent"] == ScopeIntent.GLOBAL_ONLY.value
+
+    def test_scope_cache_key_distinguishes_global_only_from_unscoped(self):
+        unscoped_key = scope_cache_key(None)
+        global_key = scope_cache_key(global_only_scope())
+        assert global_key != unscoped_key
+        # The global-only key must encode the intent.
+        assert any(("_scope_intent", "VALUE", ScopeIntent.GLOBAL_ONLY.value) == part for part in global_key)
+
+    def test_memory_matches_scope_global_only_rejects_tenant_rows(self):
+        tenant_mem = _fm_with_scope("m-g1", "body", user_id="u1")
+        global_mem = make_memory_with_id("m-g2", "body")
+        g = global_only_scope()
+        assert memory_matches_scope(global_mem, g) is True
+        assert memory_matches_scope(tenant_mem, g) is False
+
+    def test_scope_from_context_preserves_global_only(self):
+        class _Ctx:
+            scope_filters = global_only_scope()
+        out = scope_from_context(_Ctx())
+        assert out is not None
+        assert out.get("_scope_intent") == ScopeIntent.GLOBAL_ONLY.value
+
+    def test_list_with_global_only_returns_only_null_scope_rows(self, temp_store):
+        """End-to-end: the store list path must honour GLOBAL_ONLY and return
+        only rows whose scope columns are NULL."""
+        fm_global = make_memory_with_id("m-go-global", "shared body")
+        fm_tenant = _fm_with_scope("m-go-tenant", "tenant body", user_id="u1")
+        temp_store.put("user", fm_global.frontmatter, fm_global.body)
+        temp_store.put("user", fm_tenant, "tenant body")
+
+        results = temp_store.list(filters=global_only_scope())
+        ids = {m.id() for m in results}
+        assert "m-go-global" in ids
+        assert "m-go-tenant" not in ids

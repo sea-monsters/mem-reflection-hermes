@@ -184,3 +184,32 @@ class TestPalaceRecallZoneFilter:
 
         assert mock_store.search_calls[-1]["filters"] == {"user_id": "u1"}
         assert [m["id"] for m in result["results"]] == ["mem-u1"]
+
+    def test_scoped_recall_emits_stable_graph_expanded_key(self, monkeypatch):
+        """Round-3 review (A5 follow-up): when scope filters are active, graph
+        expansion is intentionally skipped, but the response must still carry
+        a ``graph_expanded: []`` key so the schema is stable across the
+        filtered / unfiltered paths."""
+        mem_u1 = make_memory_with_id("mem-u1", "apple scoped", zone="work")
+        object.__setattr__(mem_u1.frontmatter, "user_id", "u1")
+        mock_store = MockStore([mem_u1])
+
+        monkeypatch.setattr(_tools_mod, "_get_mem_store", lambda: mock_store)
+        # If the scoped branch wrongly calls _enrich_with_graph, this would raise.
+        monkeypatch.setattr(
+            _tools_mod,
+            "_enrich_with_graph",
+            lambda *a, **k: pytest.fail("_enrich_with_graph must not run with active filters"),
+        )
+        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+
+        result = json.loads(_tools_mod._tool_srh_palace_recall({
+            "topic": "apple",
+            "limit": 5,
+            "zone": "work",
+            "filters": {"user_id": "u1"},
+        }))
+
+        assert "graph_expanded" in result, "scoped response must keep a stable schema"
+        assert result["graph_expanded"] == []
+        assert [m["id"] for m in result["results"]] == ["mem-u1"]

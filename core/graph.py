@@ -248,6 +248,41 @@ class GraphIndex:
             conn.commit()
         return True
 
+    def invalidate_facts_for_memories(
+        self,
+        memory_ids: List[str],
+        invalidated_by: str,
+        valid_until: Optional[str] = None,
+    ) -> int:
+        """Invalidate every active typed fact owned by the given memories.
+
+        A fact is "owned" by a memory when it is the ``source_memory_id`` (the
+        memory that produced the fact). Facts that merely reference the memory
+        as ``target_memory_id`` (e.g. membership/mention edges from another
+        source) are left intact so the relation graph is not silently pruned.
+
+        This is the batch counterpart to :meth:`invalidate_typed_fact` and is
+        what the reflection/compaction supersede paths call when a new memory
+        replaces one or more older ones. Returns the number of rows updated.
+        """
+        memory_ids = [mid for mid in (memory_ids or []) if mid]
+        if not memory_ids:
+            return 0
+        now = valid_until or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            placeholders = ",".join("?" * len(memory_ids))
+            cursor = conn.execute(
+                f"""UPDATE typed_facts
+                    SET invalidated_by = ?, valid_until = ?
+                    WHERE source_memory_id IN ({placeholders})
+                      AND invalidated_by IS NULL""",
+                [invalidated_by, now, *memory_ids],
+            )
+            updated = cursor.rowcount or 0
+            conn.commit()
+        return updated
+
     def typed_facts(
         self,
         *,

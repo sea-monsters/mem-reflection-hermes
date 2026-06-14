@@ -188,3 +188,87 @@ def test_record_entity_mentions_extracts_and_persists_entities(temp_graph_index)
     assert any(row["kind"] == "entity" for row in rows)
     assert any(row["subject"] == "mem-entity-1" for row in rows)
     assert any(row["episode_id"] == "episode-entity-1" for row in rows)
+
+
+def test_invalidate_facts_for_memories_bulks_invalidates_owned_facts(temp_graph_index):
+    """P1-1 regression: batch invalidation must mark every fact owned by the
+    superseded memories, while leaving facts that only reference them as a
+    target intact (those belong to a different source relationship)."""
+    gi = temp_graph_index
+
+    # Two facts owned by mem-old, plus one membership edge that points AT mem-old
+    # from another source (must survive invalidation of mem-old).
+    gi.record_typed_fact(
+        "mem-old", "User prefers dark mode", relation="describes",
+        kind="preference", target_memory_id="mem-old", episode_id="ep1",
+        source="reflection",
+    )
+    gi.record_typed_fact(
+        "mem-old", "User dislikes light themes", relation="describes",
+        kind="preference", target_memory_id="mem-old", episode_id="ep1",
+        source="reflection",
+    )
+    # A third fact owned by mem-other that only references mem-old as target.
+    gi.record_typed_fact(
+        "mem-other", "cluster includes mem-old", relation="member_of",
+        kind="membership", target_memory_id="mem-old", episode_id="ep2",
+        source="distill",
+    )
+
+    updated = gi.invalidate_facts_for_memories(["mem-old"], invalidated_by="mem-new")
+    assert updated == 2
+
+    owned = gi.typed_facts(source_memory_id="mem-old")
+    assert len(owned) == 2
+    assert all(row["invalidated_by"] == "mem-new" for row in owned)
+    assert all(row["valid_until"] is not None for row in owned)
+    # Active-query must no longer surface the superseded facts.
+    assert gi.typed_facts(source_memory_id="mem-old", include_invalidated=False) == []
+    # The membership edge pointing at mem-old from mem-other survives.
+    referencing = gi.typed_facts(target_memory_id="mem-old", relation="member_of")
+    assert len(referencing) == 1
+    assert referencing[0]["invalidated_by"] is None
+
+
+def test_compaction_invalidates_superseded_episode_facts(temp_mem_store, temp_graph_index):
+    """P1-1 end-to-end: compaction must invalidate the typed facts owned by the
+    raw episodes it folds into a summary. This was the gap the round-2/3 audit
+    identified — invalidate_typed_fact existed but no production path called it."""
+    gi = temp_graph_index
+    store = temp_mem_store
+    # Wire the graph into the store so the sidecar writer can reach it.
+    store._graph = gi
+
+    # Seed raw episode memories, each with a typed fact sidecar.
+    old_ids = []
+    for i in range(3):
+        fm = _store.MemoryFrontmatter.new(
+            source="raw_chunk", confidence="low",
+            tags=["episode", "raw_chunk"], zone="episode",
+        )
+        store.put("user", fm, f"[user] turn {i}\n[assistant] response {i}")
+        old_ids.append(fm.id)
+        gi.record_typed_fact(
+            fm.id, f"raw fact {i}", relation="captures", kind="raw_chunk",
+            target_memory_id=fm.id, episode_id=fm.id, source="raw_chunk",
+        )
+
+    # Sanity: facts are active before compaction.
+    assert all(gi.typed_facts(source_memory_id=mid, include_invalidated=False) for mid in old_ids)
+
+    # Force compaction by lowering the threshold and giving it raw episodes.
+    import mem_reflection_hermes.reflection.runtime as _runtime_mod
+    orig_threshold = _runtime_mod._COMPACT_THRESHOLD
+    _runtime_mod._COMPACT_THRESHOLD = 2
+    try:
+        result = _runtime_mod._compact_episode_zone(store, ctx=None, filters=None)
+    finally:
+        _runtime_mod._COMPACT_THRESHOLD = orig_threshold
+
+    assert result["compacted"] >= 1
+    # The superseded episode facts must now be invalidated.
+    for mid in old_ids:
+        active = gi.typed_facts(source_memory_id=mid, include_invalidated=False)
+        assert active == [], f"fact for {mid} should be invalidated after compaction"
+        invalidated = gi.typed_facts(source_memory_id=mid, include_invalidated=True)
+        assert all(row["invalidated_by"] is not None for row in invalidated)

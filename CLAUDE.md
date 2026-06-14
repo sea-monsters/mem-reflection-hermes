@@ -83,7 +83,7 @@ graph/compat.py       # forwards to runtime.graph
 ## Commands
 
 ```bash
-# Run all tests (expected baseline: 615 passed)
+# Run all tests (expected baseline: 638 passed)
 pytest tests/ -v
 
 # Run quietly when validating release baseline
@@ -92,6 +92,9 @@ pytest tests/ -q
 # Run by functional marker (see docs/testing/test-coverage.md)
 pytest -m "search and retrieval" -v
 pytest -m "runtime and not e2e" -v
+pytest -m "v17" -v                  # round-3 functional fixes
+pytest -m "graph or sidecar" -v     # Hebbian + typed fact sidecar
+pytest -m "scope" -v                # scope filter + ScopeIntent
 pytest -m "v14_runtime or v14_entity" -v
 pytest -m "contract or smoke" -v
 

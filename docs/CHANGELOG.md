@@ -45,8 +45,19 @@
 - **Windows test isolation**: pytest now uses a per-run plugin-specific `basetemp`, avoiding stale Windows temp-directory ACL conflicts during suite setup.
 - **Recovery callback compatibility**: runtime import-hygiene tests now accept scoped recovery kwargs, matching the current checkpoint recovery contract.
 - **Scoped compaction boundary**: reflection scope tests now assert that compacting one tenant scope does not supersede another scope's raw episodes.
-- **Coverage index sync**: `docs/testing/test-coverage.md` has been synchronized with the current `615` collected tests and v1.7 acceptance surfaces.
-- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `615 passed`.
+- **Coverage index sync**: `docs/testing/test-coverage.md` has been synchronized with the current `638` collected tests and v1.7 acceptance surfaces.
+- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `638 passed`.
+- **Test grouping simplification**: markers are now registered in `pytest.ini` and auto-assigned per-file in `tests/conftest.py`; new `v17` group covers the round-3 functional fixes (typed sidecar invalidation, semantic supersedes merge/scope_split, kind typing, ScopeIntent). Marker coverage closed for the 11 previously-untagged test files.
+
+### Round-3 Functional Fixes (`v17`)
+
+- **P1-1 typed sidecar invalidation**: `core/graph.py` gains `invalidate_facts_for_memories()`; `_record_typed_fact_sidecar()` now accepts `superseded_memory_ids` and all supersede/compaction paths invalidate the folded facts.
+- **P1-2 semantic merge/scope_split**: `_record_semantic_relation_sidecar()` writes `merges` / `scope_split_with` typed edges so the resolver's decision is no longer silently dropped; merge also invalidates the merge target's facts.
+- **P2-1 kind typing**: `REFINED_MEMORY_KINDS` vocabulary + `normalize_memory_kind()`; the LLM reflection schema and prompts now emit `kind`, ending the silent degeneration of the sidecar's kind column to `fact`.
+- **P2-2 dead-code cleanup**: removed the latent broken `_memory_tokens` import in `reflection/engine.py`; consolidated the triplicated `_is_memorable_content` / `_is_noise_text` / `_text_similarity` onto the CJK-aware `extraction.py` source of truth.
+- **P2-3 ScopeIntent**: `core/scope.py` introduces `ScopeIntent` (UNSCOPED/TENANT/GLOBAL_ONLY) and `global_only_scope()` so the IS NULL intent is finally expressible; `None`/`{}` semantics unchanged for backward compatibility.
+- **A5 palace_recall schema stability**: `runtime/tools.py::_tool_srh_palace_recall` now returns `graph_expanded: []` in scoped mode to keep the response schema stable; `tests/test_palace_recall.py` locks the regression.
+- **Regression coverage**: 20 new tests (suite 617 -> 638); see `docs/dev/1.7/v1.7-round3-functional-audit.md`.
 
 ### Development Notes
 

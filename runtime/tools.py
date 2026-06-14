@@ -587,9 +587,16 @@ def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
         out.append(item)
     # ── Graph-enhanced expansion ─────────────────────────
     # Enrich palace recall results with graph-neighbor memories.
+    # v1.6 scope design: when scope filters are active, graph expansion is
+    # skipped to avoid leaking cross-scope memories (see round-2 audit A5).
+    # Round-3 review: still emit ``graph_expanded: []`` in that case so the
+    # response schema stays stable across the filtered / unfiltered paths
+    # (callers should not have to branch on the presence of the key).
     result_mids = [m.id() for m in results]
+    if filters:
+        return json.dumps({"results": out, "graph_expanded": []}, ensure_ascii=False)
     return json.dumps(
-        {"results": out} if filters else _enrich_with_graph(result_mids, out, k, zone_filter=zone),
+        _enrich_with_graph(result_mids, out, k, zone_filter=zone),
         ensure_ascii=False,
     )
 

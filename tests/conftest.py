@@ -25,40 +25,57 @@ def pytest_configure(config):
 
 
 _FILE_MARKERS = {
+    # ── Store & data layer ──────────────────────────────────────────────
     "test_store.py": ("store", "compatibility"),
     "test_core_data.py": ("store", "compatibility"),
+    "test_store_module_split.py": ("store", "compatibility"),
+    "test_async_writer.py": ("store", "v14"),
+    # ── Retrieval, ranking, entities ───────────────────────────────────
     "test_search.py": ("search", "retrieval"),
     "test_bm25.py": ("search", "retrieval", "cjk"),
     "test_fusion_rerank.py": ("search", "retrieval"),
     "test_wave3_retrieval.py": ("search", "retrieval", "graph"),
     "test_reranker.py": ("search", "retrieval", "reranker"),
     "test_reranker_exceptions.py": ("search", "retrieval", "reranker", "v14"),
+    "test_entity_extraction.py": ("search", "retrieval", "v14"),
+    "test_palace_recall.py": ("search", "retrieval", "tools"),
+    # ── Graph layer ────────────────────────────────────────────────────
     "test_graph.py": ("graph",),
     "test_graph_operations.py": ("graph", "compatibility"),
     "test_graph_distil_failure.py": ("graph", "v14"),
+    "test_runtime_graph_aliases.py": ("graph", "runtime", "compatibility"),
+    # ── Scope & filters (v1.6 + round-3 ScopeIntent) ───────────────────
+    "test_scope_filters.py": ("scope", "store", "search"),
+    # ── Reflection, extraction, supersedes, sidecar ────────────────────
     "test_reflect.py": ("reflection", "compatibility"),
     "test_reflection.py": ("reflection", "runtime"),
+    "test_reflection_refinement.py": ("reflection", "extraction", "v17"),
+    "test_reflection_scope.py": ("reflection", "scope", "runtime"),
+    "test_semantic_supersedes.py": ("reflection", "supersedes", "v17"),
+    "test_typed_fact_sidecar.py": ("graph", "reflection", "sidecar", "v17"),
+    "test_compaction.py": ("compaction", "runtime", "reflection"),
+    # ── Context, runtime, hooks, config ────────────────────────────────
     "test_context.py": ("context", "runtime"),
     "test_hooks.py": ("runtime", "v14"),
     "test_runtime_import_hygiene.py": ("runtime", "compatibility"),
-    "test_memory_curator.py": ("curator",),
-    "test_curator_pipeline.py": ("curator", "integration"),
-    "test_bridge.py": ("bridge", "integration"),
-    "test_dashboard.py": ("dashboard", "integration"),
-    "test_tool_handlers.py": ("tools", "runtime"),
-    "test_compaction.py": ("compaction", "runtime", "reflection"),
-    "test_e2e.py": ("e2e", "integration"),
-    "test_host_contract_smoke.py": ("contract", "smoke", "integration"),
     "test_checkpoint.py": ("runtime", "config"),
     "test_checkpoint_backup_failure.py": ("runtime", "v14"),
     "test_config.py": ("config",),
+    "test_optional_deps.py": ("config", "v14"),
     "test_backend.py": ("backend",),
     "test_schema_module.py": ("runtime", "tools", "contract"),
     "test_lb.py": ("runtime", "compatibility"),
-    "test_entity_extraction.py": ("search", "retrieval", "v14"),
-    "test_async_writer.py": ("store", "v14"),
-    "test_optional_deps.py": ("config", "v14"),
-    "test_store_module_split.py": ("store", "compatibility"),
+    # ── Curation & lifecycle ───────────────────────────────────────────
+    "test_memory_curator.py": ("curator",),
+    "test_curator_pipeline.py": ("curator", "integration"),
+    "test_memory_events.py": ("curator", "events", "v16"),
+    # ── Integration & host surfaces ────────────────────────────────────
+    "test_bridge.py": ("bridge", "integration"),
+    "test_dashboard.py": ("dashboard", "integration"),
+    "test_dashboard_integration.py": ("dashboard", "integration"),
+    "test_tool_handlers.py": ("tools", "runtime"),
+    "test_e2e.py": ("e2e", "integration"),
+    "test_host_contract_smoke.py": ("contract", "smoke", "integration"),
 }
 
 _V14_NODE_MARKERS = {

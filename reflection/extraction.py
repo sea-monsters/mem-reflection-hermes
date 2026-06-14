@@ -10,6 +10,38 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List
 
+# Canonical typed-memory vocabulary. The reflection LLM prompt/schema and the
+# heuristic extraction layer both draw from this set so the `kind` column in
+# the typed fact sidecar stays consistent across embedding and LLM modes
+# (round-3 audit P2-1: previously the LLM path never produced a kind, so the
+# sidecar's kind distribution silently degenerated to "fact").
+REFINED_MEMORY_KINDS = (
+    "fact",
+    "preference",
+    "decision",
+    "policy",
+    "todo",
+    "correction",
+    "intent",
+    "procedure",
+    "summary",
+    "raw_chunk",
+)
+_REFINED_KIND_SET = frozenset(REFINED_MEMORY_KINDS)
+
+
+def normalize_memory_kind(kind: Any) -> str:
+    """Normalize an external (LLM/provided) kind to the canonical vocabulary.
+
+    Returns ``"fact"`` for anything missing or outside the known set, so an
+    unexpected model output cannot poison the typed sidecar's ``kind`` column
+    (round-3 audit P2-1).
+    """
+    if not kind:
+        return "fact"
+    lowered = str(kind).strip().lower()
+    return lowered if lowered in _REFINED_KIND_SET else "fact"
+
 try:
     from ..core.search import (
         _extract_keywords,

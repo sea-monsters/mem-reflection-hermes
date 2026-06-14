@@ -99,6 +99,9 @@ class _GraphStoreShim:
     def invalidate_typed_fact(self, *args, **kwargs):
         return self._gi.invalidate_typed_fact(*args, **kwargs)
 
+    def invalidate_facts_for_memories(self, *args, **kwargs):
+        return self._gi.invalidate_facts_for_memories(*args, **kwargs)
+
     def typed_facts(self, *args, **kwargs):
         return self._gi.typed_facts(*args, **kwargs)
 

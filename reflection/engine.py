@@ -26,7 +26,6 @@ try:
     )
     from ..core.search import _embed_single, _cosine_sim, _extract_keywords, _bm25_search_scored
     from .extraction import extract_refined_memory_candidates
-    from .runtime import _memory_tokens as estimate_tokens
 except ImportError:
     import sys
     from pathlib import Path
@@ -43,7 +42,6 @@ except ImportError:
     MemoryFrontmatter = _store_mod.MemoryFrontmatter
     plugin_data_dir = _store_mod.plugin_data_dir
     _tokenise = _store_mod._tokenise
-    estimate_tokens = _store_mod._memory_tokens
 
     # Load core.search
     _search_spec = importlib.util.spec_from_file_location("_search", str(_repo / "core" / "search.py"))

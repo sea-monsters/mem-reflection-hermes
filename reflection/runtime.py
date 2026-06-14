@@ -27,7 +27,7 @@ from ..core.search import (
     _is_explicit_memory_intent, _is_procedure,
 )
 from ..core.scope import normalize_scope_filters, scope_from_context
-from .extraction import extract_refined_memory_candidates
+from .extraction import extract_refined_memory_candidates, REFINED_MEMORY_KINDS, normalize_memory_kind
 from .supersedes_resolver import resolve_semantic_supersedes
 
 logger = logging.getLogger(__name__)
@@ -176,8 +176,16 @@ def _record_typed_fact_sidecar(
     episode_id: Optional[str] = None,
     source: str = "reflection",
     confidence: float = 0.5,
+    superseded_memory_ids: Optional[List[str]] = None,
 ) -> None:
-    """Best-effort typed sidecar write for graph-enabled stores."""
+    """Best-effort typed sidecar write for graph-enabled stores.
+
+    When ``superseded_memory_ids`` is provided, the typed facts owned by those
+    memories are invalidated by the newly written memory (``fm.id``). This is
+    what makes the Phase D sidecar actually carry temporal truth — without it
+    the invalidation column stayed NULL forever and ``include_invalidated=False``
+    queries kept returning superseded facts.
+    """
     graph = _graph_for_store(mem_store)
     if graph is None:
         return
@@ -205,8 +213,62 @@ def _record_typed_fact_sidecar(
                 target_memory_id=target_memory_id or fm.id,
                 confidence=float(confidence),
             )
+        # Phase D: invalidate the typed facts owned by memories this one
+        # supersedes, so the sidecar reflects temporal truth instead of
+        # accumulating stale rows alongside the replacement.
+        if superseded_memory_ids:
+            invalidate = getattr(graph, "invalidate_facts_for_memories", None)
+            if invalidate is not None:
+                invalidate(list(superseded_memory_ids), invalidated_by=fm.id)
     except Exception as e:
         logger.warning("Typed sidecar write failed for %s: %s", fm.id, e, exc_info=True)
+
+
+def _record_semantic_relation_sidecar(
+    mem_store: Any,
+    fm: MemoryFrontmatter,
+    *,
+    action: str,
+    target_ids: List[str],
+    reason: str = "",
+    confidence: float = 0.5,
+) -> None:
+    """Record a Phase C semantic-relation typed edge for merge/scope_split.
+
+    ``supersede`` already carries its lineage through ``fm.supersedes`` plus the
+    sidecar invalidation in :func:`_record_typed_fact_sidecar`. ``merge`` and
+    ``scope_split`` carry no supersedes edge, so without this helper their
+    decisions were silently dropped (round-3 audit P1-2). This writes a single
+    typed edge per target so the relation is queryable without re-running the
+    resolver.
+    """
+    target_ids = [tid for tid in (target_ids or []) if tid]
+    if action not in ("merge", "scope_split") or not target_ids:
+        return
+    graph = _graph_for_store(mem_store)
+    if graph is None:
+        return
+    relation = "merges" if action == "merge" else "scope_split_with"
+    kind = "semantic_merge" if action == "merge" else "semantic_scope_split"
+    zone = getattr(fm, "zone", "general") or "general"
+    for target_id in target_ids:
+        try:
+            graph.record_typed_fact(
+                fm.id,
+                reason or f"{action} {target_id}",
+                relation=relation,
+                kind=kind,
+                subject=fm.id,
+                object=target_id,
+                target_memory_id=target_id,
+                episode_id=fm.id,
+                zone=zone,
+                source="reflection",
+                confidence=float(confidence),
+            )
+        except Exception as e:
+            logger.warning("Semantic relation sidecar failed for %s: %s", fm.id, e, exc_info=True)
+            break
 
 
 def _build_audit_entry(
@@ -354,7 +416,13 @@ exploration.
 2. MEMORY CANDIDATES — durable facts, conventions, preferences, or
 constraints the agent discovered that should persist across sessions.
 One claim per memory. Default `scope` to `user`; pick `project` only
-when the fact is specific to the current repo / codebase.
+when the fact is specific to the current repo / codebase. Set `kind`
+to the most specific category that applies: "fact" (default, a bare
+factual statement), "preference" (what the user likes/dislikes/wants),
+"decision" (a choice or policy adopted going forward), "policy"
+(convention/rule/config), "todo" (a follow-up / action item),
+"correction" (a revision of a prior statement), or "intent"
+(an explicit "remember this" request).
 
 3. CONFLICTS — when a new memory candidate contradicts, duplicates, or
 subsumes an existing memory, report a conflict referencing the existing
@@ -385,6 +453,7 @@ markdown fences. No commentary.
       "fact": "one short statement; one fact per memory",
       "tags": ["rust", "convention"],
       "scope": "user" | "project",
+      "kind": "fact" | "preference" | "decision" | "policy" | "todo" | "correction" | "intent",
       "confidence": "low" | "medium" | "high",
       "rationale": "why this should persist",
       "supersedes": ["mem_xxxx"],
@@ -408,6 +477,7 @@ Rules:
 - Only propose a memory if the user stated a durable preference, convention, or fact.
 - Only propose a skill if the assistant followed a multi-step procedure that would be reusable verbatim next time.
 - Never propose more than 1 memory and 1 skill per micro-reflection.
+- Set `kind` to the most specific category: "preference", "decision", "policy", "todo", "correction", "intent", or default "fact".
 - Confidence should be "low" or "medium" — never "high" for micro-reflection.
 - If the conversation reveals that an existing memory is WRONG or OUTDATED, produce a memory_candidates entry with the corrected fact and set `supersedes` to the old memory's id, plus a conflicts entry with kind "stale".
 
@@ -415,7 +485,7 @@ Reply with EXACTLY ONE JSON object:
 {
   "summary": "<one sentence>",
   "skill_candidates": [],
-  "memory_candidates": [{"fact": "<short statement>", "tags": [], "scope": "user", "confidence": "low|medium", "rationale": "<why>", "supersedes": ["mem_xxx"]}],
+  "memory_candidates": [{"fact": "<short statement>", "tags": [], "scope": "user", "kind": "fact", "confidence": "low|medium", "rationale": "<why>", "supersedes": ["mem_xxx"]}],
   "conflicts": [{"with": "mem_xxx", "kind": "stale", "explain": "<why old memory is wrong>", "options": ["keep_new", "keep_old"]}]
 }"""
 
@@ -562,6 +632,9 @@ def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
 
 def _build_reflect_schema() -> Dict[str, Any]:
     """Build JSON schema for reflection structured output."""
+    # Exclude internal-only kinds (summary/raw_chunk) from the LLM-facing enum:
+    # those are produced by the embedding/compaction pipeline, not by the model.
+    llm_kinds = [k for k in REFINED_MEMORY_KINDS if k not in ("summary", "raw_chunk")]
     return {
         "type": "object",
         "properties": {
@@ -589,6 +662,7 @@ def _build_reflect_schema() -> Dict[str, Any]:
                         "fact": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "scope": {"type": "string", "enum": ["user", "project"]},
+                        "kind": {"type": "string", "enum": llm_kinds},
                         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                         "rationale": {"type": "string"},
                         "supersedes": {"type": "array", "items": {"type": "string"}},
@@ -758,6 +832,9 @@ def _run_full_reflection(
     for cand in parsed.get("memory_candidates", []):
         body = cand.get("fact", "")
         scope = cand.get("scope", "user")
+        # P2-1: normalize the LLM-provided kind so the sidecar vocabulary
+        # stays consistent (unknown/missing kinds fall back to "fact").
+        candidate_kind = normalize_memory_kind(cand.get("kind"))
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         candidate_supersedes = list(cand.get("supersedes", []) or [])
         novelty = 0.0
@@ -768,7 +845,7 @@ def _run_full_reflection(
 
         plan = resolve_semantic_supersedes(
             candidate_text=body,
-            candidate_kind=cand.get("kind", "fact"),
+            candidate_kind=candidate_kind,
             user_msg=full_user,
             conflict_memory=None,
             conflict_similarity=0.0,
@@ -807,17 +884,30 @@ def _run_full_reflection(
             if fm.supersedes:
                 _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
+            # Phase C: a merge carries no lineage edge but the resolver still
+            # named targets whose facts are now superseded in truth-value.
+            merge_targets = plan["target_ids"] if plan["action"] == "merge" else []
             _record_typed_fact_sidecar(
                 mem_store,
                 fm,
                 body,
                 relation="describes",
-                kind=cand.get("kind", "fact"),
+                kind=candidate_kind,
                 target_memory_id=fm.id,
                 episode_id=fm.id,
                 source="reflection",
                 confidence=0.9 if cand.get("confidence") == "high" else 0.6,
+                superseded_memory_ids=list(fm.supersedes or []) + list(merge_targets) or None,
             )
+            # Record merge / scope_split semantic edges (round-3 P1-2).
+            if plan["action"] in ("merge", "scope_split") and plan.get("target_ids"):
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=plan["action"],
+                    target_ids=plan["target_ids"],
+                    reason=plan["reason"],
+                    confidence=plan.get("confidence", 0.6),
+                )
             _remember_current_session_memory_id(fm.id)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")})
             audit_entries.append(_build_audit_entry(
@@ -939,9 +1029,11 @@ def _run_micro_reflection(
             pass
 
         candidate_supersedes = list(cand.get("supersedes", []) or [])
+        # P2-1: normalize the LLM-provided kind to the canonical vocabulary.
+        candidate_kind = normalize_memory_kind(cand.get("kind"))
         plan = resolve_semantic_supersedes(
             candidate_text=body,
-            candidate_kind=cand.get("kind", "fact"),
+            candidate_kind=candidate_kind,
             user_msg=user_msg,
             conflict_memory=None,
             conflict_similarity=0.0,
@@ -976,17 +1068,29 @@ def _run_micro_reflection(
             if fm.supersedes:
                 _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
+            # Phase C: merge targets carry no lineage edge but should still
+            # invalidate the superseded facts and record a relation edge.
+            merge_targets = plan["target_ids"] if plan["action"] == "merge" else []
             _record_typed_fact_sidecar(
                 mem_store,
                 fm,
                 body,
                 relation="describes",
-                kind=cand.get("kind", "fact"),
+                kind=candidate_kind,
                 target_memory_id=fm.id,
                 episode_id=fm.id,
                 source="micro_reflection",
                 confidence=0.9 if cand.get("confidence") == "high" else 0.6,
+                superseded_memory_ids=list(fm.supersedes or []) + list(merge_targets) or None,
             )
+            if plan["action"] in ("merge", "scope_split") and plan.get("target_ids"):
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=plan["action"],
+                    target_ids=plan["target_ids"],
+                    reason=plan["reason"],
+                    confidence=plan.get("confidence", 0.6),
+                )
             _remember_current_session_memory_id(fm.id)
             accepted = {"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")}
             audit_entries.append(_build_audit_entry(
@@ -1257,104 +1361,17 @@ def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str
     return extract_refined_memory_candidates(user_msg, assistant_msg)
 
 
-def _is_noise_text(text: str) -> bool:
-    """Check if extracted text is a system note or tool artifact, not genuine user content.
-
-    These texts should never be saved as memories.
-    """
-    stripped = text.strip()
-
-    # System-level bookkeeping notes
-    if stripped.startswith("[System note:") or stripped.startswith("[System]"):
-        return True
-
-    # Tool placeholder markers
-    if stripped.startswith("[tool]") or stripped.startswith("{"):
-        return True
-
-    # "Review the conversation above and update the skill library" — auto-injected task
-    if "Review the conversation above and update the skill library" in stripped:
-        return True
-
-    # Gateway shutdown / restart notes
-    if "gateway shutdown" in stripped.lower() or "interrupted by a gateway" in stripped.lower():
-        return True
-
-    # Pure JSON / data dumps (tool outputs leaked into message text)
-    if stripped.startswith('{"') or stripped.startswith('['):
-        return True
-
-    return False
-
-
-def _text_similarity(a: str, b: str) -> float:
-    """Quick text similarity using token overlap."""
-    ta = set(_tokenise(a))
-    tb = set(_tokenise(b))
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    return inter / max(len(ta), len(tb))
-
-
-def _is_memorable_content(text: str) -> bool:
-    """Filter out non-memorable content that shouldn't be stored as memory.
-
-    Rejects:
-    - Tool output patterns (code blocks, exit codes, stdout/stderr)
-    - File paths and code patterns
-    - Very short or very repetitive content
-    - System-like messages
-
-    Returns True if content is worth remembering, False otherwise.
-    """
-    if not text or not isinstance(text, str):
-        return False
-
-    text = text.strip()
-
-    # Too short
-    if len(text) < 15:
-        return False
-
-    # Tool output patterns
-    tool_indicators = [
-        "```", "Exit code", "stdout", "stderr", "Tool ran without output",
-        "Process completed", "Command output", "Execution result",
-        "File created", "File modified", "File deleted",
-    ]
-    text_lower = text.lower()
-    for indicator in tool_indicators:
-        if indicator.lower() in text_lower:
-            return False
-
-    # File paths (Windows and Unix)
-    if re.search(r'[a-zA-Z]:\\[\w\\.-]+|/[\w/\-._]+', text):
-        # Only reject if looks like a file path, not just a path-like string
-        if re.search(r'[\\/]([\w-]+\.[\w]{2,4}|[\w-]+[\\/])', text):
-            return False
-
-    # Code patterns (function/class definitions, imports)
-    code_patterns = [
-        r'^def\s+\w+\s*\(', r'^class\s+\w+', r'^import\s+\w+',
-        r'^from\s+\w+\s+import', r'^\s*(public|private|protected)\s+(void|int|String)',
-        r'^function\s+\w+\s*\(', r'^const\s+\w+\s*=',
-    ]
-    for pat in code_patterns:
-        if re.match(pat, text, re.MULTILINE):
-            return False
-
-    # Very repetitive content (e.g., "------" or "aaaaa")
-    if len(set(text[:50])) < 5:
-        return False
-
-    # System-like messages
-    system_prefixes = ["[system]", "[error]", "[warning]", "[info]", "[debug]"]
-    for prefix in system_prefixes:
-        if text_lower.startswith(prefix.lower()):
-            return False
-
-    return True
+# P2-2 (round-3): these helpers previously lived as local copies in this
+# module AND in extraction.py/engine.py, with subtly different behaviour (the
+# local ``_is_memorable_content`` ignored CJK weight, so Chinese short
+# fragments were scored inconsistently between micro-reflection and the
+# compaction fallback). They are now re-exported from extraction.py, the
+# single CJK-aware source of truth, so every path agrees.
+from .extraction import (  # noqa: E402,F401
+    _is_noise_text,
+    _is_memorable_content,
+    _text_similarity,
+)
 
 
 def _infer_zone_from_scope(scope: str) -> str:
@@ -1478,6 +1495,8 @@ def _run_embedding_reflection(
                     "explain": plan["reason"],
                     "options": ["keep_new", "keep_old"],
                 })
+            # merge / scope_split carry no supersedes edge; capture the targets
+            # so the storage loop can record a semantic-relation sidecar edge.
         memory_candidates.append({
             "fact": text,
             "tags": tags,
@@ -1486,6 +1505,9 @@ def _run_embedding_reflection(
             "rationale": fact["rationale"],
             "supersedes": supersedes,
             "kind": candidate_kind,
+            "semantic_action": (plan or {}).get("action") if (plan or {}).get("action") in ("merge", "scope_split") else None,
+            "semantic_target_ids": (plan or {}).get("target_ids") if (plan or {}).get("action") in ("merge", "scope_split") else [],
+            "semantic_reason": (plan or {}).get("reason", "") if (plan or {}).get("action") in ("merge", "scope_split") else "",
         })
         audit_entries.append(_build_audit_entry(
             candidate_id=cand_id,
@@ -1590,6 +1612,28 @@ def _run_embedding_reflection(
             path = mem_store.put(scope, fm, body)
             accepted_memories.append({"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")})
             _remember_current_session_memory_id(fm.id)
+            # Phase C: record merge / scope_split semantic edges so the
+            # resolver's decision is not silently dropped (round-3 P1-2).
+            semantic_action = cand.get("semantic_action")
+            semantic_targets = cand.get("semantic_target_ids") or []
+            if semantic_action in ("merge", "scope_split") and semantic_targets:
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=semantic_action,
+                    target_ids=semantic_targets,
+                    reason=cand.get("semantic_reason", ""),
+                    confidence=0.6,
+                )
+                # A merge is a semantic update: the merge target's own facts
+                # are now superseded in truth-value by this memory.
+                if semantic_action == "merge":
+                    _record_typed_fact_sidecar(
+                        mem_store, fm, body,
+                        relation="describes", kind=cand.get("kind", "fact"),
+                        target_memory_id=fm.id, episode_id=fm.id,
+                        source="reflection", confidence=0.6,
+                        superseded_memory_ids=semantic_targets,
+                    )
             # Update the matching pending_storage audit entry if present
             updated = False
             for ae in audit_entries:
@@ -1801,6 +1845,7 @@ def _run_embedding_micro_reflection(
     tags = _extract_keywords(best["text"], top_k=3)
 
     supersedes = []
+    plan: Optional[Dict[str, Any]] = None
     if conflict_mem:
         mem, sim = conflict_mem
         plan = resolve_semantic_supersedes(
@@ -1841,6 +1886,13 @@ def _run_embedding_micro_reflection(
         )
         _validate_supersedes_targets(mem_store, fm.supersedes)
         path = mem_store.put("user", fm, best["text"])
+        # Phase C: a merge is a semantic update, so the merge target's facts
+        # are superseded in truth-value even though no lineage edge is written.
+        semantic_action = (plan or {}).get("action")
+        semantic_targets = (plan or {}).get("target_ids") or []
+        merge_supersede_ids = list(fm.supersedes or [])
+        if semantic_action == "merge" and semantic_targets:
+            merge_supersede_ids.extend(semantic_targets)
         _record_typed_fact_sidecar(
             mem_store,
             fm,
@@ -1851,7 +1903,17 @@ def _run_embedding_micro_reflection(
             episode_id=fm.id,
             source="micro_reflection",
             confidence=0.8 if best.get("confidence") == "high" else 0.6,
+            superseded_memory_ids=merge_supersede_ids or None,
         )
+        # Record the merge / scope_split relation edge (round-3 P1-2).
+        if semantic_action in ("merge", "scope_split") and semantic_targets:
+            _record_semantic_relation_sidecar(
+                mem_store, fm,
+                action=semantic_action,
+                target_ids=semantic_targets,
+                reason=(plan or {}).get("reason", ""),
+                confidence=0.6,
+            )
         _remember_current_session_memory_id(fm.id)
         accepted = {"id": fm.id, "body": best["text"], "path": str(path), "kind": best.get("kind")}
 
@@ -2217,6 +2279,7 @@ def _compact_episode_zone(mem_store, ctx=None, filters: Optional[Dict[str, Any]]
                 episode_id=day,
                 source="compaction",
                 confidence=0.6,
+                superseded_memory_ids=[m.id() for m in mems],
             )
             summaries.append({
                 "day": day,
