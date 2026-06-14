@@ -208,15 +208,9 @@ def build_context_bundle(
         block = "## Active Skills\n" + "\n".join(_format_skill(s, detail_level="mild") for s in always)
         _try_add(stable_parts, "always_active_skills", block)
 
-    # 5. Dynamic: compacted episode summaries
-    if not stable_only:
-        try:
-            cfg = plugin_config()
-            if cfg.get("context_compacted_episode", True):
-                episode_block = _build_compacted_episode_block(store, detail_level="mild", filters=filters)
-        except Exception:
-            debug["dropped_sections"].append("compacted_episode_summaries")
-
+    # 5. Dynamic: compacted episode summaries (built inside _build_dynamic_context_parts)
+    #    The filters are passed through to _build_compacted_episode_block so scoped
+    #    sessions only see their own compacted episodes.
     remaining_budget = max(token_budget - used_tokens, 0)
     compression_enabled = True
     try:
@@ -237,6 +231,7 @@ def build_context_bundle(
             store=store,
             budget=remaining_budget,
             compression_enabled=compression_enabled,
+            filters=filters,
         )
     debug["compression_level"] = compression_level
     for label in dropped_labels:
@@ -356,6 +351,7 @@ def _build_dynamic_context_parts(
     store,
     budget: int,
     compression_enabled: bool = True,
+    filters: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[str], str, List[str], List[str]]:
     """Assemble dynamic context using compression levels instead of tail truncation."""
     if budget <= 0 and active:
@@ -428,7 +424,7 @@ def _build_dynamic_context_parts(
             else:
                 dropped.append("triggered_skills")
 
-        episode_block = _build_compacted_episode_block(store, detail_level=cfg["episode_detail"])
+        episode_block = _build_compacted_episode_block(store, detail_level=cfg["episode_detail"], filters=filters)
         if episode_block:
             cost = _estimate_block_tokens(episode_block)
             if used + cost <= budget:

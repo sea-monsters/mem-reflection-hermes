@@ -303,6 +303,10 @@ def _on_session_end(**kwargs) -> None:
 
     # No substantive content to reflect on
     if not messages:
+        # Clean up even on empty sessions — session-start may have set up
+        # state that needs release.
+        _reset_current_session_memory_ids()
+        _cleanup_session_state(session_id)
         return
 
     if session_id:
