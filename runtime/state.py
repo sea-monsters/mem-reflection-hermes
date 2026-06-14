@@ -65,7 +65,8 @@ def _get_mem_store():
         with _mem_store_lock:
             if _mem_store is None:
                 from ..core.store import MemoryStore
-                _mem_store = MemoryStore()
+                from ..core.config import user_memories_dir
+                _mem_store = MemoryStore(user_root=user_memories_dir())
     return _mem_store
 
 
@@ -76,7 +77,8 @@ def _get_skill_store():
         with _skill_store_lock:
             if _skill_store is None:
                 from ..core.store import SkillStore
-                _skill_store = SkillStore()
+                from ..core.config import user_memories_dir
+                _skill_store = SkillStore(user_root=user_memories_dir())
     return _skill_store
 
 
