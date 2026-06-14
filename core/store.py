@@ -16,6 +16,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -139,6 +140,7 @@ def _append_stat_entries(entries: List[Tuple[str, str]]) -> None:
 def record_memory_stat(memory_id: str, event: str) -> None:
     try:
         _append_stat_entries([(memory_id, event)])
+        _invalidate_effectiveness_cache()
     except Exception:
         logger.warning("Failed to record memory stat for %s", memory_id)
 
@@ -146,8 +148,20 @@ def record_memory_stat(memory_id: str, event: str) -> None:
 def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
     try:
         _append_stat_entries(entries)
+        _invalidate_effectiveness_cache()
     except Exception:
         logger.warning("Stat sync write failed")
+
+
+def _invalidate_effectiveness_cache() -> None:
+    """Drop the effectiveness cache entirely so the next read re-scans disk.
+
+    Clears both the cached value and its timestamp: only zeroing the timestamp
+    leaves a stale value that a buggy read path could still return.
+    """
+    global _effectiveness_cache, _effectiveness_cache_at
+    _effectiveness_cache = None
+    _effectiveness_cache_at = 0.0
 
 
 _write_queue: "queue.Queue[Tuple[Path, str, int] | None]" = queue.Queue(maxsize=500)
@@ -155,6 +169,15 @@ _pending_writes: Set[Path] = set()
 _write_guard_lock = threading.Lock()
 _write_path_locks: Dict[str, threading.RLock] = {}
 _write_generations: Dict[str, int] = {}
+
+# --- effectiveness cache (backed by memory-stats.jsonl) ---------------------
+# load_effectiveness() does a full-file scan of memory-stats.jsonl on every
+# call. To avoid re-reading the (potentially large) file on each effectiveness()
+# lookup, we cache the parsed result with a short TTL and invalidate whenever
+# we append new stats in this process.
+_effectiveness_cache: Optional[Dict[str, "MemoryEffectiveness"]] = None
+_effectiveness_cache_at: float = 0.0
+_EFFECTIVENESS_CACHE_TTL: float = 30.0  # seconds
 
 
 def _write_path_key(path: Path) -> str:
@@ -291,11 +314,108 @@ def async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
             logger.warning("Sync write fallback failed for %s: %s", path, e)
 
 
+def _effectiveness_index_path() -> Path:
+    """Aggregate snapshot file: one row per memory_id (post-compaction baseline)."""
+    return plugin_data_dir() / "effectiveness-index.jsonl"
+
+
+def _load_effectiveness_snapshot() -> Tuple[Dict[str, "MemoryEffectiveness"], Optional[str]]:
+    """Read the aggregate snapshot.
+
+    Returns (eff_map, folded_at) where folded_at is the ISO timestamp of the
+    last compaction (events with at <= folded_at are already folded in). If no
+    snapshot exists, returns ({}, None) so callers fall back to scanning the
+    whole event stream.
+    """
+    sp = _effectiveness_index_path()
+    if not sp.exists():
+        return {}, None
+    eff: Dict[str, MemoryEffectiveness] = {}
+    folded_at: Optional[str] = None
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mid = row.get("memory_id", "")
+                if not mid:
+                    continue
+                eff[mid] = MemoryEffectiveness(
+                    loaded=int(row.get("loaded", 0)),
+                    referenced=int(row.get("referenced", 0)),
+                    accessed=int(row.get("accessed", 0)),
+                    last_event_at=row.get("last_event_at"),
+                )
+                row_folded = row.get("folded_at")
+                if row_folded and (folded_at is None or row_folded > folded_at):
+                    folded_at = row_folded
+    except Exception as e:
+        logger.warning("Failed to load effectiveness snapshot from %s: %s", sp, e)
+    return eff, folded_at
+
+
+def _write_effectiveness_snapshot(
+    eff_map: Dict[str, "MemoryEffectiveness"], folded_at: str
+) -> None:
+    """Atomically rewrite the aggregate snapshot, one row per memory_id.
+
+    Uses _safe_write (tmp + fsync + os.replace) so a crash mid-write cannot
+    corrupt the snapshot. Rows that have no activity (all-zero counts and no
+    last_event_at) are skipped to keep the file compact.
+    """
+    sp = _effectiveness_index_path()
+    lines: List[str] = []
+    for mid, eff in eff_map.items():
+        if eff.loaded == 0 and eff.referenced == 0 and eff.accessed == 0 and not eff.last_event_at:
+            continue
+        row = {
+            "memory_id": mid,
+            "loaded": eff.loaded,
+            "referenced": eff.referenced,
+            "accessed": eff.accessed,
+            "last_event_at": eff.last_event_at,
+            "folded_at": folded_at,
+        }
+        lines.append(json.dumps(row, ensure_ascii=False))
+    content = ("\n".join(lines) + "\n") if lines else ""
+    _safe_write(sp, content)
+
+
+def _apply_stat_entry(eff_map: Dict[str, "MemoryEffectiveness"], entry: Dict[str, Any]) -> None:
+    """Fold one event-stream entry into an effectiveness map (in place)."""
+    mid = entry.get("memory_id", "")
+    if not mid:
+        return
+    e = eff_map.setdefault(mid, MemoryEffectiveness())
+    ev = entry.get("event", "")
+    if ev == "loaded":
+        e.loaded += 1
+    elif ev == "referenced":
+        e.referenced += 1
+    elif ev == "accessed":
+        e.accessed += 1
+    at = entry.get("at")
+    if at and (e.last_event_at is None or at > e.last_event_at):
+        e.last_event_at = at
+
+
 def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
+    """Load effectiveness stats via the dual-track path.
+
+    Reads the aggregate snapshot (O(memories)) as the baseline, then folds in
+    only the event-stream tail (entries with at > snapshot.folded_at). When no
+    snapshot exists (fresh install / pre-compaction), falls back to scanning
+    the entire event stream for backward compatibility.
+    """
+    eff, folded_at = _load_effectiveness_snapshot()
     sp = _stats_path()
     if not sp.exists():
-        return {}
-    eff: Dict[str, MemoryEffectiveness] = {}
+        return eff
     try:
         with open(sp, "r", encoding="utf-8") as f:
             for line in f:
@@ -306,20 +426,12 @@ def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                mid = entry.get("memory_id", "")
-                if not mid:
-                    continue
-                e = eff.setdefault(mid, MemoryEffectiveness())
-                ev = entry.get("event", "")
-                if ev == "loaded":
-                    e.loaded += 1
-                elif ev == "referenced":
-                    e.referenced += 1
-                elif ev == "accessed":
-                    e.accessed += 1
-                at = entry.get("at")
-                if at and (e.last_event_at is None or at > e.last_event_at):
-                    e.last_event_at = at
+                # Skip events already folded into the snapshot baseline.
+                if folded_at is not None:
+                    at = entry.get("at")
+                    if at and at <= folded_at:
+                        continue
+                _apply_stat_entry(eff, entry)
     except Exception as e:
         logger.warning("Failed to load effectiveness stats from %s: %s", sp, e)
     return eff
@@ -1156,12 +1268,41 @@ class MemoryStore:
         return _lineage_mod._calc_supersedes_depth(self, mem_id, visited, max_depth, depth)
 
     def record_stat(self, memory_id: str, event: str) -> None:
+        """[DEPRECATED] Writes to the SQLite stats table.
+
+        Production stats are recorded via the module-level record_memory_stat()
+        (which appends to memory-stats.jsonl, the single source of truth for
+        effectiveness). This method is retained only for backward compatibility
+        and is not called by any production path. Prefer record_memory_stat().
+        """
         _sm = _load_related_module("store_methods")
         return _sm.record_stat(self, memory_id, event)
 
     def effectiveness(self, memory_id: Optional[str] = None) -> Dict[str, MemoryEffectiveness]:
-        _sm = _load_related_module("store_methods")
-        return _sm.effectiveness(self, memory_id)
+        """Effectiveness stats sourced from memory-stats.jsonl (the truth path).
+
+        Production stats are written by record_memory_stat() to the JSONL log;
+        this method reads them back via load_effectiveness(). The result is
+        cached briefly (TTL_EFFECTIVENESS_CACHE_SECS) to avoid re-reading the
+        whole file on every call.
+
+        Args:
+            memory_id: if given, returns {memory_id: MemoryEffectiveness} for
+                that one memory (or an empty dict if absent); if None, returns
+                the full {memory_id: MemoryEffectiveness} map.
+        """
+        global _effectiveness_cache, _effectiveness_cache_at
+        now = time.monotonic()
+        if (
+            _effectiveness_cache is None
+            or (now - _effectiveness_cache_at) > _EFFECTIVENESS_CACHE_TTL
+        ):
+            _effectiveness_cache = load_effectiveness()
+            _effectiveness_cache_at = now
+        if memory_id is not None:
+            eff = _effectiveness_cache.get(memory_id)
+            return {memory_id: eff} if eff is not None else {}
+        return dict(_effectiveness_cache)
 
     def health_metrics(self) -> Dict[str, Any]:
         _sh = _load_related_module("store_health")

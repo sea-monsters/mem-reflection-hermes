@@ -115,7 +115,8 @@ valid and readable.
 │   │       └── SKILL.md
 │   ├── zone-cache/                   # Per-zone summary caches
 │   ├── palace-index.md              # Palace zone index
-│   ├── memory-stats.jsonl           # Effectiveness tracking
+│   ├── memory-stats.jsonl           # Effectiveness event stream (append-only; compacted by curator)
+│   ├── effectiveness-index.jsonl    # Effectiveness aggregate snapshot (one row per memory, v1.7 round-4)
 │   └── cold_store.jsonl             # Curator cold storage archive (v1.2)
 ├── plugins/
 │   └── mem-reflection-hermes/

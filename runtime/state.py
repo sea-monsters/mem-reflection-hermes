@@ -106,7 +106,9 @@ def _get_graph_mgr():
     if _graph_mgr is None:
         with _graph_mgr_lock:
             if _graph_mgr is None:
-                # Import from runtime.graph (which uses core.graph)
-                from ..runtime.graph import _get_graph_mgr as _ggm
+                # runtime/graph.py exposes get_graph_manager_compat(), the
+                # thread-safe singleton factory. (_get_graph_mgr did not exist
+                # on runtime.graph, so the old import raised ImportError.)
+                from ..runtime.graph import get_graph_manager_compat as _ggm
                 _graph_mgr = _ggm()
     return _graph_mgr

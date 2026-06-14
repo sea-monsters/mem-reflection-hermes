@@ -466,7 +466,7 @@ def get_graph_manager_compat(db_path: Optional[Path] = None) -> GraphManagerComp
         with _gm_compat_lock:
             if _graph_manager_compat is None:
                 if db_path is None:
-                    from .store import plugin_data_dir
+                    from ..core.store import plugin_data_dir
                     db_path = plugin_data_dir() / "graph.db"
                 _graph_manager_compat = GraphManagerCompat(db_path)
     return _graph_manager_compat
@@ -493,9 +493,9 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
     """Register graph tools, graph maintenance hook, health tool, and /graph command."""
     if graph_db_path is None:
         try:
-            from .store import plugin_data_dir
+            from ..core.store import plugin_data_dir
         except ImportError:
-            from store import plugin_data_dir
+            from core.store import plugin_data_dir
         graph_db_path = plugin_data_dir() / "graph.db"
 
     try:

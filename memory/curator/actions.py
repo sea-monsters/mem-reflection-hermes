@@ -165,7 +165,11 @@ class ArchiveStale(CuratorAction):
                     except Exception as e:
                         logger.debug("ArchiveStale: could not load effectiveness for %s: %s", mid, e)
                     if eff:
-                        score = eff.get("effectiveness", 0.5)
+                        # Combined effectiveness score: hit-rate (factor, 0.5-1.0)
+                        # weighted by time-decay (decay_factor, 0.3-1.0). Range
+                        # ~0.15-1.0. A memory is stale when it is both rarely
+                        # referenced AND long untouched.
+                        score = eff.factor() * eff.decay_factor()
                         if score < eff_threshold:
                             is_stale = True
 
@@ -424,8 +428,14 @@ class MergeSimilar(CuratorAction):
             try:
                 from .helpers import _load_effectiveness
                 eff = _load_effectiveness(mem_store, mem_id)
-                if eff and "last_accessed" in eff:
-                    return (0, -eff["last_accessed"])
+                if eff and getattr(eff, "last_event_at", None):
+                    # Sort by most-recently-active first (newer ISO sorts higher,
+                    # so negate via reverse epoch of the last event).
+                    from datetime import datetime, timezone
+                    last = datetime.fromisoformat(eff.last_event_at.replace("Z", "+00:00"))
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    return (0, -last.timestamp())
             except Exception as e:
                 logger.debug("MergeSimilar sort key failed for %s: %s", mem_id, e)
             return (1, getattr(m.frontmatter, "created", ""))

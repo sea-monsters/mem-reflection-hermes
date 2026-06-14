@@ -174,6 +174,18 @@ def _run_curator(
     result["total_archived"] = result["archived"] + result["superseded"] + result["merged"]
     result["errors"] = list(pipeline_ctx.errors)
 
+    # Dual-track stats compaction: fold the memory-stats.jsonl event stream into
+    # the effectiveness-index.jsonl snapshot and truncate it, so the read path
+    # stays O(memories) instead of O(events). Runs after all mutations so the
+    # snapshot reflects post-archive state. Failures only warn.
+    try:
+        from .helpers import compact_stats_snapshot
+        compact = compact_stats_snapshot(mem_store)
+        result["stats_compaction"] = compact
+    except Exception as e:
+        logger.warning("Stats compaction step failed: %s", e)
+        result["stats_compaction"] = {"compacted": False, "error": str(e)}
+
     # Generate and persist report
     try:
         report_action = GenerateReport()
@@ -231,7 +243,7 @@ def scan_for_stale(mem_store) -> List[str]:
                 else:
                     from .helpers import _load_effectiveness
                     eff = _load_effectiveness(mem_store, mem.id())
-                    if eff and eff.get("effectiveness", 0.5) < eff_threshold:
+                    if eff and (eff.factor() * eff.decay_factor()) < eff_threshold:
                         is_stale = True
             if is_stale:
                 ids.append(mem.id())

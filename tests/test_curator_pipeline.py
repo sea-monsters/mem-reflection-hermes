@@ -203,7 +203,12 @@ class TestLoadLastAccess:
 
         ts = load_last_access(stale_store, "fresh")
         assert ts > 0
-        assert ts == _MOCK_TIME
+        # The timestamp is derived from MemoryEffectiveness.last_event_at, which
+        # is stored as an ISO-8601 string (microsecond precision, matching how
+        # the real stats pipeline writes it). A raw float epoch like _MOCK_TIME
+        # may carry sub-microsecond digits that do not survive the ISO round
+        # trip, so compare with pytest.approx rather than exact equality.
+        assert ts == pytest.approx(_MOCK_TIME)
         assert isinstance(ts, float)
 
     def test_returns_zero_on_missing_memory(self, empty_store):
@@ -381,7 +386,7 @@ class TestCuratorConfig:
         cfg = _curator_config(empty_store)
         assert cfg["enabled"] is False
         assert cfg["stale"]["days"] == 30
-        assert cfg["stale"]["effectiveness_threshold"] == 0.1  # default preserved
+        assert cfg["stale"]["effectiveness_threshold"] == 0.2  # default preserved
         assert cfg["similarity"]["enabled"] is False
         assert cfg["similarity"]["bm25_threshold"] == 0.6  # default preserved
 
@@ -467,15 +472,22 @@ class TestArchiveStaleAction:
         assert "bad_date" in empty_store.memories
 
     def test_effectiveness_below_threshold_triggers_archive(self, empty_store):
-        """Low effectiveness (even with recent access) triggers stale archive."""
+        """Low combined effectiveness (hit-rate x decay) triggers stale archive.
+
+        Combined score = factor() * decay_factor(); range ~0.15-1.0. A memory
+        is archived when it is both rarely referenced (low factor) AND long
+        untouched (low decay). Here: never referenced (factor=0.5) and last
+        touched ~120 days ago (decay floored at 0.3) -> 0.15, below threshold.
+        """
         from memory.curator.actions import ArchiveStale, CuratorContext
 
         empty_store.memories["low_eff"] = MockMemory(
             "low_eff", "low effectiveness memory", confidence="high"
         )
         empty_store.eff_data["low_eff"] = {
-            "last_accessed": _MOCK_TIME,
-            "effectiveness": 0.05,  # below default threshold 0.1
+            # ~120 days old so decay_factor() floors at 0.3; combined = 0.15
+            "last_accessed": _MOCK_TIME - 120 * 86400,
+            "effectiveness": 0.05,  # signals "low"; adapter maps to factor=0.5
         }
         ctx = CuratorContext(mem_store=empty_store)
         result = ArchiveStale().execute(ctx)

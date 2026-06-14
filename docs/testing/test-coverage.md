@@ -1,8 +1,8 @@
 # Test Coverage Documentation
 
-> Version: v1.7 release baseline (incl. round-3 functional audit fixes + A5 schema stability)
+> Version: v1.7 release baseline (incl. round-3 functional audit fixes + A5 schema stability, round-4 slash-command/graph/curator/stats fixes)
 > Last updated: 2026-06-14
-> Collection snapshot: `pytest tests --collect-only -q` -> **638 tests collected**
+> Collection snapshot: `pytest tests --collect-only -q` -> **647 tests collected**
 > Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.7 acceptance surfaces
 
 ---
@@ -29,7 +29,7 @@ auto-assigned per-file in `tests/conftest.py`:
 ### Quick selection commands
 
 ```powershell
-pytest tests/ -q                              # full suite (baseline: 638 passed)
+pytest tests/ -q                              # full suite (baseline: 647 passed)
 
 # by functional surface
 pytest -m "reflection"                        # all reflection pipelines
@@ -92,6 +92,7 @@ Intent note:
 | `test_dashboard_integration.py` | 5 | dashboard graph service resolution + real-graph endpoints (v1.7 regression) |
 | `test_e2e.py` | 6 | end-to-end lifecycle integration |
 | `test_entity_extraction.py` | 21 | entity index lifecycle, regex patterns, weight hierarchy |
+| `test_effectiveness_snapshot.py` | 8 | dual-track stats read path, compaction fold+truncate, tail merge, backward-compat (v1.7 round-4) |
 | `test_fusion_rerank.py` | 17 | recency, effectiveness, Hebbian boost, fusion |
 | `test_graph.py` | 17 | graph decay, distill, cross-zone, orphan cleanup |
 | `test_graph_distil_failure.py` | 1 | distil write failure exception handling |
@@ -255,7 +256,7 @@ pytest tests/ -m "v14_runtime or v14_entity" -q
 - **`pytest.ini`** (project root) is the source of truth for **marker registration** — it lists every functional / version / v1.4 marker so `pytest --markers` and `pytest -m "<expr>"` resolve cleanly.
 - **`tests/conftest.py`** is the source of truth for **automatic marker assignment** (`_FILE_MARKERS` per-file, plus `_V14_NODE_MARKERS` for node-level v1.4 overrides). When you add a test file, add it to `_FILE_MARKERS` so it joins a functional group.
 - **`tests/_helpers.py`** provides shared mock classes and test utilities (`make_memory`, `make_memory_with_id`, `MockStore`, …).
-- Latest coverage refresh: `pytest tests --collect-only -q` reports **638 collected tests**.
+- Latest coverage refresh: `pytest tests --collect-only -q` reports **647 collected tests**.
 - When adding new tests: classify them by functional surface first (add the file to `_FILE_MARKERS`); use a `v16` / `v17` marker only when the test is part of a versioned acceptance slice.
 - Keep this document aligned to collected reality. The minimum refresh is:
   1. rerun `pytest tests --collect-only -q`

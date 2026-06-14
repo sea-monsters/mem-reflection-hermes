@@ -189,7 +189,47 @@ class MockStore:
         return False
 
     def list_active_effectiveness(self) -> dict[str, dict[str, Any]]:
+        # Legacy hook retained for older callers; real stores no longer expose
+        # this. Prefer effectiveness(memory_id).
         return self.eff_data
+
+    def effectiveness(self, memory_id: str | None = None) -> dict[str, MemoryEffectiveness]:
+        """Mirror the real MemoryStore.efficiency() contract.
+
+        Tests populate self.eff_data with raw dicts like
+        {"last_accessed": <epoch>, "effectiveness": <0..1>}; we adapt those into
+        MemoryEffectiveness records so curator code can use the dataclass API
+        (eff.factor(), eff.last_event_at) just like production.
+        """
+        result: dict[str, MemoryEffectiveness] = {}
+        for mid, raw in self.eff_data.items():
+            raw = raw or {}
+            score = float(raw.get("effectiveness", 0.5))
+            # Reverse-engineer loaded/referenced so factor() reproduces score:
+            # factor() = 0.5 + 0.5*(referenced/loaded); pick loaded=2 so the
+            # ratio is exact when score is in (0.5, 1.0], else loaded large.
+            if score >= 0.5:
+                referenced = max(1, round((score - 0.5) * 2 * 2))
+                loaded = 2
+            else:
+                referenced = 0
+                loaded = 1
+            last_accessed = raw.get("last_accessed")
+            last_event_at = None
+            if last_accessed:
+                try:
+                    last_event_at = datetime.fromtimestamp(
+                        float(last_accessed), tz=timezone.utc
+                    ).isoformat()
+                except (TypeError, ValueError):
+                    last_event_at = None
+            result[mid] = MemoryEffectiveness(
+                loaded=loaded, referenced=referenced, accessed=0,
+                last_event_at=last_event_at,
+            )
+        if memory_id is not None:
+            return {memory_id: result.get(memory_id)} if memory_id in result else {}
+        return result
 
     def update(self, mem_id, body=None, zone=None, confidence=None,
                tags=None, pinned=None, supersedes=None):

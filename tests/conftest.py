@@ -68,6 +68,7 @@ _FILE_MARKERS = {
     # ── Curation & lifecycle ───────────────────────────────────────────
     "test_memory_curator.py": ("curator",),
     "test_curator_pipeline.py": ("curator", "integration"),
+    "test_effectiveness_snapshot.py": ("curator", "store", "v17"),
     "test_memory_events.py": ("curator", "events", "v16"),
     # ── Integration & host surfaces ────────────────────────────────────
     "test_bridge.py": ("bridge", "integration"),
@@ -238,6 +239,80 @@ def temp_graph():
     yield store
     store.close()
     _rmtree_safe(tmpdir)
+
+
+@pytest.fixture(autouse=True)
+def _reset_graph_singletons():
+    """Reset module-level graph singletons before each test.
+
+    runtime/graph.get_graph_manager_compat() and runtime/state._get_graph_mgr()
+    both cache a singleton GraphManagerCompat. Without a reset, a test that
+    populates graph state leaks into later tests (e.g. CleanOrphanEdges'
+    "no graph" path would see a non-empty singleton from a prior test). This
+    fixture clears those caches so every test starts from a clean graph state.
+
+    Scope: global autouse. We deliberately do NOT redirect HERMES_HOME here --
+    other tests (checkpoint persistence, reflect-log) depend on the real home
+    dir semantics, and a global env override broke them. The narrower
+    graph.db isolation that curator tests need is provided by
+    _isolated_curator_graph_db below (marker-scoped).
+    """
+    import mem_reflection_hermes.runtime.graph as _rt_graph
+    import mem_reflection_hermes.runtime.state as _rt_state
+
+    _rt_graph._graph_manager_compat = None
+    _rt_state._graph_mgr = None
+    yield
+    if _rt_graph._graph_manager_compat is not None:
+        try:
+            _rt_graph._graph_manager_compat.close()
+        except Exception:
+            pass
+        _rt_graph._graph_manager_compat = None
+    _rt_state._graph_mgr = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_curator_graph_db(request, monkeypatch, tmp_path):
+    """Isolate the graph manager for curator tests.
+
+    Curator's CleanOrphanEdges calls get_graph_manager_compat(), which returns
+    a process-wide singleton backed by the real ~/.hermes/memory/graph.db. That
+    singleton (and its db) persists across tests and even across runs, so a
+    prior test that wrote graph edges leaks into CleanOrphanEdges' "no graph"
+    assertions.
+
+    Rather than chasing the db path through several re-export layers (which
+    breaks depending on import order), we patch the resolver itself to build a
+    fresh GraphManagerCompat against a per-test temp db. Tests that need a
+    specific fake manager (e.g. test_counts_cleaned_edges_when_graph_available)
+    still monkeypatch get_graph_manager_compat themselves and override this.
+
+    Scope: tests marked "curator" only; other suites keep real home semantics.
+    """
+    markers = {m.name for m in request.node.iter_markers()}
+    if "curator" not in markers:
+        yield
+        return
+
+    import mem_reflection_hermes.runtime.graph as _rt_graph
+
+    db_path = tmp_path / "curator_graph.db"
+
+    def _fresh_isolated_manager(_db_path=None):
+        # Always rebuild against the isolated path so no state leaks in or out.
+        return _rt_graph.GraphManagerCompat(db_path)
+
+    # Patch BOTH the runtime.graph symbol (used by state._get_graph_mgr) and
+    # the curator.actions resolver, since they resolve via different paths.
+    monkeypatch.setattr(_rt_graph, "get_graph_manager_compat", _fresh_isolated_manager)
+    try:
+        import mem_reflection_hermes.memory.curator.actions as _cur_actions
+        monkeypatch.setattr(_cur_actions, "get_graph_manager_compat", _fresh_isolated_manager)
+    except Exception:
+        pass
+
+    yield
 
 
 @pytest.fixture
