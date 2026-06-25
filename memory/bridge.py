@@ -145,6 +145,7 @@ def _acquire_file_lock(path: Path) -> Optional[Any]:
             pass
     except Exception:
         fd.close()
+        logger.warning("File lock failed for %s", lock_path)
         return None
     return fd
 

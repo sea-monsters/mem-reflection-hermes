@@ -542,7 +542,7 @@ def _tool_srh_palace_rebalance(args: dict, **kwargs) -> str:
 
 
 def _tool_srh_palace_recall(args: dict, **kwargs) -> str:
-    """Search memories by topic, optionally scoped to a zone."""
+    """Recall memories by topic within a zone (palace navigation)."""
     query = args.get("topic", "")
     if not query:
         return _jd({"error": "topic is required"})

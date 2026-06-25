@@ -129,6 +129,19 @@ def _micro_reflection_enabled():
 
 
 def _scope_filters_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Optional[str]]]:
+    """Resolve scope filters from hook kwargs (triple fallback).
+
+    Resolution order:
+      1. Explicit ``scope_filters`` kwarg (canonical path).
+      2. ``ctx`` → ``scope_from_context()`` (session-level scope).
+      3. Direct ``user_id``/``agent_id``/``run_id`` kwargs (legacy).
+
+    ⚠️ Fallback 3 accepts ANY kwarg keys matching the scope field names.
+    If a hook caller passes an unrelated ``user_id`` (e.g. from a data
+    payload), it will be misinterpreted as a scope filter. This is a
+    known fragility — do not add new scope-like kwarg names without
+    review.
+    """
     explicit = kwargs.get("scope_filters")
     if explicit is not None:
         return normalize_scope_filters(explicit) or None
@@ -542,7 +555,7 @@ def _post_tool_call(**kwargs) -> None:
                     except Exception as _be:
                         logger.debug("Bridge Dir A failed: %s", _be)
         except Exception:
-            pass
+            logger.warning("Bridge Dir A sync failed", exc_info=True)
 
     # ── Effectiveness tracking (v0.16.0 enhanced) ─────────────────────────
     # Log slow operations (>10s) for diagnostics

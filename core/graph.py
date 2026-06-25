@@ -850,9 +850,20 @@ class GraphIndex:
             with self._lock:
                 conn = self._get_conn()
                 if not valid_ids:
-                    # Empty set means all rows are orphaned
+                    # Empty set means all rows are orphaned — log conspicuously
+                    # so accidental wipes (e.g. list_active() returns empty)
+                    # are not silent.
+                    logger.warning(
+                        "clean_orphan_edges called with empty valid_ids — "
+                        "all %d edges and %d graph_meta rows will be deleted",
+                        conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+                        conn.execute("SELECT COUNT(*) FROM graph_meta").fetchone()[0],
+                    )
                     deleted += conn.execute("DELETE FROM edges").rowcount
                     deleted += conn.execute("DELETE FROM graph_meta").rowcount
+                    # Also clean orphan typed_facts: remove rows whose
+                    # source_memory_id is no longer valid.
+                    deleted += conn.execute("DELETE FROM typed_facts").rowcount
                 else:
                     placeholders = ",".join("?" * len(valid_ids))
                     ids_list = list(valid_ids)
@@ -862,6 +873,11 @@ class GraphIndex:
                     ).rowcount
                     deleted += conn.execute(
                         f"DELETE FROM graph_meta WHERE memory_id NOT IN ({placeholders})",
+                        ids_list,
+                    ).rowcount
+                    deleted += conn.execute(
+                        "DELETE FROM typed_facts WHERE source_memory_id NOT IN "
+                        f"({placeholders})",
                         ids_list,
                     ).rowcount
                 conn.commit()

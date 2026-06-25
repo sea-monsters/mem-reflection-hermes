@@ -556,6 +556,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
         json.loads(s)
         return None
     except Exception:
+        logger.debug("_repair_truncated_json: plain load failed")
         pass
 
     repaired_full = _close_open_containers(s)
@@ -566,6 +567,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
                 json.loads(repaired_full)
                 return repaired_full
             except Exception:
+                logger.debug("_repair_truncated_json: repaired_full load failed")
                 pass
 
     for end in range(len(s) - 1, 0, -1):
@@ -581,6 +583,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
             json.loads(repaired)
             return repaired
         except Exception:
+            logger.debug("_repair_truncated_json: truncation prefix load failed")
             continue
     return None
 
@@ -600,6 +603,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
                 if isinstance(obj, dict):
                     return obj
             except Exception:
+                logger.debug("_parse_reflect_output: raw_decode failed at pos %d", i)
                 pass
         i += 1
     # Fallback: try the whole string
@@ -611,6 +615,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
             try:
                 return _json.loads(repaired)
             except Exception:
+                logger.debug("_parse_reflect_output: repaired load failed")
                 pass
         logger.warning("Reflection JSON parse failed: %s", first_err)
         return None
