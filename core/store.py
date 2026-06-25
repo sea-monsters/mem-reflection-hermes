@@ -268,7 +268,10 @@ def _file_flush_worker() -> None:
     while True:
         try:
             item = _write_queue.get(timeout=1)
+        except queue.Empty:
+            continue
         except Exception:
+            logger.warning("Flush worker error", exc_info=True)
             continue
         if item is None:
             break
@@ -1218,11 +1221,11 @@ class MemoryStore:
             self._search_index._graph = graph
             self._search_index.invalidate_cache()
 
-    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
-        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, filters=filters)
+    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None, filters: Optional[Dict[str, Optional[str]]] = None, **kwargs) -> List[LoadedMemory]:
+        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, filters=filters, **kwargs)
 
     def fusion_search(self, query: str, k: int = 5, zone: Optional[str] = None, include_history: bool = False, **kwargs) -> List[LoadedMemory]:
-        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, **kwargs)
+        return self.search(query, k=k, zone=zone, include_history=include_history, **kwargs)
 
     def fusion_search_explain(self, query: str, k: int = 5, zone: Optional[str] = None, include_history: bool = False, **kwargs) -> Dict[str, Any]:
         return self._get_search_index().search_explain(query, k=k, zone=zone, include_history=include_history, **kwargs)

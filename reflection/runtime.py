@@ -219,6 +219,10 @@ def _record_typed_fact_sidecar(
         if superseded_memory_ids:
             invalidate = getattr(graph, "invalidate_facts_for_memories", None)
             if invalidate is not None:
+                # Batch-invalidate all typed facts owned by superseded memories.
+                # If per-fact invalidation is needed later (invalidate one fact
+                # while keeping others from the same source), also available:
+                #   graph.invalidate_typed_fact(fact_id, invalidated_by=...)
                 invalidate(list(superseded_memory_ids), invalidated_by=fm.id)
     except Exception as e:
         logger.warning("Typed sidecar write failed for %s: %s", fm.id, e, exc_info=True)

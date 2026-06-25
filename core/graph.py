@@ -394,42 +394,95 @@ class GraphIndex:
             for r in rows
         ]
 
-    def _neighbors_raw(self, memory_id: str) -> List[Dict[str, Any]]:
-        """Unfiltered neighbor list for spreading activation."""
+    def _neighbors_for_spread(
+        self, memory_id: str, min_weight: float = 0.0, undirected: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Get neighbors for activation spreading.
+
+        Args:
+            memory_id: The source memory ID.
+            min_weight: Minimum edge weight to traverse.
+            undirected: If True, traverse edges in both directions.
+
+        Returns list of {target_id, weight, relation}.
+        """
         conn = self._get_conn()
+        if undirected:
+            rows = conn.execute(
+                """SELECT source_id, target_id, weight,
+                          COALESCE(relation, 'co_occurs') AS relation
+                   FROM edges
+                   WHERE (source_id = ? OR target_id = ?) AND weight >= ?""",
+                (memory_id, memory_id, min_weight),
+            ).fetchall()
+            result = []
+            for r in rows:
+                if r["source_id"] == memory_id:
+                    result.append(
+                        {"target_id": r["target_id"], "weight": r["weight"], "relation": r["relation"]}
+                    )
+                else:
+                    result.append(
+                        {"target_id": r["source_id"], "weight": r["weight"], "relation": r["relation"]}
+                    )
+            return result
         rows = conn.execute(
-            "SELECT target_id, weight FROM edges WHERE source_id = ?",
-            (memory_id,),
+            "SELECT target_id, weight, COALESCE(relation, 'co_occurs') AS relation "
+            "FROM edges WHERE source_id = ? AND weight >= ?",
+            (memory_id, min_weight),
         ).fetchall()
-        return [{"target_id": r["target_id"], "weight": r["weight"]} for r in rows]
+        return [{"target_id": r["target_id"], "weight": r["weight"], "relation": r["relation"]} for r in rows]
 
     # -- spreading activation (HeLa-Mem §3.4) --------------------------------
 
     def spread(
-        self, seed_ids: List[str], decay: float = 0.7, max_iter: int = 50, max_nodes: int = 1000
+        self,
+        seed_ids: List[str],
+        decay: float = 0.7,
+        max_iter: int = 50,
+        max_nodes: int = 1000,
+        min_weight: float = 0.0,
+        exclude_relations: Optional[Set[str]] = None,
+        undirected: bool = False,
     ) -> Dict[str, float]:
         """Fixed-point activation spreading from seed nodes.
 
         Returns {node_id: activation_score} for all reached nodes.
         Also increments the internal step counter for per-step decay.
+
+        Args:
+            seed_ids: Starting nodes.
+            decay: Propagation decay factor (0-1).
+            max_iter: Maximum iterations.
+            max_nodes: Cap on total activated nodes.
+            min_weight: Minimum edge weight to traverse.
+            exclude_relations: Set of relation types to skip (e.g. ``{"SUPERSEDES"}``).
+            undirected: If True, traverse edges in both directions.
         """
+        excluded = exclude_relations or set()
         activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
         for _ in range(max_iter):
             if len(activation) > max_nodes:
                 break
             new_act: Dict[str, float] = {}
+            delta = 0.0
             for nid, act in activation.items():
                 if act < 0.01:
                     continue
-                for neighbor in self._neighbors_raw(nid):
+                for neighbor in self._neighbors_for_spread(
+                    nid, min_weight=min_weight, undirected=undirected
+                ):
+                    if neighbor["relation"] in excluded:
+                        continue
                     propagated = act * decay * neighbor["weight"]
                     tid = neighbor["target_id"]
                     new_act[tid] = max(new_act.get(tid, 0.0), propagated)
-            activation.update(new_act)
-            delta = sum(
-                abs(new_act.get(nid, 0.0) - activation.get(nid, 0.0))
-                for nid in set(new_act) | set(activation)
-            )
+            for nid, score in new_act.items():
+                prev = activation.get(nid, 0.0)
+                new_val = max(prev, score)
+                if new_val != prev:
+                    delta += new_val - prev
+                activation[nid] = new_val
             if delta < 1e-4:
                 break
         self._step_counter += 1

@@ -277,38 +277,25 @@ class _GraphStoreShim:
         threshold: float = 1e-4,
         max_iter: Optional[int] = None,
     ) -> Dict[str, float]:
-        conn = self._conn()
+        """Activation spreading delegated to :meth:`GraphIndex.spread`.
+
+        The runtime layer adds BFS-style default iteration (max_depth × 10),
+        SUPERSEDES-relation exclusion, undirected traversal, seed filtering,
+        threshold gating, and capped results — all via optional parameters
+        on the core method.
+        """
         steps = max_iter if max_iter is not None else max_depth * 10
-        activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
-        for _ in range(max(1, steps)):
-            new_act: Dict[str, float] = {}
-            for nid, act in list(activation.items()):
-                if act < threshold:
-                    continue
-                rows = conn.execute(
-                    """SELECT source_id, target_id, relation, weight
-                       FROM edges
-                       WHERE (source_id = ? OR target_id = ?) AND weight >= ?""",
-                    (nid, nid, min_weight),
-                ).fetchall()
-                for r in rows:
-                    relation = r["relation"] or "co_occurs"
-                    if relation == "SUPERSEDES":
-                        continue
-                    neighbor = r["target_id"] if r["source_id"] == nid else r["source_id"]
-                    if neighbor in seed_ids:
-                        continue
-                    propagated = act * decay * float(r["weight"])
-                    new_act[neighbor] = max(new_act.get(neighbor, 0.0), propagated)
-            if not new_act:
-                break
-            delta = sum(new_act.values())
-            for nid, score in new_act.items():
-                activation[nid] = max(activation.get(nid, 0.0), score)
-            if delta < threshold:
-                break
+        raw = self._gi.spread(
+            seed_ids,
+            decay=decay,
+            max_iter=max(1, steps),
+            min_weight=min_weight,
+            exclude_relations={"SUPERSEDES"},
+            undirected=True,
+        )
+        # Remove seeds, sort desc, apply threshold + limit
         results: Dict[str, float] = {}
-        for nid, act in sorted(activation.items(), key=lambda x: -x[1]):
+        for nid, act in sorted(raw.items(), key=lambda x: -x[1]):
             if nid in seed_ids:
                 continue
             if act < threshold:
@@ -321,10 +308,8 @@ class _GraphStoreShim:
     def stats(self) -> dict:
         stats = self._gi.stats()
         stats["healthy"] = True
-        stats["nodes"] = stats.get("nodes", 0)
-        stats["edges"] = stats.get("edges", 0)
-        stats["node_count"] = stats["nodes"]
-        stats["edge_count"] = stats["edges"]
+        stats["node_count"] = stats.get("nodes", 0)
+        stats["edge_count"] = stats.get("edges", 0)
         return stats
 
     def _connect(self):
