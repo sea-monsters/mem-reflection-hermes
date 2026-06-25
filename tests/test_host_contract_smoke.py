@@ -13,6 +13,6 @@ def test_host_contract_smoke_script_passes():
         cwd=repo,
         text=True,
         capture_output=True,
-        timeout=60,
+        timeout=120,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

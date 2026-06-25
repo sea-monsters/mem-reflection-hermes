@@ -473,6 +473,8 @@ class MergeSimilar(CuratorAction):
                         if overlap >= bm25_threshold:
                             candidates.append((group[i].id(), group[j].id(), round(overlap, 3)))
                     except Exception:
+                        logger.debug("BM25 tokenization failed for pair (%s, %s)",
+                                      group[i].id(), group[j].id())
                         continue
 
         candidates.sort(key=lambda x: -x[2])

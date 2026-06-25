@@ -288,7 +288,7 @@ def _build_audit_entry(
 ) -> Dict[str, Any]:
     """Build a structured reflection audit entry for the reflect log.
 
-    decision values: accepted | rejected | conflicted | superseded | skipped
+    decision values: accepted | rejected | superseded | skipped
     """
     return {
         "candidate_id": candidate_id,

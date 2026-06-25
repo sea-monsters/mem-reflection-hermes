@@ -1,4 +1,11 @@
-"""conftest.py — Shared test fixtures for mem-reflection-hermes test suite."""
+"""conftest.py — Shared test fixtures for mem-reflection-hermes test suite.
+
+NOTE: Some test files load modules via importlib with unique names
+(e.g. _store_mod, _memory_store_module), creating SEPARATE singleton
+instances (_effectiveness_cache, _write_queue, etc.). Cross-instance
+state bugs are invisible to these tests. Fix: use canonical module
+names across all importlib loads.
+"""
 from __future__ import annotations
 
 import os

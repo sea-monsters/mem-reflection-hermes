@@ -250,6 +250,7 @@ class TestScopedSearch:
             return [0.0, 1.0]
 
         monkeypatch.setattr(_search_mod, "_embed_single", _fake_embed)
+        monkeypatch.setattr(_search_mod, "embeddings_enabled", lambda: True)
 
         # Out-of-scope memory is closer to the query vector
         fm_out = _fm_with_scope("m-emb-out", "relevant", user_id="u2")

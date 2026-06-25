@@ -958,6 +958,15 @@ class MemoryStore:
         return self.get(mem_id)
 
     def delete(self, scope: str, mem_id: str) -> bool:
+        """Delete a memory by ID.
+
+        .. caution::
+
+           Deletion is **permanent**. There is no undo or rollback mechanism
+           for memory writes. The file is removed from disk and the SQLite
+           index entry is deleted. Consider archiving via the curator or
+           marking as superseded instead of hard-deleting production data.
+        """
         with self._lock:
             conn = self._get_conn()
             was_in_transaction = conn.in_transaction

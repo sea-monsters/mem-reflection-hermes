@@ -182,6 +182,8 @@ def _prune_cold_store(mem_store, cap_mb: int) -> int:
             size = len(serialized.encode("utf-8"))
             entries_with_size.append((e, size))
         except Exception:
+            logger.debug("Cold store JSON serialization failed for entry %s",
+                          e.get("memory_id", "<unknown>"))
             continue
 
     entries_with_size.sort(key=lambda x: x[0].get("archived_at", ""))

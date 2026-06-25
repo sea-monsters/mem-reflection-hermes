@@ -668,7 +668,7 @@ async def list_reflection_audit(limit: int = Query(100, ge=1, le=1000), decision
 
     Args:
         limit: Maximum number of audit entries to return
-        decision: Filter by decision type (accepted, rejected, skipped, superseded, pending)
+        decision: Filter by decision type (accepted, rejected, skipped, superseded, pending_storage)
     """
     log_path = srh._plugin_data_dir() / "reflect-log.jsonl"
     audit_entries = []
