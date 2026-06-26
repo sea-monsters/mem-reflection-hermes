@@ -13,7 +13,11 @@ so existing imports continue to work.
 """
 from __future__ import annotations
 
+import json
 import logging
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -60,6 +64,10 @@ from .helpers import (
 from .report import _persist_report, generate_report
 
 logger = logging.getLogger(__name__)
+
+# P2-15: recovery journal lock guards concurrent curator runs writing to the
+# same plugin-wide recovery journal.
+_recovery_journal_lock = threading.Lock()
 
 __all__ = [
     # Entry point
@@ -120,6 +128,43 @@ def _ctx_scope_filters(ctx) -> Optional[Dict[str, Optional[str]]]:
     return scope_from_context(ctx)
 
 
+def _recovery_journal_path(mem_store) -> Path:
+    """Path for the curator recovery journal (JSONL) in plugin data dir."""
+    if hasattr(mem_store, "_test_data_dir"):
+        p = Path(mem_store._test_data_dir) / "memory"
+        p.mkdir(parents=True, exist_ok=True)
+        return p / "curator_recovery.jsonl"
+    try:
+        core_store = _lb_fn("mem_reflection_hermes.core.store") if _lb_fn is not None else None
+        if core_store is None:
+            core_store = _lb_fn("core.store") if _lb_fn is not None else None
+        if core_store is not None and hasattr(core_store, "plugin_data_dir"):
+            base = Path(core_store.plugin_data_dir())
+        else:
+            base = Path.home() / ".hermes" / "memory"
+    except Exception:
+        base = Path.home() / ".hermes" / "memory"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "curator_recovery.jsonl"
+
+
+def _append_recovery_entries(mem_store, entries: List[Dict[str, Any]]) -> None:
+    """Append recovery journal entries atomically; fail-open with a warning."""
+    if not entries:
+        return
+    path = _recovery_journal_path(mem_store)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _recovery_journal_lock:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                for entry in entries:
+                    record = dict(entry)
+                    record.setdefault("recorded_at", ts)
+                    f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except OSError as e:
+            logger.warning("Failed to write curator recovery journal to %s: %s", path, e)
+
+
 def _run_curator(
     ctx,
     mem_store,
@@ -128,10 +173,16 @@ def _run_curator(
 ) -> Dict[str, Any]:
     """Run the full curator pipeline. Called from on_session_end.
 
-    Fail-open: all curation failures are caught and logged.
+    Fail-open: all curation failures are caught and logged.  When
+    ``stop_on_error`` is enabled in curator config, the pipeline halts after
+    the first action failure to limit the non-transactional inconsistency
+    window.  A recovery journal captures the mutations performed by each
+    action so that a future run can reconcile partial state.
     """
     filters = normalize_scope_filters(filters) if filters is not None else _ctx_scope_filters(ctx)
     scope_label = "global_admin" if admin_global else ("scoped" if filters else "local_global")
+    cfg = _curator_config(mem_store)
+    stop_on_error = bool(cfg.get("stop_on_error", False))
     result: Dict[str, Any] = {
         "curator": True,
         "scope": scope_label,
@@ -146,10 +197,17 @@ def _run_curator(
         "orphan_edges": 0,
         "total_archived": 0,
         "errors": [],
+        "stop_on_error": stop_on_error,
     }
 
-    pipeline_ctx = CuratorContext(mem_store=mem_store, filters=filters, admin_global=admin_global)
+    pipeline_ctx = CuratorContext(
+        mem_store=mem_store,
+        filters=filters,
+        admin_global=admin_global,
+        stop_on_error=stop_on_error,
+    )
     action_results: List[CuratorResult] = []
+    recovery_entries: List[Dict[str, Any]] = []
 
     for action_cls in _ACTION_CLASSES:
         action = action_cls()
@@ -159,9 +217,20 @@ def _run_curator(
             r = action.execute(pipeline_ctx)
             action_results.append(r)
             pipeline_ctx.errors.extend(r.errors)
+            recovery_entries.extend(r.journal_entries)
         except Exception as e:
             pipeline_ctx.errors.append(f"{action.name}: {e}")
             logger.warning("Curator action %s failed: %s", action.name, e)
+            if stop_on_error:
+                logger.warning("Curator stop_on_error=True; halting pipeline after %s failure", action.name)
+                break
+
+    # Persist recovery journal so partial runs can be reconciled later.
+    if recovery_entries:
+        try:
+            _append_recovery_entries(mem_store, recovery_entries)
+        except Exception as e:
+            logger.warning("Curator recovery journal append failed: %s", e)
 
     # Aggregate
     result["stale"] = sum(r.archived for r in action_results if r.action_name == "ArchiveStale")
@@ -241,10 +310,24 @@ def scan_for_stale(mem_store) -> List[str]:
                 if last_access > 0 and (now - last_access) > stale_days * 86400:
                     is_stale = True
                 else:
-                    from .helpers import _load_effectiveness
-                    eff = _load_effectiveness(mem_store, mem.id())
-                    if eff and (eff.factor() * eff.decay_factor()) < eff_threshold:
+                    # P2-14: fall back to creation age when no stats exist.
+                    age_ts = 0.0
+                    created = getattr(mem.frontmatter, "created", None)
+                    if created:
+                        try:
+                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            age_ts = dt.timestamp()
+                        except (ValueError, TypeError):
+                            pass
+                    if age_ts > 0 and (now - age_ts) > stale_days * 86400:
                         is_stale = True
+                    else:
+                        from .helpers import _load_effectiveness
+                        eff = _load_effectiveness(mem_store, mem.id())
+                        if eff and (eff.factor() * eff.decay_factor()) < eff_threshold:
+                            is_stale = True
             if is_stale:
                 ids.append(mem.id())
     except Exception as e:

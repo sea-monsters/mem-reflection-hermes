@@ -48,10 +48,10 @@ Delete a memory by ID, or batch-delete by scope filters.
 
 ```python
 srh_memory_delete(id="mem_abc123", scope="user")
-srh_memory_delete(id="batch", filters={"run_id": "sess-001"})  # v1.6: batch delete
+srh_memory_delete(filters={"run_id": "sess-001"})  # v1.6: batch delete by scope
 ```
 
-**v1.6 batch delete**: When `filters` is provided, the tool deletes all memories matching the scope filter and returns `{deleted_count: N}`. The `id` field is still required in the schema for backward compatibility.
+**v1.6 batch delete**: When `filters` is provided, the tool deletes all memories matching the scope filter and ignores `id`. The response is `{success: true, deleted_count: N, id: null}`. For single-ID deletion the response is `{success: true|false, deleted_count: 1|0, id: "mem_abc123"}`. Both paths return the same key set.
 
 ### `srh_memory_history`
 
@@ -90,12 +90,12 @@ srh_palace_navigate(topic="editor preference", zone="work", limit=5, filters={"u
 Trigger reflection pipeline manually.
 
 ```python
-srh_reflect_now(messages=[...], mode="full")
-srh_reflect_now(messages=[...], mode="full", filters={"user_id": "u1"})
+srh_reflect_now(messages=[...])
+srh_reflect_now(messages=[...], filters={"user_id": "u1"})
 ```
 
-Modes: `full` (session-end structured summary), `micro` (per-turn background), `embedding` (vector-only, zero LLM).
-Use `filters` when you want the reflection write path to stay tenant-safe in hosted or multi-agent sessions.
+The reflection mode is chosen by plugin configuration (`auto`, `llm`, `embedding`, `raw_chunk`, or `hybrid`), not by this tool. `raw_chunk` stores up to 20 episode chunks per session; `embedding` is vector-only and zero-LLM.
+Use `filters` when you want the reflection write path to stay tenant-safe in hosted or multi-agent sessions. The response schema is normalized across modes: `mode`, `summary`, `accepted_memories`, `skill_candidates`, `conflicts`, `chunks_created`, `error`.
 
 ### `srh_compile_profile`
 
@@ -137,8 +137,11 @@ srh_associate(memory_ids=["mem_a", "mem_b"], relation="co_occurs")
 Retrieve associative neighbors (Hebbian co-activation propagation).
 
 ```python
-srh_graph_retrieve(seed_ids=["mem_a"], max_results=10, tier="rank")
+srh_graph_retrieve(memory_ids=["mem_a"], max_results=10, tier="rank")
+srh_graph_retrieve(memory_ids=["mem_a"], max_results=10, filters={"user_id": "u1"})  # v1.7: scope boundary
 ```
+
+> **Note**: `seed_ids` is deprecated and accepted only for backward compatibility. Use `memory_ids`. When `filters` is provided, graph traversal is restricted to memories matching the scope (tenant-safe retrieval).
 
 ### `srh_graph_stats`
 
@@ -154,7 +157,10 @@ Generate graph visualization data.
 
 ```python
 srh_graph_viz(format="adjacency", depth=2)
+srh_graph_viz(format="adjacency", depth=2, filters={"user_id": "u1"})  # v1.7: scope boundary
 ```
+
+> **v1.7 scope boundary**: `srh_graph_viz` also accepts optional `filters` to restrict returned nodes/edges to the active scope.
 
 ## Health Metrics (1)
 
@@ -187,7 +193,7 @@ Returns:
 | `srh_skill_query` | Skills | `runtime/tools.py` | Delegates to `_tool_srh_skill_search` |
 | `srh_compile_profile` | Profile | `runtime/tools.py` | v1.6: optional scope filters for per-tenant profile/palace/zone compilation |
 | `srh_associate` | Graph | `runtime/graph.py` | |
-| `srh_graph_retrieve` | Graph | `runtime/graph.py` | |
+| `srh_graph_retrieve` | Graph | `runtime/graph.py` | Use `memory_ids`; `seed_ids` is deprecated |
 | `srh_graph_stats` | Graph | `runtime/graph.py` | |
 | `srh_graph_viz` | Graph | `runtime/graph.py` | |
 | `srh_memory_health` | Health | `runtime/graph.py` | |

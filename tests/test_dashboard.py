@@ -17,7 +17,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -248,6 +248,57 @@ class TestMemoriesCRUD:
         data = resp.json()
         assert [m["user_id"] for m in data["memories"]] == ["u1"]
         assert [m["body"] for m in data["memories"]] == ["Scoped dashboard item u1"]
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_update_memory_returns_404_for_unknown_id(self, temp_dashboard):
+        client, store, graph = temp_dashboard
+        resp = client.put("/api/memories/does-not-exist", json={"body": "updated"})
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Memory not found"
+
+    @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+    def test_create_memory_auto_associate_caps_related(self, temp_dashboard):
+        client, store, graph = temp_dashboard
+        mod = sys.modules["dashboard_api"]
+
+        # Seed 30 related memories; the oldest half have older created timestamps.
+        for i in range(30):
+            if i < 15:
+                created = f"2026-01-{i+1:02d}T00:00:00Z"
+            else:
+                created = f"2026-06-{i-14:02d}T00:00:00Z"
+            fm = MemoryFrontmatter(
+                id=f"related-{i}", created=created, source="test",
+                confidence="medium", tags=["shared"]
+            )
+            store.put("user", fm, f"related memory {i}")
+
+        new_id = "new-shared-mem"
+        fm_new = MemoryFrontmatter(
+            id=new_id, created="2026-06-02T00:00:00Z", source="test",
+            confidence="medium", tags=["shared"]
+        )
+        store.put("user", fm_new, "new shared memory")
+
+        mock_gm = MagicMock()
+        mock_gm.associator.on_memory_coactivation.return_value = 0
+
+        with patch.object(mod, "_get_graph_interface", return_value=mock_gm), \
+             patch.object(
+                 sys.modules["mem_reflection_hermes"],
+                 "_tool_srh_memory_write",
+                 return_value=json.dumps({"id": new_id}),
+             ):
+            resp = client.post("/api/memories", json={"body": "new", "tags": ["shared"]})
+
+        assert resp.status_code == 200
+        assert mock_gm.associator.on_memory_coactivation.call_count == 1
+        coactivated = mock_gm.associator.on_memory_coactivation.call_args.args[0]
+        assert coactivated[0] == new_id
+        assert len(coactivated) == 1 + mod._MAX_AUTO_ASSOCIATE_RELATED
+        # Oldest memories should have been dropped by the recency cap.
+        assert "related-0" not in coactivated
+        assert "related-15" in coactivated
 
     @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
     def test_query_endpoint_scope_filter(self, temp_dashboard):

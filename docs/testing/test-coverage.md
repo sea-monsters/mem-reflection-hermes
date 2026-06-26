@@ -1,8 +1,8 @@
 # Test Coverage Documentation
 
-> Version: v1.7 release baseline (incl. round-3 functional audit fixes + A5 schema stability, round-4 slash-command/graph/curator/stats fixes)
-> Last updated: 2026-06-14
-> Collection snapshot: `pytest tests --collect-only -q` -> **647 tests collected**
+> Version: v1.7 release baseline (incl. round-3 functional audit fixes + A5 schema stability, round-4 slash-command/graph/curator/stats fixes, round-5 schema/graph/curator hardening)
+> Last updated: 2026-06-26
+> Collection snapshot: `pytest tests --collect-only -q` -> **686 tests collected**
 > Scope note: this document reflects the current pytest layout, marker taxonomy, and v1.7 acceptance surfaces
 
 ---
@@ -29,7 +29,7 @@ auto-assigned per-file in `tests/conftest.py`:
 ### Quick selection commands
 
 ```powershell
-pytest tests/ -q                              # full suite (baseline: 647 passed)
+pytest tests/ -q                              # full suite (baseline: 686 passed)
 
 # by functional surface
 pytest -m "reflection"                        # all reflection pipelines
@@ -39,7 +39,7 @@ pytest -m "scope"                             # scope filter + ScopeIntent
 pytest -m "supersedes"                        # semantic supersedes resolver
 
 # by version acceptance
-pytest -m "v17"                               # round-3 functional fixes + A5 schema stability
+pytest -m "v17"                               # round-3 functional fixes + A5 schema stability + round-4/5 hardening
 pytest -m "v16"                               # event ledger + scoped filters
 pytest -m "v14"                               # all v1.4 regression slices
 
@@ -60,7 +60,7 @@ pytest -m "integration and not slow"
 | `v14` | 55 | `scope` | 38 |
 | `config` | 36 | `bridge` | 35 |
 | `tools` | 31 | `context` | 29 |
-| `v17` | 24 | `dashboard` | 23 |
+| `v17` | 39 | `dashboard` | 23 |
 | `v16` | 23 | `contract` | 19 |
 | `cjk` | 16 | `compaction` | 14 |
 | `supersedes` | 11 | `extraction` | 7 |
@@ -87,35 +87,35 @@ Intent note:
 | `test_config.py` | 15 | typed config fallback and diagnostics |
 | `test_context.py` | 29 | context assembly, bundle split, compression |
 | `test_core_data.py` | 16 | frontmatter, effectiveness, lineage, atomic write |
-| `test_curator_pipeline.py` | 85 | composable curator actions, pipeline aggregation, report persistence, boundary/error isolation |
+| `test_curator_pipeline.py` | 93 | composable curator actions, pipeline aggregation, report persistence, boundary/error isolation, recovery journal, scan cap |
 | `test_dashboard.py` | 21 | dashboard API, curator/reflection endpoints, zones |
 | `test_dashboard_integration.py` | 5 | dashboard graph service resolution + real-graph endpoints (v1.7 regression) |
 | `test_e2e.py` | 6 | end-to-end lifecycle integration |
 | `test_entity_extraction.py` | 21 | entity index lifecycle, regex patterns, weight hierarchy |
-| `test_effectiveness_snapshot.py` | 8 | dual-track stats read path, compaction fold+truncate, tail merge, backward-compat (v1.7 round-4) |
+| `test_effectiveness_snapshot.py` | 13 | dual-track stats read path, compaction fold+truncate, tail merge, backward-compat, lock safety, dead-row GC (v1.7 round-4/5) |
 | `test_fusion_rerank.py` | 17 | recency, effectiveness, Hebbian boost, fusion |
-| `test_graph.py` | 17 | graph decay, distill, cross-zone, orphan cleanup |
+| `test_graph.py` | 19 | graph decay, distill, cross-zone, orphan cleanup, empty-set fail-safe, read-only spread |
 | `test_graph_distil_failure.py` | 1 | distil write failure exception handling |
 | `test_graph_operations.py` | 15 | compat graph CRUD, spread activation, PageRank |
 | `test_host_contract_smoke.py` | 1 | host contract and smoke script |
 | `test_hooks.py` | 19 | v0.16.0 enhanced hooks |
 | `test_lb.py` | 9 | late-binding helper, module resolution, fail-open |
 | `test_memory_curator.py` | 9 | legacy curator compatibility, cold-store lifecycle, restore |
-| `test_memory_events.py` | 23 | v1.6: event ledger ADD/UPDATE/DELETE/PIN/UNPIN/SUPERSEDE, query filters, atomicity, history |
+| `test_memory_events.py` | 24 | v1.6: event ledger ADD/UPDATE/DELETE/PIN/UNPIN/SUPERSEDE, query filters, atomicity, history, truncated-frontmatter hash |
 | `test_optional_deps.py` | 5 | optional dependency fallback paths |
-| `test_palace_recall.py` | 4 | palace recall zone filters, scoped fallback behavior, and schema-stable `graph_expanded` key |
+| `test_palace_recall.py` | 5 | palace recall zone filters, scoped fallback behavior, schema-stable `graph_expanded` key, unified read-zone return shape |
 | `test_reflect.py` | 23 | reflection engine, facts, logs, raw chunk |
-| `test_reflection.py` | 27 | runtime reflection, hook cadence, JSON repair |
+| `test_reflection.py` | 31 | runtime reflection, hook cadence, JSON repair, current-session exclusion in LLM/micro paths |
 | `test_reflection_refinement.py` | 7 | refined candidate extraction, kind vocabulary, LLM kind propagation |
 | `test_reflection_scope.py` | 4 | scope propagation across reflection, compaction, and manual reflection |
 | `test_reranker.py` | 13 | reranker abstraction and SearchIndex integration |
 | `test_reranker_exceptions.py` | 5 | reranker OOM/API failure fallbacks |
-| `test_runtime_graph_aliases.py` | 7 | runtime graph alias helpers and host-facing graph surfaces |
+| `test_runtime_graph_aliases.py` | 11 | runtime graph alias helpers and host-facing graph surfaces incl. scope boundary + deprecated `seed_ids` compat |
 | `test_runtime_import_hygiene.py` | 4 | runtime recovery, compile-profile, tool handler dispatch |
-| `test_schema_module.py` | 18 | runtime schema definitions, JSON schema validity |
-| `test_scope_filters.py` | 34 | scoped write/search/list/update/delete/explain, migration, NULL matching, ScopeIntent / GLOBAL_ONLY |
+| `test_schema_module.py` | 22 | runtime schema definitions, JSON schema validity, registration wiring, reflect-now response normalization |
+| `test_scope_filters.py` | 35 | scoped write/search/list/update/delete/explain, migration, NULL matching, ScopeIntent / GLOBAL_ONLY, `delete_by_filters` root guard |
 | `test_search.py` | 16 | RRF, MMR, conflict, explain, entity boost |
-| `test_semantic_supersedes.py` | 11 | semantic correction/merge/store/scope-split resolution + side-effect edges |
+| `test_semantic_supersedes.py` | 12 | semantic correction/merge/store/scope-split resolution + side-effect edges + partial-failure resilience |
 | `test_store.py` | 21 | rebuild/validate/prune, lineage, delete callbacks |
 | `test_store_module_split.py` | 11 | core module split, behavioral compatibility, backward compat |
 | `test_tool_handlers.py` | 9 | runtime tool lineage and write/read helpers |
@@ -155,7 +155,7 @@ Intent note:
 ## v1.7 Round-3 Acceptance Surface (`v17`)
 
 The round-3 functional audit (see `docs/dev/1.7/v1.7-round3-functional-audit.md`)
-landed five fixes plus one schema-stability fix, each with dedicated regression coverage tagged `v17`:
+landed five fixes plus one schema-stability fix, each with dedicated regression coverage tagged `v17`. Round-4 (slashcmd/graph/curator/stats) and Round-5 (2026-06-26 schema/graph/curator hardening) tests are also included under `v17`.
 
 | Fix | Marker files | New tests |
 |-----|--------------|----------|
@@ -165,9 +165,24 @@ landed five fixes plus one schema-stability fix, each with dedicated regression 
 | **P2-2** engine.py dead-import + CJK helper consolidation | (covered by `test_compaction.py` / `test_reflect.py`) | — |
 | **P2-3** ScopeIntent / GLOBAL_ONLY | `test_scope_filters.py::TestScopeIntent` | 10 cases incl. `test_list_with_global_only_returns_only_null_scope_rows` |
 | **A5** palace_recall schema stability | `test_palace_recall.py` | `test_scoped_recall_emits_stable_graph_expanded_key` |
+| **R5-1** graph feature registration | `test_schema_module.py` | `test_register_wires_graph_manager_getter_for_hooks`, `test_register_graph_features_is_idempotent` |
+| **R5-2** `srh_graph_retrieve` `seed_ids` compat | `test_runtime_graph_aliases.py`, `test_schema_module.py` | `test_srh_graph_retrieve_seed_ids_backward_compat`, `test_graph_retrieve_schema_accepts_deprecated_seed_ids`, `test_graph_retrieve_schema_requires_memory_ids_when_seed_ids_missing` |
+| **R5-3** `MergeSimilar` 500 cap | `test_curator_pipeline.py` | `test_scan_for_similar_caps_at_500_memories` |
+| **R5-4** stats compaction lock safety | `test_effectiveness_snapshot.py` | `test_compaction_holds_lock_against_concurrent_appends` |
+| **R5-5** deprecated SQLite stats forward | `test_effectiveness_snapshot.py` | `test_deprecated_store_methods_effectiveness_forwards_to_jsonl`, `test_deprecated_store_methods_record_stat_forwards_to_jsonl` |
+| **R5-7** orphan cleanup empty-set guard | `test_graph.py` | `test_empty_valid_ids_is_noop` |
+| **R5-8** graph scope boundary | `test_runtime_graph_aliases.py` | `test_srh_graph_retrieve_filters_by_scope`, `test_srh_graph_viz_filters_by_scope` |
+| **R5-9** semantic sidecar partial failure | `test_semantic_supersedes.py` | `test_record_semantic_relation_sidecar_continues_on_partial_failure` |
+| **R5-10** reflection current-session exclusion | `test_reflection.py` | `test_full_reflection_excludes_current_session_ids_from_conflict_check`, `test_micro_reflection_excludes_current_session_ids_from_conflict_check` |
+| **R5-12** reflect-now response normalization | `test_schema_module.py` | `test_raw_chunk_response_has_same_keys_as_llm_response`, `test_llm_response_fills_missing_defaults` |
+| **R5-14** ArchiveStale age fallback | `test_curator_pipeline.py` | `test_archives_by_created_when_no_effectiveness` |
+| **R5-15** curator recovery journal | `test_curator_pipeline.py` | `test_stop_on_error_halts_after_first_action_failure`, `test_recovery_journal_contains_mutation_entries`, `test_recovery_journal_empty_when_no_mutations` |
+| **R5-16** effectiveness dead-row GC | `test_effectiveness_snapshot.py` | `test_compaction_removes_dead_rows` |
+| **R5-18** event frontmatter hash | `test_memory_events.py` | `test_event_json_truncation_preserves_hash` |
+| **R5-19** read-only spread / step counter | `test_graph.py` | `test_read_only_spread_does_not_increment_step_counter`, `test_spread_allowed_nodes_restricts_activation` |
 
 ```powershell
-pytest -m "v17"          # 24 tests across the five round-3 fixes + A5 schema stability
+pytest -m "v17"          # 39 tests across round-3, round-4, and round-5 acceptance surfaces
 ```
 
 ## v1.4 & v1.5 Acceptance Surface
@@ -220,26 +235,26 @@ pytest tests/ -m "v14_runtime or v14_entity" -q
 - `test_compaction.py`: episode clustering, scored fallback summarisation, token accounting, quality-gated LLM fallback, idempotency, return-shape guarantees.
 
 ### Graph and sidecar surfaces
-- `test_graph.py`: graph decay, distillation, cross-zone analysis, orphan-edge cleanup.
+- `test_graph.py`: graph decay, distillation, cross-zone analysis, orphan-edge cleanup, empty-set fail-safe, read-only spread activation.
 - `test_graph_operations.py`: compatibility graph CRUD, spread activation, PageRank, thread-safe reads.
 - `test_graph_distil_failure.py`: distil write failure exception handling.
-- `test_runtime_graph_aliases.py`: runtime graph alias helpers and host-facing graph surfaces.
+- `test_runtime_graph_aliases.py`: runtime graph alias helpers and host-facing graph surfaces, `seed_ids` deprecation compatibility, scope boundary filtering.
 - `test_typed_fact_sidecar.py`: typed fact sidecar persistence, **batch invalidation** (`invalidate_facts_for_memories`), entity mentions, and the compaction end-to-end invalidation path.
 
 ### Context, runtime, and config
 - `test_context.py`: classic string assembly, `ContextBundle` stable/dynamic split, token-budget pressure, compression-level diagnostics.
-- `test_hooks.py`: v0.16.0 enhanced hooks (`api_error`, `subagent_start/stop`, `session_reset`).
+- `test_hooks.py`: v0.16.0 enhanced hooks (`api_error`, `subagent_start/stop`, `session_reset`), scope filter kwarg deprecation guard.
 - `test_runtime_import_hygiene.py`: runtime recovery, compile-profile late-binding, tool handler dispatch.
 - `test_checkpoint.py` / `test_checkpoint_backup_failure.py`: atomic write, corrupt-checkpoint backup, pending-work recovery, backup failure edge.
 - `test_config.py` / `test_optional_deps.py`: typed config model, diagnostics, feature flags, optional-dependency fallbacks.
 - `test_backend.py`: backend capability abstraction.
-- `test_schema_module.py`: runtime schema/registration contracts.
+- `test_schema_module.py`: runtime schema/registration contracts, graph feature registration wiring, reflect-now response normalization, `seed_ids` schema compatibility.
 - `test_lb.py`: late-binding and standalone loading safety.
 
 ### Curation and lifecycle
-- `test_curator_pipeline.py`: canonical v1.5 curator action pipeline, orchestration, side effects, boundary handling.
+- `test_curator_pipeline.py`: canonical v1.5 curator action pipeline, orchestration, side effects, boundary handling, recovery journal, `stop_on_error`, `MergeSimilar` 500-memory cap, ArchiveStale age fallback.
 - `test_memory_curator.py`: legacy-compatible curator behavior, cold-store lifecycle, restore, no-graph cleanup.
-- `test_memory_events.py`: v1.6 event ledger ADD/UPDATE/DELETE/PIN/UNPIN/SUPERSEDE, query filters, atomicity, history.
+- `test_memory_events.py`: v1.6 event ledger ADD/UPDATE/DELETE/PIN/UNPIN/SUPERSEDE, query filters, atomicity, history, truncated-frontmatter hash.
 
 ### Integration and host surfaces
 - `test_bridge.py`: host bridge mirroring in both directions, duplicate handling, capacity checks, tool-output cleanup.
@@ -256,7 +271,7 @@ pytest tests/ -m "v14_runtime or v14_entity" -q
 - **`pytest.ini`** (project root) is the source of truth for **marker registration** — it lists every functional / version / v1.4 marker so `pytest --markers` and `pytest -m "<expr>"` resolve cleanly.
 - **`tests/conftest.py`** is the source of truth for **automatic marker assignment** (`_FILE_MARKERS` per-file, plus `_V14_NODE_MARKERS` for node-level v1.4 overrides). When you add a test file, add it to `_FILE_MARKERS` so it joins a functional group.
 - **`tests/_helpers.py`** provides shared mock classes and test utilities (`make_memory`, `make_memory_with_id`, `MockStore`, …).
-- Latest coverage refresh: `pytest tests --collect-only -q` reports **647 collected tests**.
+- Latest coverage refresh: `pytest tests --collect-only -q` reports **686 collected tests**.
 - When adding new tests: classify them by functional surface first (add the file to `_FILE_MARKERS`); use a `v16` / `v17` marker only when the test is part of a versioned acceptance slice.
 - Keep this document aligned to collected reality. The minimum refresh is:
   1. rerun `pytest tests --collect-only -q`

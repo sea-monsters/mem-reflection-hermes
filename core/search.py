@@ -779,10 +779,26 @@ class SearchIndex:
         # Formula: S(v_j) = S_base(v_j) + β · Σ_{i∈N(j)} S_base(v_i) · w_ij
         # We approximate the sum term via graph.spread() and scale it to the
         # same magnitude as the max rerank score so the two signals are comparable.
+        #
+        # Search-time expansion is read-only: it must not advance the graph step
+        # counter (which drives per-step decay) and must stay within the in-scope
+        # candidate set to avoid cross-scope leakage.
         if hebbian_beta > 0 and self._graph is not None:
             try:
                 pool_ids = [mid for mid in fused_scores]
-                activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
+                allowed_nodes = set(active_map.keys())
+                try:
+                    activation = self._graph.spread(
+                        pool_ids,
+                        decay=0.7,
+                        max_iter=30,
+                        increment_step=False,
+                        allowed_nodes=allowed_nodes,
+                    )
+                except TypeError:
+                    # Backward-compat: injected graph stubs may not accept the
+                    # read-only / scope-bound keyword arguments.
+                    activation = self._graph.spread(pool_ids, decay=0.7, max_iter=30)
                 scale = max_rerank_score if max_rerank_score > 0 else 0.0
                 # Merge graph-only neighbors into the rerank pool so strongly
                 # associated but semantically distant memories are recoverable.

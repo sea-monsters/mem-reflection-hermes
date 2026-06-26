@@ -84,7 +84,7 @@ class TestPalaceRecallZoneFilter:
             lambda result_mids, out, k, zone_filter=None: {"results": out},
         )
         # Patch record_memory_stat to no-op
-        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+        monkeypatch.setattr(_tools_mod, "batch_record_stats", lambda entries: None)
 
         args = {
             "topic": "apple banana cherry",
@@ -116,7 +116,7 @@ class TestPalaceRecallZoneFilter:
             "_enrich_with_graph",
             lambda result_mids, out, k, zone_filter=None: {"results": out},
         )
-        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+        monkeypatch.setattr(_tools_mod, "batch_record_stats", lambda entries: None)
 
         args = {
             "topic": "apple banana cherry",
@@ -142,7 +142,7 @@ class TestPalaceRecallZoneFilter:
             "_enrich_with_graph",
             lambda result_mids, out, k, zone_filter=None: {"results": out},
         )
-        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+        monkeypatch.setattr(_tools_mod, "batch_record_stats", lambda entries: None)
         # _normalize_zone maps unknown zones to "general", so patch it to preserve the test zone
         monkeypatch.setattr(_tools_mod, "_normalize_zone", lambda z: z)
 
@@ -172,7 +172,7 @@ class TestPalaceRecallZoneFilter:
             "_enrich_with_graph",
             lambda result_mids, out, k, zone_filter=None: {"results": out},
         )
-        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+        monkeypatch.setattr(_tools_mod, "batch_record_stats", lambda entries: None)
 
         result_json = _tools_mod._tool_srh_palace_recall({
             "topic": "apple",
@@ -201,7 +201,7 @@ class TestPalaceRecallZoneFilter:
             "_enrich_with_graph",
             lambda *a, **k: pytest.fail("_enrich_with_graph must not run with active filters"),
         )
-        monkeypatch.setattr(_tools_mod, "record_memory_stat", lambda mid, event: None)
+        monkeypatch.setattr(_tools_mod, "batch_record_stats", lambda entries: None)
 
         result = json.loads(_tools_mod._tool_srh_palace_recall({
             "topic": "apple",

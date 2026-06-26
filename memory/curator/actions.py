@@ -72,6 +72,8 @@ except ImportError:
             merged: int = 0
             similar_pairs: int = 0
             orphan_edges: int = 0
+            typed_facts_deleted: int = 0
+            journal_entries: List[Dict[str, Any]] = field(default_factory=list)
             errors: List[str] = field(default_factory=list)
 
         def _curator_config(mem_store):  # type: ignore[no-redef]
@@ -88,6 +90,8 @@ except ImportError:
                     "llm_merge": False,
                 },
                 "cold_storage": {"enabled": True, "max_archive_size_mb": 10},
+                "gc": {"typed_fact_retention_days": 30},
+                "stop_on_error": False,
             }
 
         # Assign as lambdas so AST scans see exactly one FunctionDef per name.
@@ -158,20 +162,43 @@ class ArchiveStale(CuratorAction):
                 if last_access > 0 and (now - last_access) > stale_days * 86400:
                     is_stale = True
                 else:
-                    eff = None
-                    try:
-                        from .helpers import _load_effectiveness
-                        eff = _load_effectiveness(mem_store, mid)
-                    except Exception as e:
-                        logger.debug("ArchiveStale: could not load effectiveness for %s: %s", mid, e)
-                    if eff:
-                        # Combined effectiveness score: hit-rate (factor, 0.5-1.0)
-                        # weighted by time-decay (decay_factor, 0.3-1.0). Range
-                        # ~0.15-1.0. A memory is stale when it is both rarely
-                        # referenced AND long untouched.
-                        score = eff.factor() * eff.decay_factor()
-                        if score < eff_threshold:
-                            is_stale = True
+                    # P2-14: memories that pre-date the stats pipeline (or were
+                    # created without recorded stats) would otherwise become
+                    # immortal. Fall back to frontmatter.created or the file mtime
+                    # when there is no last_access signal.
+                    age_ts = 0.0
+                    created = getattr(fm, "created", None)
+                    if created:
+                        try:
+                            from datetime import datetime, timezone
+                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            age_ts = dt.timestamp()
+                        except (ValueError, TypeError):
+                            pass
+                    if age_ts == 0 and getattr(mem, "source_path", None):
+                        try:
+                            age_ts = mem.source_path.stat().st_mtime
+                        except OSError:
+                            pass
+                    if age_ts > 0 and (now - age_ts) > stale_days * 86400:
+                        is_stale = True
+                    else:
+                        eff = None
+                        try:
+                            from .helpers import _load_effectiveness
+                            eff = _load_effectiveness(mem_store, mid)
+                        except Exception as e:
+                            logger.debug("ArchiveStale: could not load effectiveness for %s: %s", mid, e)
+                        if eff:
+                            # Combined effectiveness score: hit-rate (factor, 0.5-1.0)
+                            # weighted by time-decay (decay_factor, 0.3-1.0). Range
+                            # ~0.15-1.0. A memory is stale when it is both rarely
+                            # referenced AND long untouched.
+                            score = eff.factor() * eff.decay_factor()
+                            if score < eff_threshold:
+                                is_stale = True
 
             if is_stale:
                 stale_ids.append(mid)
@@ -184,6 +211,12 @@ class ArchiveStale(CuratorAction):
             success, err = archive_and_delete(mem_store, mem, entry, "stale")
             if success:
                 result.archived += 1
+                result.journal_entries.append({
+                    "action": "archive",
+                    "memory_id": mid,
+                    "context_tag": "stale",
+                    "scope_label": getattr(ctx, "scope_label", "local_global"),
+                })
             elif err:
                 result.errors.append(f"archive {mid}: {err}")
 
@@ -265,6 +298,13 @@ class CompactChains(CuratorAction):
                     success, err = archive_and_delete(mem_store, mem, entry, "compacted")
                     if success:
                         result.compacted += 1
+                        result.journal_entries.append({
+                            "action": "compact",
+                            "memory_id": mid,
+                            "context_tag": "compacted",
+                            "chain": list(chain),
+                            "scope_label": getattr(ctx, "scope_label", "local_global"),
+                        })
                     elif err:
                         result.errors.append(f"compact {mid}: {err}")
 
@@ -373,6 +413,13 @@ class ArchiveSuperseded(CuratorAction):
                 success, err = archive_and_delete(mem_store, mem, entry, "superseded")
                 if success:
                     result.archived += 1
+                    result.journal_entries.append({
+                        "action": "archive",
+                        "memory_id": mid,
+                        "context_tag": "superseded",
+                        "chain_depth": len(chain),
+                        "scope_label": getattr(ctx, "scope_label", "local_global"),
+                    })
                 elif err:
                     result.errors.append(f"archive {mid}: {err}")
 
@@ -419,9 +466,6 @@ class MergeSimilar(CuratorAction):
                 getattr(fm, "agent_id", None),
                 getattr(fm, "run_id", None),
             )
-        scope_groups: Dict[Tuple, List] = {}
-        for m in all_active:
-            scope_groups.setdefault(_scope_key(m), []).append(m)
 
         def _sort_key(m):
             mem_id = m.id()
@@ -440,6 +484,9 @@ class MergeSimilar(CuratorAction):
                 logger.debug("MergeSimilar sort key failed for %s: %s", mem_id, e)
             return (1, getattr(m.frontmatter, "created", ""))
 
+        # Apply the advertised 500-memory cap BEFORE building scope groups.
+        # The original code built groups from the full list and then sliced,
+        # making the cap dead code and the scan O(n²) over the entire store.
         try:
             all_active = sorted(all_active, key=_sort_key)[:500]
         except Exception:
@@ -449,6 +496,13 @@ class MergeSimilar(CuratorAction):
                 key=lambda m: getattr(getattr(m, "frontmatter", None), "created", ""),
                 reverse=True,
             )[:500]
+
+        if len(all_active) > 400:
+            logger.debug("MergeSimilar capped scan to %d most-recent memories", len(all_active))
+
+        scope_groups: Dict[Tuple, List] = {}
+        for m in all_active:
+            scope_groups.setdefault(_scope_key(m), []).append(m)
 
         tokenise = self._tokenise_fn(mem_store)
         candidates: List[Tuple[str, str, float]] = []
@@ -508,6 +562,12 @@ class MergeSimilar(CuratorAction):
                     success, err = archive_and_delete(mem_store, to_archive, entry, "dedup")
                     if success:
                         result.merged += 1
+                        result.journal_entries.append({
+                            "action": "dedup",
+                            "memory_id": to_archive.id(),
+                            "context_tag": "dedup",
+                            "scope_label": getattr(ctx, "scope_label", "local_global"),
+                        })
                     elif err:
                         result.errors.append(f"dedup {to_archive.id()}: {err}")
                     continue
@@ -540,6 +600,13 @@ class MergeSimilar(CuratorAction):
                 success, err = archive_and_delete(mem_store, archived, entry, "merged")
                 if success:
                     result.merged += 1
+                    result.journal_entries.append({
+                        "action": "merge",
+                        "memory_id": archived.id(),
+                        "keeper_id": keeper.id(),
+                        "context_tag": "merged",
+                        "scope_label": getattr(ctx, "scope_label", "local_global"),
+                    })
                 elif err:
                     result.errors.append(f"merge {archived.id()}: {err}")
 
@@ -595,6 +662,19 @@ class CleanOrphanEdges(CuratorAction):
         try:
             all_ids = {m.id() for m in ctx.list_active()}
             result.orphan_edges = gm.store.clean_orphan_edges(all_ids)
+            if result.orphan_edges > 0:
+                result.journal_entries.append({
+                    "action": "clean_orphan_edges",
+                    "count": result.orphan_edges,
+                    "scope_label": getattr(ctx, "scope_label", "local_global"),
+                })
+            # P2-4: prune invalidated typed facts older than the configured retention.
+            retention_days = (
+                _curator_config(mem_store)
+                .get("gc", {})
+                .get("typed_fact_retention_days", 30)
+            )
+            result.typed_facts_deleted = gm.store._gi.compact_typed_facts(retention_days)
         except Exception as e:
             result.errors.append(f"clean_orphan_edges: {e}")
             logger.warning("Curator orphan edge cleanup failed: %s", e)

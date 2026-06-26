@@ -46,7 +46,7 @@
 - **Recovery callback compatibility**: runtime import-hygiene tests now accept scoped recovery kwargs, matching the current checkpoint recovery contract.
 - **Scoped compaction boundary**: reflection scope tests now assert that compacting one tenant scope does not supersede another scope's raw episodes.
 - **Coverage index sync**: `docs/testing/test-coverage.md` has been synchronized with the current `638` collected tests and v1.7 acceptance surfaces.
-- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `638 passed`.
+- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `686 passed` (includes 2026-06-26 round-5 fixes).
 - **Test grouping simplification**: markers are now registered in `pytest.ini` and auto-assigned per-file in `tests/conftest.py`; new `v17` group covers the round-3 functional fixes (typed sidecar invalidation, semantic supersedes merge/scope_split, kind typing, ScopeIntent). Marker coverage closed for the 11 previously-untagged test files.
 
 ### Round-3 Functional Fixes (`v17`)
@@ -58,6 +58,45 @@
 - **P2-3 ScopeIntent**: `core/scope.py` introduces `ScopeIntent` (UNSCOPED/TENANT/GLOBAL_ONLY) and `global_only_scope()` so the IS NULL intent is finally expressible; `None`/`{}` semantics unchanged for backward compatibility.
 - **A5 palace_recall schema stability**: `runtime/tools.py::_tool_srh_palace_recall` now returns `graph_expanded: []` in scoped mode to keep the response schema stable; `tests/test_palace_recall.py` locks the regression.
 - **Regression coverage**: 20 new tests (suite 617 -> 638); see `docs/dev/1.7/v1.7-round3-functional-audit.md`.
+
+### Round-4 P3 Root-Cause Fixes
+
+- **P3-1 batch stats recording**: `record_memory_stat()` loops in `runtime/tools.py` and `runtime/hooks.py` are now batched through `batch_record_stats()` to reduce lock churn and make the batch API actually used in production.
+- **P3-2 async write fallback failure propagation**: `core/store.py::async_write_memory()` now raises `RuntimeError` when the synchronous fallback fails, instead of silently logging a warning.
+- **P3-3 frontmatter version preservation**: `MemoryFrontmatter.version` is now serialized by `serialize_frontmatter()` and `_frontmatter_to_data()`, surviving disk round-trips.
+- **P3-4 MockStore scope parity**: `tests/_helpers.py::MockStore.list()` now filters through `core.scope.filter_memories_by_scope()` so tests mirror production scope semantics.
+- **P3-5 scope_split fact invalidation**: `_record_semantic_relation_sidecar()` now invalidates target-memory typed facts for `scope_split` as well as `merge`.
+- **P3-6 pending-skills archive retention**: old `pending-skills.<timestamp>.json` archives are pruned after 30 days or when more than 10 archives accumulate.
+- **P3-7 raw_chunk per-session cap**: `_run_raw_chunk_reflection()` now limits raw-chunk episode memories to 20 per session (configurable via `plugin_config().reflection.max_raw_chunk_per_session`).
+- **P3-8 atomic cold-store prune**: `memory/curator/cold_store.py::_prune_cold_store()` rewrites the cold store atomically via temp-file + `os.replace()`.
+- **P3-9 dashboard update 404**: `web/api.py::update_memory()` now returns HTTP 404 instead of 500 for non-existent memory IDs.
+- **P3-10 capped auto-association**: `web/api.py::create_memory()` caps graph auto-association to the 20 most recent tag-overlapping memories.
+- **Regression coverage**: 9 new tests; full-suite baseline moves to 656 passed.
+
+### Round-5 Schema / Graph / Curator Hardening (2026-06-26)
+
+Triggered by a systematic-debugging review of the latest v1.7 beta fixes. All items below are confirmed by new regression tests; full-suite baseline is **686 passed**.
+
+- **R5-1 graph feature registration wired**: `runtime/registration.py::register()` now calls `runtime/graph.py::register_graph_features()` so the `/graph` slash command, graph lifecycle hook, and hook-side graph manager getter are actually registered. `register_graph_features()` uses a context-idempotency guard to avoid duplicate registration.
+- **R5-2 `srh_graph_retrieve` parameter compatibility**: the handler now accepts both `memory_ids` (canonical) and the deprecated `seed_ids`; passing `seed_ids` alone logs a deprecation warning. The schema uses `anyOf` to keep old clients valid.
+- **R5-3 `MergeSimilar` scan cap restored**: `_scan_for_similar()` now sorts and slices active memories to the intended 500 most-recent before grouping by scope, fixing the O(n²) regression introduced in v1.6.
+- **R5-4 stats compaction concurrency safety**: `memory/curator/helpers.py::compact_stats_snapshot()` holds `_stat_write_lock` from snapshot load through stream truncate, preventing event loss from concurrent `record_memory_stat()` writes.
+- **R5-5 SQLite stats dead path deprecated**: `core/store_methods.py::effectiveness()` and `record_stat()` now forward to the JSONL truth path (`store.effectiveness()` / `record_memory_stat()`) and emit `DeprecationWarning`; the SQLite `stats` table DDL is kept only for existing databases.
+- **R5-6 `srh_memory_delete` return shape unified**: single-ID and filter-batch paths now both return `{success, id, deleted_count}`.
+- **R5-7 orphan-edge cleanup fail-safe**: `GraphIndex.clean_orphan_edges()` treats an empty `valid_ids` set as a caller error and returns 0 instead of wiping the whole graph.
+- **R5-8 graph scope boundary filtering**: `srh_graph_retrieve` and `srh_graph_viz` accept optional `filters`; graph traversal is restricted to nodes in the active scope (`allowed_nodes`) so Hebbian retrieval does not leak across tenants. `_GraphStoreShim.spread_activation()` / `propagate_activation()` and `GraphManagerCompat.retrieve_related()` / `propagate_activation()` propagate `allowed_nodes`.
+- **R5-9 semantic sidecar partial-failure resilience**: `_record_semantic_relation_sidecar()` in `reflection/runtime.py` now tries every target individually, collects failures, and logs warnings instead of silently stopping on the first error.
+- **R5-10 reflection excludes current session IDs in LLM/micro paths**: `_run_full_reflection()` and `_run_micro_reflection()` now pass `current_session_ids` as `exclude_ids` to novelty/conflict checks in the LLM branch, matching the embedding path.
+- **R5-11 `ReflectionEngine` scope-aware**: `ReflectionEngine.__init__` accepts optional `scope_filters` and stamps `user_id`/`agent_id`/`run_id` onto newly created memories in `micro()`/`full()`.
+- **R5-12 `srh_reflect_now` response normalization**: `_tool_srh_reflect_now()` post-processes `_run_full_reflection()` results so the returned JSON always contains `{mode, summary, accepted_memories, skill_candidates, conflicts, chunks_created, error}`, regardless of reflection mode.
+- **R5-13 palace read-zone return shape unified**: `_tool_srh_palace_read_zone` now returns a single schema `{zone, source, count, memories, content, message}` across all branches.
+- **R5-14 ArchiveStale age fallback**: when a memory has no effectiveness or `last_access` record, `ArchiveStale` now falls back to `frontmatter.created` and then file mtime for staleness decisions.
+- **R5-15 curator recovery journal**: `memory/curator/__init__.py::_run_curator()` writes a `curator_recovery.jsonl` with mutation entries and supports a `curator.stop_on_error` config flag to halt the pipeline on first failure.
+- **R5-16 effectiveness snapshot GC**: `compact_stats_snapshot()` removes snapshot rows for memory IDs that no longer exist in the store.
+- **R5-17 `_scope_filters_from_kwargs` deprecation guard**: legacy bare `user_id`/`agent_id`/`run_id` kwargs to lifecycle hooks still work but now emit a `DeprecationWarning`; explicit `scope_filters` dict is preferred.
+- **R5-18 memory-event truncation auditability**: `core/store.py::_event_json()` now records an `_original_frontmatter_hash` when frontmatter is truncated to >8KB, preserving a verifiable link to the original event payload.
+- **R5-19 spread_activation / decay counter decoupled**: `GraphIndex.spread()` gains `increment_step=False` and `allowed_nodes` parameters; search-time Hebbian boost calls it with `increment_step=False` so retrieval no longer advances the decay step counter.
+- **Regression coverage**: ~30 new tests across `test_schema_module.py`, `test_runtime_graph_aliases.py`, `test_curator_pipeline.py`, `test_effectiveness_snapshot.py`, `test_graph.py`, `test_reflection.py`, `test_semantic_supersedes.py`, and `test_memory_events.py`; full-suite baseline moves to 686 passed.
 
 ### Round-4 Slash-Command / Graph / Curator / Stats Fixes (`v17`)
 

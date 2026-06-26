@@ -345,6 +345,22 @@ class TestScopedUpdate:
         assert row["user_id"] == "u1"
 
 
+@pytest.fixture
+def dual_root_store(temp_dir):
+    """MemoryStore with separate user and project roots for cross-root tests."""
+    user_root = temp_dir / "user_memories"
+    project_root = temp_dir / "project_memories"
+    user_root.mkdir(parents=True, exist_ok=True)
+    project_root.mkdir(parents=True, exist_ok=True)
+    store = _store_mod.MemoryStore(
+        user_root=user_root,
+        project_root=project_root,
+        db_path=temp_dir / "memories.db",
+    )
+    yield store
+    store.close()
+
+
 # ---------------------------------------------------------------------------
 # 5. Scoped Delete
 # ---------------------------------------------------------------------------
@@ -386,6 +402,23 @@ class TestScopedDelete:
     def test_delete_without_id_or_filters_rejected(self, temp_store):
         with pytest.raises((ValueError, TypeError)):
             temp_store.delete_by_filters({})
+
+    def test_delete_by_filters_explicit_scope_restricts_to_root(self, dual_root_store):
+        """P2-6: explicit scope filter + root path guard prevents cross-root deletion."""
+        store = dual_root_store
+        store.put("user", _fm_with_scope("m-user", "body", user_id="u1"), "body")
+        store.put("project", _fm_with_scope("m-proj", "body", user_id="u1"), "body")
+
+        # Without an explicit scope filter both roots match the user_id.
+        assert store.delete_by_filters({"user_id": "u1"}) == 2
+
+        # With an explicit scope filter only the requested root is affected.
+        store.put("user", _fm_with_scope("m-user2", "body", user_id="u2"), "body")
+        store.put("project", _fm_with_scope("m-proj2", "body", user_id="u2"), "body")
+
+        assert store.delete_by_filters({"scope": "project", "user_id": "u2"}) == 1
+        assert store.get("m-proj2") is None
+        assert store.get("m-user2") is not None
 
 
 # ---------------------------------------------------------------------------

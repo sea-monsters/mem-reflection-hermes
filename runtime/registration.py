@@ -18,13 +18,8 @@ def register(ctx: Any) -> None:
     # Deferred imports to avoid circular dependency at module load time.
     from ..runtime.hooks import register_hooks, register_commands
     from ..runtime.schemas import (
-        _SRH_ASSOCIATE_SCHEMA,
         _SRH_COMPILE_PROFILE_SCHEMA,
-        _SRH_GRAPH_RETRIEVE_SCHEMA,
-        _SRH_GRAPH_STATS_SCHEMA,
-        _SRH_GRAPH_VIZ_SCHEMA,
         _SRH_MEMORY_DELETE_SCHEMA,
-        _SRH_MEMORY_HEALTH_SCHEMA,
         _SRH_MEMORY_HISTORY_SCHEMA,
         _SRH_MEMORY_SEARCH_SCHEMA,
         _SRH_MEMORY_WRITE_SCHEMA,
@@ -42,6 +37,7 @@ def register(ctx: Any) -> None:
         srh_reflect_now,
         srh_skill_query,
     )
+    from ..runtime.graph import register_graph_features
     from .. import _get_mem_store, _get_graph_mgr
 
     # Register runtime hooks
@@ -115,50 +111,10 @@ def register(ctx: Any) -> None:
         description="Compile profile/palace/zone summaries, optionally scoped to a tenant/user/run",
     )
 
-    # Register graph/health tools (5)
-    from ..runtime.graph import (
-        srh_associate,
-        srh_graph_retrieve,
-        srh_graph_stats,
-        srh_graph_viz,
-        srh_memory_health,
-    )
-
-    ctx.register_tool(
-        name="srh_associate",
-        toolset=_TOOLSET,
-        schema=_SRH_ASSOCIATE_SCHEMA,
-        handler=srh_associate,
-        description="Associate memories in graph",
-    )
-    ctx.register_tool(
-        name="srh_graph_retrieve",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_RETRIEVE_SCHEMA,
-        handler=srh_graph_retrieve,
-        description="Retrieve graph neighbors",
-    )
-    ctx.register_tool(
-        name="srh_graph_stats",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_STATS_SCHEMA,
-        handler=srh_graph_stats,
-        description="Get graph statistics",
-    )
-    ctx.register_tool(
-        name="srh_graph_viz",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_VIZ_SCHEMA,
-        handler=srh_graph_viz,
-        description="Generate graph visualization",
-    )
-    ctx.register_tool(
-        name="srh_memory_health",
-        toolset=_TOOLSET,
-        schema=_SRH_MEMORY_HEALTH_SCHEMA,
-        handler=srh_memory_health,
-        description="Check memory health",
-    )
+    # Register graph tools, graph maintenance hook, /graph slash command,
+    # and the memory-health tool. This also sets the hook-side graph manager
+    # getter so that _post_tool_call() and _get_graph_neighbors() can use it.
+    register_graph_features(ctx, get_mem_store=_get_mem_store)
 
     logger.info("mem-reflection-hermes plugin registered successfully")
 

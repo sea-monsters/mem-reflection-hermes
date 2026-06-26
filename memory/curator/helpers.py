@@ -9,6 +9,7 @@ Centralizes duplicated patterns from the legacy monolithic curator.py:
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,17 @@ if _lb_fn is None:
         from runtime._lb import _lb as _lb_fn
     except ImportError:
         _lb_fn = None
+
+# The stats append lock lives in core.store. We import it directly so that
+# compaction can hold it during the read-snapshot-truncate sequence, preventing
+# concurrent stat appends from being lost.
+try:
+    from ...core.store import _stat_write_lock as _core_stat_write_lock
+except ImportError:
+    try:
+        from core.store import _stat_write_lock as _core_stat_write_lock
+    except ImportError:
+        _core_stat_write_lock = None
 
 # Cross-module body refinement: prefer memory.bridge._refine_body when
 # resolvable, else fall back to a minimal strip so build_cold_entry never
@@ -71,6 +83,12 @@ _DEFAULT_CFG: Dict[str, Any] = {
         "llm_merge": False,
     },
     "cold_storage": {"enabled": True, "max_archive_size_mb": 10},
+    # Typed-fact sidecar retention: invalidated rows older than this many days
+    # are pruned by the curator. Active (non-invalidated) rows are preserved.
+    "gc": {"typed_fact_retention_days": 30},
+    # Pipeline behavior: if True, stop running subsequent actions once any
+    # action fails. This narrows the non-transactional inconsistency window.
+    "stop_on_error": False,
     # Stats compaction: when the event stream (memory-stats.jsonl) exceeds this
     # many lines, the curator folds it into the aggregate snapshot
     # (effectiveness-index.jsonl) and truncates the stream. Keeps read-time
@@ -87,6 +105,7 @@ class CuratorContext:
     admin_global: bool = False
     scope_label: str = "local_global"
     errors: List[str] = field(default_factory=list)
+    stop_on_error: bool = False
 
     def __post_init__(self) -> None:
         self.filters = normalize_scope_filters(self.filters)
@@ -111,6 +130,8 @@ class CuratorResult:
     merged: int = 0
     similar_pairs: int = 0
     orphan_edges: int = 0
+    typed_facts_deleted: int = 0
+    journal_entries: List[Dict[str, Any]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
 
@@ -131,7 +152,7 @@ def _curator_config(mem_store) -> Dict[str, Any]:
             cfg = {}
     merged = dict(_DEFAULT_CFG)
     merged.update(cfg)
-    for key in ("ttl", "stale", "episode", "similarity", "cold_storage", "stats"):
+    for key in ("ttl", "stale", "episode", "similarity", "cold_storage", "stats", "gc"):
         if key in cfg and isinstance(cfg[key], dict):
             # Start from defaults so partial overrides do not drop sibling keys.
             merged[key] = dict(_DEFAULT_CFG.get(key, {}))
@@ -245,27 +266,46 @@ def compact_stats_snapshot(mem_store) -> Dict[str, Any]:
         if lines_before < threshold:
             return result  # below threshold -> skip compaction this run
 
-        # 1. Read the full aggregate (snapshot + tail).
-        eff_map = core_store.load_effectiveness()
-        # 2. folded_at = the max event timestamp actually folded, NOT wall-clock
-        #    now. The read path skips events with at <= folded_at, so using the
-        #    last event's at (rather than compaction time) ensures events written
-        #    AFTER compaction but with an earlier timestamp are not dropped.
-        folded_at = max(
-            (e.last_event_at for e in eff_map.values() if e.last_event_at),
-            default=None,
-        )
-        if folded_at is None:
-            folded_at = datetime.now(timezone.utc).isoformat()
-        # 3. Rewrite the snapshot atomically.
-        core_store._write_effectiveness_snapshot(eff_map, folded_at)
-        # 4. Truncate the event stream (all events now live in the snapshot).
-        core_store._safe_write(stats_path, "")
-        # 5. Invalidate the in-process cache so the next read sees fresh state.
-        core_store._invalidate_effectiveness_cache()
+        # Hold the stats write lock during read -> truncate so that concurrent
+        # stat appends are not lost in the window between loading the folded
+        # state and emptying the event stream.
+        lock = _core_stat_write_lock
+        with (lock if lock is not None else nullcontext()):
+            # 1. Read the full aggregate (snapshot + tail).
+            eff_map = core_store.load_effectiveness()
+            # P2-16: GC snapshot rows for memories that no longer exist in the
+            # active store. Deleted/archived memories leave orphaned
+            # effectiveness rows that otherwise accumulate forever.
+            removed_dead_rows = 0
+            for mid in list(eff_map.keys()):
+                if mem_store.get(mid) is None:
+                    del eff_map[mid]
+                    removed_dead_rows += 1
+            if removed_dead_rows:
+                logger.debug(
+                    "compact_stats_snapshot removed %d dead effectiveness rows",
+                    removed_dead_rows,
+                )
+            # 2. folded_at = the max event timestamp actually folded, NOT wall-clock
+            #    now. The read path skips events with at <= folded_at, so using the
+            #    last event's at (rather than compaction time) ensures events written
+            #    AFTER compaction but with an earlier timestamp are not dropped.
+            folded_at = max(
+                (e.last_event_at for e in eff_map.values() if e.last_event_at),
+                default=None,
+            )
+            if folded_at is None:
+                folded_at = datetime.now(timezone.utc).isoformat()
+            # 3. Rewrite the snapshot atomically.
+            core_store._write_effectiveness_snapshot(eff_map, folded_at)
+            # 4. Truncate the event stream (all events now live in the snapshot).
+            core_store._safe_write(stats_path, "")
+            # 5. Invalidate the in-process cache so the next read sees fresh state.
+            core_store._invalidate_effectiveness_cache()
 
-        result["compacted"] = True
-        result["lines_after"] = 0
+            result["compacted"] = True
+            result["lines_after"] = 0
+            result["removed_dead_rows"] = removed_dead_rows
     except Exception as e:
         logger.warning("compact_stats_snapshot failed: %s", e)
         result["error"] = str(e)

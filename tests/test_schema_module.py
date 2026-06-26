@@ -9,6 +9,7 @@ These tests verify the current tool schema contract:
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -130,6 +131,24 @@ class TestSchemaDefinitions:
         tier = schemas._SRH_GRAPH_RETRIEVE_SCHEMA["properties"]["tier"]
         assert tier["enum"] == ["count", "list", "detail"]
 
+    def test_graph_retrieve_schema_accepts_deprecated_seed_ids(self):
+        """P1-2: schema keeps seed_ids deprecated so old clients don't fail validation."""
+        from mem_reflection_hermes.runtime import schemas
+        import jsonschema
+
+        jsonschema.validate(
+            {"seed_ids": ["a"], "max_results": 5, "tier": "list"},
+            schemas._SRH_GRAPH_RETRIEVE_SCHEMA,
+        )
+
+    def test_graph_retrieve_schema_requires_memory_ids_when_seed_ids_missing(self):
+        """P1-2: schema requires at least memory_ids (no seed_ids means memory_ids required)."""
+        from mem_reflection_hermes.runtime import schemas
+        import jsonschema
+
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({"max_results": 5}, schemas._SRH_GRAPH_RETRIEVE_SCHEMA)
+
     def test_graph_stats_schema_has_no_unused_properties(self):
         """_SRH_GRAPH_STATS_SCHEMA does not contain unused format or depth keys."""
         from mem_reflection_hermes.runtime import schemas
@@ -216,6 +235,31 @@ class TestRegisterBehavior:
         assert "body" in schema.get("required", [])
         assert "supersedes_reason" in schema.get("properties", {})
 
+    def test_register_wires_graph_manager_getter_for_hooks(self):
+        """P1-1: register() must call register_graph_features so post_tool_call can access graph."""
+        import mem_reflection_hermes as pkg
+        from mem_reflection_hermes.runtime import hooks as hooks_mod
+
+        original = hooks_mod._gm_getter_func
+        try:
+            hooks_mod._gm_getter_func = None
+            ctx = MagicMock()
+            pkg.register(ctx)
+            assert hooks_mod._gm_getter_func is not None, "_gm_getter_func was not set by register()"
+        finally:
+            hooks_mod._gm_getter_func = original
+
+    def test_register_graph_features_is_idempotent(self):
+        """P1-1: calling register() twice on the same context does not double-register graph tools."""
+        import mem_reflection_hermes as pkg
+
+        ctx = MagicMock()
+        pkg.register(ctx)
+        first_graph_calls = [c for c in ctx.register_tool.call_args_list if c.kwargs.get("name", "").startswith("srh_graph")]
+        pkg.register(ctx)
+        second_graph_calls = [c for c in ctx.register_tool.call_args_list if c.kwargs.get("name", "").startswith("srh_graph")]
+        assert len(first_graph_calls) == len(second_graph_calls), "graph tools double-registered on same context"
+
     def test_register_does_not_mutate_schema(self):
         """register(ctx) does not mutate schema dicts."""
         import mem_reflection_hermes as pkg
@@ -226,3 +270,55 @@ class TestRegisterBehavior:
         pkg.register(ctx)
         after = {k: dict(getattr(schemas, k)) for k in before}
         assert before == after
+
+
+class TestReflectNowNormalization:
+    """P2-11: srh_reflect_now normalizes response schema across reflection modes."""
+
+    def test_raw_chunk_response_has_same_keys_as_llm_response(self, monkeypatch):
+        from mem_reflection_hermes.runtime import tools as tools_mod
+
+        def _fake_run_full_reflection(_ctx, _messages, scope_filters=None):
+            return {
+                "mode": "raw_chunk",
+                "summary": "raw chunk summary",
+                "accepted_memories": [{"id": "m1", "body_preview": "bp"}],
+                "chunks_created": 1,
+            }
+
+        monkeypatch.setattr(tools_mod, "_run_full_reflection", _fake_run_full_reflection)
+        result = json.loads(tools_mod._tool_srh_reflect_now({
+            "ctx": SimpleNamespace(),
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        assert result["mode"] == "raw_chunk"
+        assert result["summary"] == "raw chunk summary"
+        assert result["accepted_memories"] == [{"id": "m1", "body_preview": "bp"}]
+        assert result["skill_candidates"] == []
+        assert result["conflicts"] == []
+        assert result["chunks_created"] == 1
+        assert result["error"] is None
+
+    def test_llm_response_fills_missing_defaults(self, monkeypatch):
+        from mem_reflection_hermes.runtime import tools as tools_mod
+
+        def _fake_run_full_reflection(_ctx, _messages, scope_filters=None):
+            return {
+                "mode": "llm",
+                "summary": "llm summary",
+                "accepted_memories": [{"id": "m2", "body": "b2"}],
+                "skill_candidates": [{"name": "s1"}],
+                "conflicts": [{"id": "c1"}],
+            }
+
+        monkeypatch.setattr(tools_mod, "_run_full_reflection", _fake_run_full_reflection)
+        result = json.loads(tools_mod._tool_srh_reflect_now({
+            "ctx": SimpleNamespace(),
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        assert result["mode"] == "llm"
+        assert result["accepted_memories"] == [{"id": "m2", "body": "b2"}]
+        assert result["skill_candidates"] == [{"name": "s1"}]
+        assert result["conflicts"] == [{"id": "c1"}]
+        assert result["chunks_created"] == 0
+        assert result["error"] is None

@@ -93,6 +93,53 @@ class TestAliasFunctions:
         if mem_store is not None:
             monkeypatch.setattr(_runtime_graph, "_get_mem_store", lambda: mem_store, raising=False)
 
+    def _put_mem(self, store, memory_id: str, user_id: str) -> None:
+        """Insert a scoped memory into *store* with a deterministic ID."""
+        fm = _store.MemoryFrontmatter.new(source="test", confidence="medium")
+        fm.id = memory_id
+        fm.user_id = user_id
+        store.put("user", fm, f"body {memory_id}")
+
+    def test_srh_graph_retrieve_filters_by_scope(self, temp_gm, temp_mem_store, monkeypatch):
+        """P2-5: graph retrieval respects scope filters and excludes cross-scope neighbors."""
+        gm = temp_gm
+        store = temp_mem_store
+        self._put_mem(store, "a", "u1")
+        self._put_mem(store, "b", "u2")
+        self._put_mem(store, "c", "u1")
+        gm.store.ensure_meta("a", zone="general")
+        gm.store.ensure_meta("b", zone="general")
+        gm.store.ensure_meta("c", zone="general")
+        gm.associator.on_co_occurrence(["a", "b"])
+        gm.associator.on_co_occurrence(["a", "c"])
+        self._patch_getters(monkeypatch, gm, store)
+
+        result = _runtime_graph.srh_graph_retrieve(
+            {"memory_ids": ["a"], "filters": {"user_id": "u1"}, "max_results": 10, "tier": "detail"}
+        )
+        parsed = json.loads(result)
+        result_ids = {r["memory_id"] for r in parsed["results"]}
+        assert "c" in result_ids
+        assert "b" not in result_ids
+
+    def test_srh_graph_viz_filters_by_scope(self, temp_gm, temp_mem_store, monkeypatch):
+        """P2-5: graph viz respects scope filters and hides cross-scope nodes/edges."""
+        gm = temp_gm
+        store = temp_mem_store
+        self._put_mem(store, "a", "u1")
+        self._put_mem(store, "b", "u2")
+        gm.store.ensure_meta("a", zone="general")
+        gm.store.ensure_meta("b", zone="general")
+        gm.associator.on_co_occurrence(["a", "b"])
+        self._patch_getters(monkeypatch, gm, store)
+
+        result = _runtime_graph.srh_graph_viz({"filters": {"user_id": "u1"}})
+        parsed = json.loads(result)
+        node_ids = {n["id"] for n in parsed["nodes"]}
+        assert "a" in node_ids
+        assert "b" not in node_ids
+        assert all(e["source"] != "b" and e["target"] != "b" for e in parsed["edges"])
+
     def test_srh_graph_retrieve_empty(self, temp_gm, monkeypatch):
         """srh_graph_retrieve on empty graph returns empty results."""
         self._patch_getters(monkeypatch, temp_gm)
@@ -118,6 +165,21 @@ class TestAliasFunctions:
         assert len(parsed["results"]) >= 1
         # detail tier should include weight
         assert "weight" in parsed["results"][0]
+
+    def test_srh_graph_retrieve_seed_ids_backward_compat(self, temp_gm, monkeypatch):
+        """P1-2: deprecated seed_ids still works as a fallback for memory_ids."""
+        gm = temp_gm
+        gm.store.ensure_meta("a", zone="general")
+        gm.store.ensure_meta("b", zone="general")
+        gm.associator.on_co_occurrence(["a", "b"])
+        self._patch_getters(monkeypatch, gm)
+        result = _runtime_graph.srh_graph_retrieve(
+            {"seed_ids": ["a"], "max_results": 5, "tier": "detail"}
+        )
+        parsed = json.loads(result)
+        assert "results" in parsed
+        assert len(parsed["results"]) >= 1
+        assert parsed["seed_ids"] == ["a"]
 
     def test_srh_graph_retrieve_tier_all_backward_compat(self, temp_gm, monkeypatch):
         """tier='all' is mapped to 'detail' for backward compatibility."""

@@ -201,7 +201,9 @@ def test_full_reflection_strips_supersedes_without_replacement_intent(monkeypatc
     result = _runtime._run_full_reflection(ctx, [{"role": "user", "content": "记住我的偏好即可"}])
 
     assert result["accepted_memories"]
-    assert store.check_conflict_calls[0]["exclude_ids"] == ["mem-old"]
+    # exclude_ids now includes both explicit supersedes targets and current-session
+    # memory IDs; the test only needs to verify the explicit target is present.
+    assert "mem-old" in store.check_conflict_calls[0]["exclude_ids"]
     assert store.put_calls[0]["frontmatter"].supersedes == []
 
 
@@ -239,6 +241,45 @@ class _GraphedStore:
 
     def get(self, _mid):
         return object()
+
+
+class _FlakyGraph:
+    """Graph stub that fails on a specific target_id to test partial-failure handling."""
+
+    def __init__(self, fail_on=None):
+        self.recorded = []
+        self.fail_on = fail_on or set()
+
+    def record_typed_fact(self, *args, **kwargs):
+        target = kwargs.get("target_memory_id")
+        if target in self.fail_on:
+            raise RuntimeError(f"simulated failure for {target}")
+        self.recorded.append({"args": args, "kwargs": kwargs})
+        return "fact-id"
+
+    def record_entity_mentions(self, *args, **kwargs):
+        return []
+
+    def invalidate_facts_for_memories(self, memory_ids, invalidated_by):
+        return len(memory_ids)
+
+
+def test_record_semantic_relation_sidecar_continues_on_partial_failure():
+    """P2-8: one failing target must not abort the remaining targets."""
+    graph = _FlakyGraph(fail_on={"mem-b"})
+    store = _GraphedStore(graph)
+    fm = MemoryFrontmatter.new(source="test", confidence="medium", zone="general")
+
+    _runtime._record_semantic_relation_sidecar(
+        store, fm,
+        action="merge",
+        target_ids=["mem-a", "mem-b", "mem-c"],
+        reason="batch merge",
+        confidence=0.8,
+    )
+
+    recorded_targets = {rec["kwargs"]["target_memory_id"] for rec in graph.recorded}
+    assert recorded_targets == {"mem-a", "mem-c"}
 
 
 def test_record_semantic_relation_sidecar_writes_merge_edge():
@@ -343,3 +384,53 @@ def test_merge_action_invalidates_merge_target_facts(monkeypatch):
     assert graph.invalidated, "merge must invalidate the merge target's facts"
     assert graph.invalidated[0]["memory_ids"] == ["mem-policy"]
     assert any(rec["kwargs"]["relation"] == "merges" for rec in graph.recorded)
+
+
+def test_scope_split_invalidates_target_facts(monkeypatch):
+    """P3-5: a scope_split decision must invalidate the target memory's typed
+    facts via the semantic-relation sidecar, just like merge."""
+    old = make_memory_with_id("mem-outside", "I prefer light mode")
+    old.frontmatter.user_id = "u2"
+
+    graph = _RecordingGraph()
+    store = SimpleNamespace(
+        list_active=lambda filters=None: [old],
+        _embed_index=None,
+        _graph=graph,
+        put_calls=[],
+    )
+
+    def _put(scope, fm, body):
+        store.put_calls.append({"frontmatter": fm, "body": body})
+        return SimpleNamespace(path=f"/tmp/{fm.id}.md")
+
+    store.put = _put
+    monkeypatch.setattr(_runtime, "_get_mem_store", lambda: store)
+    monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_a, **_k: 0.9)
+    monkeypatch.setattr(
+        _runtime, "_find_conflicting_memory",
+        lambda *_a, **_k: (old, 0.92),
+    )
+    monkeypatch.setattr(
+        _runtime, "resolve_semantic_supersedes",
+        lambda **_k: {
+            "action": "scope_split",
+            "target_ids": ["mem-outside"],
+            "reason": "cross-scope split",
+            "confidence": 0.8,
+        },
+    )
+
+    result = _runtime._run_embedding_micro_reflection(
+        "Actually, I prefer dark mode.",
+        "Noted.",
+        scope_filters={"user_id": "u1"},
+    )
+
+    assert result is not None
+    assert store.put_calls
+    assert store.put_calls[0]["frontmatter"].supersedes == []
+    assert graph.invalidated, "scope_split must invalidate the target's facts"
+    assert graph.invalidated[0]["memory_ids"] == ["mem-outside"]
+    assert any(rec["kwargs"]["relation"] == "scope_split_with" for rec in graph.recorded)

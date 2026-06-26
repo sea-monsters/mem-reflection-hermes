@@ -255,14 +255,38 @@ def _read_reflect_log(n: int = 10, log_path: Optional[Path] = None) -> List[Dict
 # ---------------------------------------------------------------------------
 
 class ReflectionEngine:
-    """Simplified reflection with dependency injection."""
+    """Simplified reflection with dependency injection.
 
-    def __init__(self, store, search, graph, log_path: Optional[Path] = None):
+    .. note::
+       This class is a legacy/simplified surface. The canonical reflection
+       pipeline in ``reflection.runtime`` is scope-aware; this class accepts
+       optional ``scope_filters`` so direct callers can also produce scoped
+       memories. If ``scope_filters`` is omitted, memories are written without
+       scope fields (the pre-v1.7 behavior).
+    """
+
+    def __init__(
+        self,
+        store,
+        search,
+        graph,
+        log_path: Optional[Path] = None,
+        scope_filters: Optional[Dict[str, Optional[str]]] = None,
+    ):
         self.store = store
         self.search = search
         self.graph = graph
         self._log_path = log_path
         self._mode = os.environ.get("MEM_REFLECTION_MODE", "raw_chunk")
+        self.scope_filters = scope_filters or {}
+
+    def _scope_kwargs(self) -> Dict[str, Optional[str]]:
+        """Return scope fields for MemoryFrontmatter.new()."""
+        return {
+            "user_id": self.scope_filters.get("user_id"),
+            "agent_id": self.scope_filters.get("agent_id"),
+            "run_id": self.scope_filters.get("run_id"),
+        }
 
     # -- micro reflection ----------------------------------------------------
 
@@ -280,6 +304,7 @@ class ReflectionEngine:
         fm = MemoryFrontmatter.new(
             source="raw_chunk", confidence="low",
             tags=["episode", "raw_chunk"], zone="episode",
+            **self._scope_kwargs(),
         )
         self.store.put("user", fm, combined)
         return {"id": fm.id, "type": "raw_chunk", "preview": combined[:120]}
@@ -294,6 +319,7 @@ class ReflectionEngine:
         fm = MemoryFrontmatter.new(
             source="micro_reflection", confidence=best["confidence"],
             tags=_extract_keywords(best["text"], top_k=3), zone="general",
+            **self._scope_kwargs(),
         )
         self.store.put("user", fm, best["text"])
         return {"id": fm.id, "type": "fact", "text": best["text"]}
@@ -326,6 +352,7 @@ class ReflectionEngine:
             fm = MemoryFrontmatter.new(
                 source="raw_chunk", confidence="low",
                 tags=["episode", "raw_chunk"], zone="episode",
+                **self._scope_kwargs(),
             )
             self.store.put("user", fm, content.strip())
             accepted.append({"id": fm.id, "preview": content[:120]})
@@ -380,6 +407,7 @@ class ReflectionEngine:
                 confidence=mem.get("confidence", "medium"),
                 tags=mem.get("tags", []),
                 zone=mem.get("zone", "general"),
+                **self._scope_kwargs(),
             )
             self.store.put("user", fm, text)
             accepted.append({"id": fm.id, "text": text})

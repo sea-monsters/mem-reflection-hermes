@@ -6,6 +6,7 @@ Frozen: 2026-06-11 — do not modify assertions to fit implementation.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -91,6 +92,17 @@ class TestEventLedgerTable:
         assert "idx_memory_events_memory_id" in indexes
         assert "idx_memory_events_session_id" in indexes
         assert "idx_memory_events_created_at" in indexes
+
+    def test_event_json_truncation_preserves_hash(self):
+        """P2-18: oversized frontmatter is truncated but keeps a correlation hash."""
+        big_data = {"id": "mem-big", "body": "x" * 20000}
+        result = _store_mod.MemoryStore._event_json(big_data)
+        parsed = json.loads(result)
+        assert parsed["id"] == "mem-big"
+        assert parsed.get("_truncated") is True
+        assert "_original_frontmatter_hash" in parsed
+        assert len(parsed["_original_frontmatter_hash"]) == 16
+        assert len(result) <= 8192
 
 
 # ---------------------------------------------------------------------------

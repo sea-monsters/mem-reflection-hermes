@@ -34,11 +34,46 @@ Self-evolving memory & reflection system for [Hermes Agent](https://github.com/N
 - **Session Checkpoint** (v1.4): Atomic JSON persistence with pending-stage recovery and corrupt-failopen behavior
 - **Dashboard Memory Manager**: Full CRUD + reorder + graph visualization + runtime search + zone analysis
 - **Temporal/Context Hints**: `valid_from`, `valid_until`, `context_scope` for time-bounded and scoped memories
-- **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`
+- **Slash Commands**: `/reflect`, `/skills`, `/memories`, `/pending`, `/approve`, `/reject`, `/compile`, `/graph`
 - **Thread Safety**: RLock on MemoryStore, locks on session state and embedding cache
 - **Session-Scoped Reflection**: Reflection exclusion set prevents feedback loops within a session
 - **Robust Error Handling**: Silent failures upgraded to warning-level logging across all modules
 - **Protocol-Based Design**: GraphStoreProtocol uses typing.Protocol for structural typing
+
+## v1.7 P3 Root-Cause Hardening
+
+A focused round of fixes for deferred/root-cause issues identified in the v1.7 code review:
+
+- **Batch stat recording**: `record_memory_stat()` loops in tool/hook paths now batch through `batch_record_stats()` to reduce lock churn.
+- **Async write failure propagation**: `async_write_memory()` raises `RuntimeError` when the synchronous fallback fails, so callers can no longer miss a lost write.
+- **Frontmatter version preservation**: `MemoryFrontmatter.version` (integer, default `1`) now survives disk round-trips.
+- **MockStore scope parity**: test helpers use `core.scope.filter_memories_by_scope()` so mock filtering matches production semantics.
+- **scope_split fact invalidation**: semantic `scope_split` decisions now invalidate target-memory typed facts, matching `merge` behavior.
+- **Pending-skills archive retention**: old `pending-skills.<timestamp>.json` archives are pruned after 30 days or when more than 10 accumulate.
+- **Raw-chunk per-session cap**: raw-chunk reflection stops creating new episode memories after 20 per session.
+- **Atomic cold-store prune**: curator cold-store pruning rewrites the file atomically via temp-file + `os.replace()`.
+- **Dashboard 404 for missing IDs**: `PUT /memories/{id}` returns HTTP 404 instead of 500 when the memory does not exist.
+- **Capped auto-association**: dashboard memory creation associates at most the 20 most recent tag-overlapping memories in the graph.
+
+## v1.7 P4 Schema / Graph / Curator Hardening (2026-06-26)
+
+A systematic-debugging review of the latest v1.7 beta fixes closed P1/P2 gaps around registration, schema drift, scope boundaries, and retention:
+
+- **Graph features actually registered**: `register_graph_features()` is now called during plugin registration, so the `/graph` slash command, graph lifecycle hook, and hook-side graph manager getter are live.
+- **`srh_graph_retrieve` parameter compatibility**: accepts both `memory_ids` (canonical) and deprecated `seed_ids`, with a deprecation warning for the latter.
+- **`MergeSimilar` 500-memory cap restored**: scan now sorts and slices to the intended 500 most-recent memories before scope grouping, preventing O(n²) blow-up.
+- **Stats compaction concurrency safety**: `compact_stats_snapshot()` holds the stats write lock across load→truncate to avoid losing concurrent events.
+- **SQLite stats dead path deprecated**: `store_methods.effectiveness()` and `record_stat()` forward to the JSONL truth path and emit `DeprecationWarning`.
+- **`clean_orphan_edges` fail-safe**: an empty `valid_ids` set is treated as a caller error and does not wipe the graph.
+- **Graph scope boundary filtering**: `srh_graph_retrieve` / `srh_graph_viz` accept optional `filters`; traversal is restricted to the active scope to avoid tenant leaks.
+- **Reflection excludes current session IDs in LLM/micro paths**: matches the embedding path so reflection does not self-conflict within a session.
+- **`ReflectionEngine` scope-aware**: accepts optional `scope_filters` and stamps scope fields onto new memories.
+- **`srh_reflect_now` response normalization**: returns a stable key set across all reflection modes.
+- **Curator recovery journal**: `curator_recovery.jsonl` records mutation entries; `curator.stop_on_error` can halt the pipeline on first failure.
+- **ArchiveStale age fallback**: memories without effectiveness records are evaluated by `frontmatter.created` / mtime.
+- **Effectiveness snapshot GC**: compaction drops snapshot rows for deleted memories.
+- **Memory-event truncation hash**: truncated event frontmatter retains an `_original_frontmatter_hash` for auditability.
+- **Search-time graph boost decoupled from decay step counter**: `GraphIndex.spread()` supports `increment_step=False`; search Hebbian boost no longer advances the step counter.
 
 ## Documentation
 

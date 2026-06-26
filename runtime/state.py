@@ -96,7 +96,11 @@ def _get_search_index():
                     reranker = _build_reranker(cfg.get(CONFIG_KEY_RERANKER, {}))
                 except Exception:
                     reranker = None
-                _search_index = SearchIndex(_get_mem_store(), reranker=reranker)
+                _search_index = SearchIndex(
+                    _get_mem_store(),
+                    graph=_get_graph_mgr().store if _graph_mgr is not None else None,
+                    reranker=reranker,
+                )
     return _search_index
 
 

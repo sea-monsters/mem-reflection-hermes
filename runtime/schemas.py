@@ -100,7 +100,6 @@ _SRH_ASSOCIATE_SCHEMA = {
         "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to associate (max 20)"},
         "context": {"type": "string", "description": "Optional context string"},
         "relation": {"type": "string", "enum": ["co_occurs", "supersedes", "related"], "description": "Relation type"},
-        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs for spreading activation"},
     },
     "required": ["memory_ids"],
 }
@@ -108,11 +107,16 @@ _SRH_ASSOCIATE_SCHEMA = {
 _SRH_GRAPH_RETRIEVE_SCHEMA = {
     "type": "object",
     "properties": {
-        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs to start retrieval from"},
+        "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to start retrieval from"},
+        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "[DEPRECATED] Use memory_ids instead"},
         "max_results": {"type": "integer", "description": "Maximum number of results (default 10)"},
         "tier": {"type": "string", "enum": ["count", "list", "detail"], "description": "Result tier"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
     },
-    "required": ["seed_ids"],
+    "anyOf": [
+        {"required": ["memory_ids"]},
+        {"required": ["seed_ids"]},
+    ],
 }
 
 _SRH_GRAPH_STATS_SCHEMA = {
@@ -123,7 +127,9 @@ _SRH_GRAPH_STATS_SCHEMA = {
 
 _SRH_GRAPH_VIZ_SCHEMA = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
+    },
     "required": [],
 }
 

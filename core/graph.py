@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS typed_facts (
     valid_until TEXT,
     invalidated_by TEXT,
     created_at TEXT NOT NULL
+    -- Retention/GC is handled by :meth:`compact_typed_facts`, invoked from the
+    -- curator pipeline; invalidated rows older than the configured retention
+    -- are pruned while active rows are preserved.
 );
 CREATE INDEX IF NOT EXISTS idx_typed_facts_source ON typed_facts(source_memory_id);
 CREATE INDEX IF NOT EXISTS idx_typed_facts_target ON typed_facts(target_memory_id);
@@ -444,11 +447,12 @@ class GraphIndex:
         min_weight: float = 0.0,
         exclude_relations: Optional[Set[str]] = None,
         undirected: bool = False,
+        increment_step: bool = True,
+        allowed_nodes: Optional[Set[str]] = None,
     ) -> Dict[str, float]:
         """Fixed-point activation spreading from seed nodes.
 
-        Returns {node_id: activation_score} for all reached nodes.
-        Also increments the internal step counter for per-step decay.
+        Returns ``{node_id: activation_score}`` for all reached nodes.
 
         Args:
             seed_ids: Starting nodes.
@@ -458,9 +462,19 @@ class GraphIndex:
             min_weight: Minimum edge weight to traverse.
             exclude_relations: Set of relation types to skip (e.g. ``{"SUPERSEDES"}``).
             undirected: If True, traverse edges in both directions.
+            increment_step: If False, do not advance the internal step counter.
+                Read-only callers (e.g. search-time Hebbian boost) should pass
+                ``False`` so per-step graph decay is only driven by deliberate
+                graph mutations, not by retrieval.
+            allowed_nodes: Optional set of node IDs to restrict propagation to.
+                Only allowed targets are added to the activation map. Search
+                callers should pass their in-scope candidate set so spreading
+                activation does not walk cross-scope edges.
         """
         excluded = exclude_relations or set()
-        activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
+        activation: Dict[str, float] = {
+            sid: 1.0 for sid in seed_ids if allowed_nodes is None or sid in allowed_nodes
+        }
         for _ in range(max_iter):
             if len(activation) > max_nodes:
                 break
@@ -474,8 +488,10 @@ class GraphIndex:
                 ):
                     if neighbor["relation"] in excluded:
                         continue
-                    propagated = act * decay * neighbor["weight"]
                     tid = neighbor["target_id"]
+                    if allowed_nodes is not None and tid not in allowed_nodes:
+                        continue
+                    propagated = act * decay * neighbor["weight"]
                     new_act[tid] = max(new_act.get(tid, 0.0), propagated)
             for nid, score in new_act.items():
                 prev = activation.get(nid, 0.0)
@@ -485,7 +501,8 @@ class GraphIndex:
                 activation[nid] = new_val
             if delta < 1e-4:
                 break
-        self._step_counter += 1
+        if increment_step:
+            self._step_counter += 1
         return activation
 
     # -- decay ---------------------------------------------------------------
@@ -839,31 +856,54 @@ class GraphIndex:
             )
             conn.commit()
 
+    def compact_typed_facts(self, retention_days: int = 30) -> int:
+        """Remove invalidated typed facts older than *retention_days*.
+
+        Invalidated facts (``invalidated_by`` set) accumulate indefinitely because
+        the sidecar is append-only. This pass prunes stale rows to keep the table
+        bounded while preserving recently invalidated facts for audit/history.
+        """
+        if retention_days < 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        with self._lock:
+            try:
+                conn = self._get_conn()
+                cur = conn.execute(
+                    """DELETE FROM typed_facts
+                       WHERE invalidated_by IS NOT NULL
+                         AND COALESCE(valid_until, created_at) < ?""",
+                    (cutoff,),
+                )
+                conn.commit()
+                deleted = cur.rowcount
+                if deleted:
+                    logger.debug("compact_typed_facts removed %d rows older than %s", deleted, cutoff)
+                return deleted
+            except Exception as e:
+                logger.warning("compact_typed_facts failed: %s", e)
+                return 0
+
     def clean_orphan_edges(self, valid_ids: Set[str]) -> int:
         """Delete edges + meta where memory no longer exists in *valid_ids*.
 
         Returns total count of rows deleted (edges + graph_meta).
         Fail-open: on SQL error, logs warning and returns 0.
+
+        An empty *valid_ids* set is treated as a caller error and does NOT
+        delete anything. This prevents a curator run on an empty active-memory
+        set from wiping the entire graph.
         """
         deleted = 0
         try:
             with self._lock:
                 conn = self._get_conn()
                 if not valid_ids:
-                    # Empty set means all rows are orphaned — log conspicuously
-                    # so accidental wipes (e.g. list_active() returns empty)
-                    # are not silent.
+                    # Empty set is a caller error, not "everything is orphaned".
                     logger.warning(
-                        "clean_orphan_edges called with empty valid_ids — "
-                        "all %d edges and %d graph_meta rows will be deleted",
-                        conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
-                        conn.execute("SELECT COUNT(*) FROM graph_meta").fetchone()[0],
+                        "clean_orphan_edges called with empty valid_ids — refusing to delete graph data"
                     )
-                    deleted += conn.execute("DELETE FROM edges").rowcount
-                    deleted += conn.execute("DELETE FROM graph_meta").rowcount
-                    # Also clean orphan typed_facts: remove rows whose
-                    # source_memory_id is no longer valid.
-                    deleted += conn.execute("DELETE FROM typed_facts").rowcount
+                    return 0
                 else:
                     placeholders = ",".join("?" * len(valid_ids))
                     ids_list = list(valid_ids)

@@ -25,12 +25,15 @@ from core.store import (
     LoadedMemory,
     parse_frontmatter,
     serialize_frontmatter,
+    read_memory,
+    write_memory_atomic,
     _lineage_depth,
     _lineage_root,
     _lineage_cycle_check,
     _classify_update_intent,
     _safe_write,
 )
+from tests._helpers import MockStore, make_memory_with_id
 
 
 class TestFrontmatter:
@@ -99,7 +102,7 @@ class TestFrontmatter:
             source="test",
             confidence="medium",
         )
-        body = "这是一个中文记忆内容，包含日本語テストと한국어"
+        body = "这是一个中文记忆内容，包含日本語テ스트と한국어"
         data = {
             "id": fm.id,
             "created": fm.created,
@@ -108,6 +111,21 @@ class TestFrontmatter:
         }
         serialized = serialize_frontmatter(data, body)
         assert body in serialized
+
+    def test_version_survives_disk_roundtrip(self, tmp_path):
+        """A memory written with version > 1 must be read back with the same version."""
+        fm = MemoryFrontmatter(
+            id="versioned-123",
+            created=datetime.now(timezone.utc).isoformat(),
+            source="reflection",
+            confidence="high",
+            version=5,
+        )
+        path = tmp_path / "versioned.md"
+        write_memory_atomic(path, fm, "versioned body")
+        loaded = read_memory(path, scope="user")
+        assert loaded is not None
+        assert loaded.frontmatter.version == 5
 
 
 class TestEffectivenessDataclass:
@@ -266,3 +284,34 @@ class TestClassifyIntent:
         intent = _classify_update_intent("Also remember that I use vim", "existing memory")
         # Should be some intent, not necessarily correction
         assert intent is not None
+
+
+class TestMockStoreScopeFiltering:
+    def test_filters_match_production_scope_semantics(self):
+        """MockStore filtering must match production build_scope_clauses semantics."""
+        store = MockStore()
+
+        unscoped = make_memory_with_id("unscoped", "body unscoped")
+        u1 = make_memory_with_id("u1", "body u1")
+        u1.frontmatter.user_id = "u1"
+        u2 = make_memory_with_id("u2", "body u2")
+        u2.frontmatter.user_id = "u2"
+        empty_scope = make_memory_with_id("empty-scope", "body empty")
+        empty_scope.frontmatter.user_id = ""
+
+        for m in (unscoped, u1, u2, empty_scope):
+            store.put("user", m.frontmatter, m.body)
+
+        # No filter returns everything.
+        assert {m.id() for m in store.list(filters=None)} == {
+            "unscoped", "u1", "u2", "empty-scope",
+        }
+
+        # Explicit value filter.
+        assert {m.id() for m in store.list(filters={"user_id": "u1"})} == {"u1"}
+
+        # NULL/unscoped filter matches memories with no explicit scope (empty
+        # strings are normalized to None, just like production).
+        assert {m.id() for m in store.list(filters={"user_id": None})} == {
+            "unscoped", "empty-scope",
+        }

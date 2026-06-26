@@ -252,6 +252,7 @@ def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
         "context_scope": fm.context_scope,
         "zone": fm.zone,
         "rank": fm.rank,
+        "version": fm.version,
     }
     for k in ("user_id", "agent_id", "run_id"):
         v = normalize_scope_value(getattr(fm, k, None))
@@ -315,6 +316,7 @@ def async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
                     _safe_write(path, content)
         except Exception as e:
             logger.warning("Sync write fallback failed for %s: %s", path, e)
+            raise RuntimeError(f"Sync write fallback failed for {path}: {e}") from e
 
 
 def _effectiveness_index_path() -> Path:
@@ -741,14 +743,30 @@ class MemoryStore:
     def _event_json(data: Optional[Dict[str, Any]]) -> Optional[str]:
         if not data:
             return None
+
         def _default(obj: Any) -> str:
             if isinstance(obj, datetime):
                 return obj.isoformat()
             raise TypeError
+
         result = json.dumps(data, ensure_ascii=False, default=_default)
         if len(result) > 8192:
-            result = json.dumps({"id": data.get("id", "")}, ensure_ascii=False)
-            logger.warning("Event frontmatter truncated for memory %s", data.get("id", "?"))
+            # P2-18: preserve a hash of the original frontmatter so the audit
+            # trail can still be correlated even after truncation.
+            original_hash = hashlib.sha256(result.encode("utf-8")).hexdigest()[:16]
+            result = json.dumps(
+                {
+                    "id": data.get("id", ""),
+                    "_truncated": True,
+                    "_original_frontmatter_hash": original_hash,
+                },
+                ensure_ascii=False,
+            )
+            logger.warning(
+                "Event frontmatter truncated for memory %s (hash %s)",
+                data.get("id", "?"),
+                original_hash,
+            )
         return result
 
     def _record_memory_event(
@@ -1157,12 +1175,24 @@ class MemoryStore:
         return build_scope_clauses(filters)
 
     def delete_by_filters(self, filters: Dict[str, Optional[str]]) -> int:
-        """Batch delete memories matching scope filters."""
+        """Batch delete memories matching scope filters.
+
+        An explicit ``"scope"`` key (``"user"`` or ``"project"``) can be passed
+        in *filters* to restrict deletion to one root. Regardless of whether a
+        scope is supplied, every selected file path is validated to lie under
+        the expected root before unlinking, preventing accidental cross-root
+        deletion when SQL scope columns alone are ambiguous.
+        """
         if not filters:
             raise ValueError("filters dict must not be empty")
         with self._lock:
             conn = self._get_conn()
-            clauses, params = self._build_scope_clauses(filters)
+            filters_copy = dict(filters)
+            explicit_scope = filters_copy.pop("scope", None)
+            clauses, params = self._build_scope_clauses(filters_copy)
+            if explicit_scope is not None:
+                clauses.append("scope = ?")
+                params.append(explicit_scope)
             if not clauses:
                 raise ValueError("filters dict must contain at least one scope key")
             where = " AND ".join(clauses)
@@ -1173,6 +1203,22 @@ class MemoryStore:
                 mem_id = row["id"]
                 scope = row["scope"]
                 path = Path(row["path"])
+                # P2-6 root guard: only unlink files that live under the root
+                # that matches the memory's scope.
+                try:
+                    expected_root = self._root_for(scope).resolve()
+                    if not path.resolve().is_relative_to(expected_root):
+                        logger.warning(
+                            "Skipping delete of memory %s: path %s is outside expected root %s",
+                            mem_id, path, expected_root,
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        "Skipping delete of memory %s: root validation failed: %s",
+                        mem_id, e,
+                    )
+                    continue
                 old_body = row["body"] or ""
                 old_loaded = self._row_to_loaded(row) or read_memory(path, scope)
                 old_fm = old_loaded.frontmatter.to_dict() if old_loaded else {}
@@ -1280,15 +1326,22 @@ class MemoryStore:
         return _lineage_mod._calc_supersedes_depth(self, mem_id, visited, max_depth, depth)
 
     def record_stat(self, memory_id: str, event: str) -> None:
-        """[DEPRECATED] Writes to the SQLite stats table.
+        """[DEPRECATED] Forward to the JSONL stats pipeline.
 
-        Production stats are recorded via the module-level record_memory_stat()
-        (which appends to memory-stats.jsonl, the single source of truth for
-        effectiveness). This method is retained only for backward compatibility
-        and is not called by any production path. Prefer record_memory_stat().
+        The SQLite ``stats`` table is no longer the source of truth; production
+        effectiveness is computed from ``memory-stats.jsonl``. This method now
+        writes to the JSONL event stream so that legacy callers do not silently
+        lose stats, and emits a DeprecationWarning. Prefer record_memory_stat().
         """
-        _sm = _load_related_module("store_methods")
-        return _sm.record_stat(self, memory_id, event)
+        import warnings
+
+        warnings.warn(
+            "MemoryStore.record_stat() is deprecated; use record_memory_stat() instead. "
+            "The SQLite stats table is no longer the source of truth.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        record_memory_stat(memory_id, event)
 
     def effectiveness(self, memory_id: Optional[str] = None) -> Dict[str, MemoryEffectiveness]:
         """Effectiveness stats sourced from memory-stats.jsonl (the truth path).

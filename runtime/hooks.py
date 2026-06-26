@@ -21,6 +21,7 @@ from ..core.config import get_plugin_config_model
 from ..core.scope import normalize_scope_filters, scope_from_context
 from ..core.store import (
     LoadedMemory, MemoryFrontmatter, record_memory_stat,
+    batch_record_stats,
     hermes_home as _hermes_home, plugin_data_dir as _plugin_data_dir,
 )
 from ..reflection.engine import (
@@ -138,9 +139,9 @@ def _scope_filters_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Opt
 
     ⚠️ Fallback 3 accepts ANY kwarg keys matching the scope field names.
     If a hook caller passes an unrelated ``user_id`` (e.g. from a data
-    payload), it will be misinterpreted as a scope filter. This is a
-    known fragility — do not add new scope-like kwarg names without
-    review.
+    payload), it will be misinterpreted as a scope filter. This fallback
+    is retained for backward compatibility but emits a DeprecationWarning.
+    New callers should pass ``scope_filters`` explicitly.
     """
     explicit = kwargs.get("scope_filters")
     if explicit is not None:
@@ -154,7 +155,17 @@ def _scope_filters_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Opt
         "agent_id": kwargs.get("agent_id"),
         "run_id": kwargs.get("run_id"),
     }
-    return normalize_scope_filters({k: v for k, v in direct.items() if v is not None}) or None
+    normalized = normalize_scope_filters({k: v for k, v in direct.items() if v is not None}) or None
+    if normalized:
+        import warnings
+
+        warnings.warn(
+            "Resolving scope filters from bare user_id/agent_id/run_id kwargs is deprecated. "
+            "Pass scope_filters explicitly to avoid kwarg namespace collisions.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    return normalized
 
 _turns_since_reflect: int = 0
 _turns_since_reflect_lock = threading.Lock()  # H21: protect concurrent access
@@ -606,7 +617,14 @@ def _on_api_request_error(**kwargs) -> None:
         return
     state = _ensure_session_state(session_id)
     state["api_error_count"] = state.get("api_error_count", 0) + 1
-    error_type = kwargs.get("error", {}).get("type", "unknown")
+    # Host may pass error as dict, string, or exception object.
+    error = kwargs.get("error")
+    if isinstance(error, dict):
+        error_type = error.get("type", "unknown")
+    elif isinstance(error, str):
+        error_type = error
+    else:
+        error_type = getattr(error, "__class__", type(error)).__name__
     # Log threshold crossing for debugging
     n = state["api_error_count"]
     if n in (1, 5, 10, 25, 50):
@@ -726,8 +744,8 @@ def _enrich_with_graph(result_ids: List[str], result_out: List[dict], k: int,
     If zone_filter is provided, graph neighbors are restricted to that zone.
     """
     graph_expanded = _get_graph_neighbors(result_ids, max_results=k, zone_filter=zone_filter)
-    for neigh_id, _ in graph_expanded:
-        record_memory_stat(neigh_id, "accessed")
+    if graph_expanded:
+        batch_record_stats([(neigh_id, "accessed") for neigh_id, _ in graph_expanded])
     return {
         "results": result_out,
         "graph_expanded": [{"id": mid, "weight": round(w, 3)} for mid, w in graph_expanded],

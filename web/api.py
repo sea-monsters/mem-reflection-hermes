@@ -51,6 +51,9 @@ else:
 
 router = APIRouter()
 
+# Cap on related memories used for graph auto-association in create_memory.
+_MAX_AUTO_ASSOCIATE_RELATED = 20
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models for request validation
@@ -339,11 +342,18 @@ async def create_memory(payload: MemoryCreate):
                     run_id=payload.run_id,
                 )
                 all_mems = _get_store().list_active(filters=filters)
-                related = [m.id() for m in all_mems
-                          if m.id() != new_mem.id()
-                          and set(m.frontmatter.tags or []) & set(payload.tags)]
-                if related:
-                    gm.associator.on_memory_coactivation([new_mem.id()] + related)
+                related_mems = [
+                    m for m in all_mems
+                    if m.id() != new_mem.id()
+                    and set(m.frontmatter.tags or []) & set(payload.tags)
+                ]
+                # Most recent first to prefer currently relevant context.
+                related_mems.sort(key=lambda m: m.frontmatter.created or "", reverse=True)
+                related_ids = [
+                    m.id() for m in related_mems[:_MAX_AUTO_ASSOCIATE_RELATED]
+                ]
+                if related_ids:
+                    gm.associator.on_memory_coactivation([new_mem.id()] + related_ids)
         except Exception as e:
             logger.warning("Graph auto-associate failed: %s", e, exc_info=True)
     return {"status": "ok", "result": result, "degraded": gm is None}
@@ -352,14 +362,21 @@ async def create_memory(payload: MemoryCreate):
 @router.put("/memories/{mem_id}")
 async def update_memory(mem_id: str, payload: MemoryUpdate):
     """Update a memory's content or metadata."""
-    mem = _get_store().update(
-        mem_id,
-        body=payload.body,
-        zone=payload.zone,
-        confidence=payload.confidence,
-        tags=payload.tags,
-        pinned=payload.pinned,
-    )
+    try:
+        mem = _get_store().update(
+            mem_id,
+            body=payload.body,
+            zone=payload.zone,
+            confidence=payload.confidence,
+            tags=payload.tags,
+            pinned=payload.pinned,
+        )
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail="Memory not found") from e
+        raise
+    if mem is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     # Update graph meta if zone changed
     if payload.zone:
         gm = _get_graph_interface()

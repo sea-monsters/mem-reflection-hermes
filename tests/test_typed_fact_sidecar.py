@@ -230,6 +230,36 @@ def test_invalidate_facts_for_memories_bulks_invalidates_owned_facts(temp_graph_
     assert referencing[0]["invalidated_by"] is None
 
 
+def test_compact_typed_facts_prunes_old_invalidated_rows(temp_graph_index):
+    """P2-4: invalidated typed facts older than retention are GC'd; active rows remain."""
+    gi = temp_graph_index
+    active_id = gi.record_typed_fact(
+        "mem-active", "Active fact", relation="describes",
+        kind="preference", target_memory_id="mem-active", source="reflection",
+    )
+    stale_id = gi.record_typed_fact(
+        "mem-stale", "Stale fact", relation="describes",
+        kind="preference", target_memory_id="mem-stale", source="reflection",
+    )
+    gi.invalidate_typed_fact(stale_id, invalidated_by="mem-new")
+
+    # Age the stale invalidated row well beyond a 30-day retention window.
+    old_ts = "2020-01-01T00:00:00+00:00"
+    gi._get_conn().execute(
+        "UPDATE typed_facts SET valid_until = ? WHERE fact_id = ?",
+        (old_ts, stale_id),
+    )
+    gi._get_conn().commit()
+
+    assert len(gi.typed_facts(source_memory_id="mem-active")) == 1
+    assert len(gi.typed_facts(source_memory_id="mem-stale", include_invalidated=True)) == 1
+
+    deleted = gi.compact_typed_facts(retention_days=30)
+    assert deleted == 1
+    assert len(gi.typed_facts(source_memory_id="mem-active")) == 1
+    assert gi.typed_facts(source_memory_id="mem-stale", include_invalidated=True) == []
+
+
 def test_compaction_invalidates_superseded_episode_facts(temp_mem_store, temp_graph_index):
     """P1-1 end-to-end: compaction must invalidate the typed facts owned by the
     raw episodes it folds into a summary. This was the gap the round-2/3 audit

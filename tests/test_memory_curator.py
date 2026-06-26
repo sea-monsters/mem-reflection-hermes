@@ -1,6 +1,7 @@
 """Unit tests for memory_curator module."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import time
@@ -32,7 +33,7 @@ from memory.curator import (  # noqa: E402
     _cold_store_path,
     _load_cold_store,
 )
-from memory.curator import _append_to_cold_store, _curator_config  # noqa: E402
+from memory.curator import _append_to_cold_store, _curator_config, _prune_cold_store  # noqa: E402
 
 
 @pytest.fixture
@@ -67,6 +68,20 @@ class TestScanForStale:
         assert "expired" in stale
         assert "keep" not in stale
         assert "fresh" not in stale
+
+    def test_finds_old_memory_without_effectiveness(self, temp_dir):
+        """P2-14: memories predating the stats pipeline must still age out."""
+        from tests._helpers import _age_to_iso
+        s = _isolated_store(temp_dir)
+        s.memories["ancient"] = MockMemory(
+            "ancient",
+            "pre-stats memory",
+            created=_age_to_iso(200),
+            confidence="low",
+        )
+        # No effectiveness record -> previously immortal.
+        stale = scan_for_stale(s)
+        assert "ancient" in stale
 
 
 class TestArchiveExpired:
@@ -164,6 +179,37 @@ class TestColdStorage:
         entries = _load_cold_store(store)
         ids = [e["id"] for e in entries]
         assert "test1" in ids
+
+    def test_prune_is_atomic_and_preserves_remaining_entries(self, store):
+        """Pruning writes a temp file and atomically replaces the cold store.
+
+        Oldest (and largest) entries are removed; remaining entries survive
+        without loss and no temporary file is left behind.
+        """
+        cold_path = Path(store._cold_store_path_override)
+        large_payload = "x" * 1_100_000
+        entries = [
+            {"id": f"old-{i}", "archived_at": f"2026-01-0{i+1}T00:00:00Z", "body": large_payload}
+            for i in range(3)
+        ] + [
+            {"id": "new-1", "archived_at": "2026-01-10T00:00:00Z", "body": "keep1"},
+            {"id": "new-2", "archived_at": "2026-01-11T00:00:00Z", "body": "keep2"},
+        ]
+        cold_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cold_path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+        pruned = _prune_cold_store(store, cap_mb=1)
+        assert pruned == 3
+
+        remaining = _load_cold_store(store)
+        remaining_ids = [e["id"] for e in remaining]
+        assert remaining_ids == ["new-1", "new-2"]
+        assert all(e["body"] in ("keep1", "keep2") for e in remaining)
+
+        # Atomic rewrite must not leave a temp file behind.
+        assert not cold_path.with_suffix(".tmp").exists()
 
 
 # ── P2b: Cold Restore Graph Rebuild ─────────────────────────

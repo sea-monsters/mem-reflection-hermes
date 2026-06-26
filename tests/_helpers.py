@@ -17,6 +17,7 @@ if str(_REPO) not in sys.path:
 # Use store.py dataclasses directly (leaf module, no relative imports).
 # core.py's MemoryFrontmatter lacks to_dict() needed by store.py's write_memory_atomic.
 from core.store import LoadedMemory, MemoryFrontmatter, MemoryEffectiveness
+from core.scope import filter_memories_by_scope
 
 
 def make_memory(
@@ -163,11 +164,14 @@ class MockStore:
         return self.memories.get(mid)
 
     def put(self, scope: str, fm, body: str):
-        self.memories[fm.id] = MockMemory(
+        mem = MockMemory(
             fm.id, body,
             zone=getattr(fm, "zone", "general"),
             tags=getattr(fm, "tags", []),
         )
+        for key in ("user_id", "agent_id", "run_id"):
+            setattr(mem.frontmatter, key, getattr(fm, key, None))
+        self.memories[fm.id] = mem
 
     def list(self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None,
              filters=None):
@@ -175,8 +179,7 @@ class MockStore:
         if zone:
             mems = [m for m in mems if m.frontmatter.zone == zone]
         if filters:
-            for key, val in filters.items():
-                mems = [m for m in mems if getattr(m.frontmatter, key, None) == val]
+            mems = filter_memories_by_scope(mems, filters)
         if limit is not None:
             mems = mems[:limit]
         return mems

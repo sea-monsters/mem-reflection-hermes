@@ -19,6 +19,7 @@ import pytest
 import mem_reflection_hermes.core.store as store_mod
 from mem_reflection_hermes.core.store import (
     MemoryEffectiveness,
+    MemoryFrontmatter,
     record_memory_stat,
     load_effectiveness,
 )
@@ -71,6 +72,56 @@ class TestReadPathBackwardCompat:
     def test_load_empty_when_no_files(self, isolated_stats_dir):
         assert store_mod.load_effectiveness() == {}
 
+    def test_deprecated_record_stat_forwards_to_jsonl(self, isolated_stats_dir):
+        """P2-1: MemoryStore.record_stat() still records stats (to JSONL) but warns."""
+        from mem_reflection_hermes.core.store import MemoryStore
+        import warnings
+
+        home = isolated_stats_dir.parent
+        store = MemoryStore(user_root=home / "memories", db_path=home / "memories.db")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            store.record_stat("legacy-mem", "accessed")
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
+
+        eff = store_mod.load_effectiveness()
+        assert "legacy-mem" in eff
+        assert eff["legacy-mem"].accessed == 1
+
+
+    def test_deprecated_store_methods_effectiveness_forwards_to_jsonl(self, isolated_stats_dir):
+        """P2-1: store_methods.effectiveness() forwards to JSONL truth path."""
+        import warnings
+        from mem_reflection_hermes.core import store_methods
+        from mem_reflection_hermes.core.store import MemoryStore
+
+        home = isolated_stats_dir.parent
+        store = MemoryStore(user_root=home / "memories", db_path=home / "memories.db")
+        _write_event(store_mod._stats_path(), "m1", "accessed", "2026-06-01T00:00:00+00:00")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            eff = store_methods.effectiveness(store, memory_id="m1")
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
+        assert eff["m1"].accessed == 1
+
+    def test_deprecated_store_methods_record_stat_forwards_to_jsonl(self, isolated_stats_dir):
+        """P2-1: store_methods.record_stat() writes JSONL, not the SQLite stats table."""
+        import warnings
+        from mem_reflection_hermes.core import store_methods
+        from mem_reflection_hermes.core.store import MemoryStore
+
+        home = isolated_stats_dir.parent
+        store = MemoryStore(user_root=home / "memories", db_path=home / "memories.db")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            store_methods.record_stat(store, "legacy-sm", "accessed")
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
+
+        eff = store_mod.load_effectiveness()
+        assert "legacy-sm" in eff
+        assert eff["legacy-sm"].accessed == 1
+
 
 class TestDualTrackRead:
     """Snapshot baseline + event-stream tail merge."""
@@ -119,7 +170,9 @@ class TestCompaction:
     """compact_stats_snapshot folds + truncates."""
 
     def test_fold_truncates_and_preserves_result(self, isolated_stats_dir, monkeypatch):
-        from memory.curator.helpers import compact_stats_snapshot
+        # Use the package-prefixed import path so compact_stats_snapshot shares
+        # the same _stat_write_lock instance as record_memory_stat in core.store.
+        from mem_reflection_hermes.memory.curator.helpers import compact_stats_snapshot
         from tests._helpers import MockStore
 
         # Lower the threshold so we can trigger compaction with few lines.
@@ -132,6 +185,14 @@ class TestCompaction:
             _write_event(stats_path, "m1", "accessed", t)
         _write_event(stats_path, "m2", "loaded", t)
 
+        # P2-16: compact_stats_snapshot GCs rows for memories that no longer exist.
+        # Put the memories into the mock store so they are retained.
+        for mid in ("m1", "m2"):
+            fm = MemoryFrontmatter.new(source="test", confidence="medium")
+            # Override the auto-generated id so it matches the event memory_id.
+            fm.id = mid
+            store.put("user", fm, f"body {mid}")
+
         eff_before = store_mod.load_effectiveness()
         assert eff_before["m1"].accessed == 5
 
@@ -139,6 +200,7 @@ class TestCompaction:
         assert result["compacted"] is True
         assert result["lines_before"] == 6
         assert result["lines_after"] == 0
+        assert result.get("removed_dead_rows", 0) == 0
 
         # Event stream truncated.
         assert store_mod._stats_path().read_text().strip() == ""
@@ -152,7 +214,7 @@ class TestCompaction:
         assert eff_after["m2"].loaded == 1
 
     def test_skip_when_below_threshold(self, isolated_stats_dir):
-        from memory.curator.helpers import compact_stats_snapshot
+        from mem_reflection_hermes.memory.curator.helpers import compact_stats_snapshot
         from tests._helpers import MockStore
 
         store = MockStore()  # default threshold 5000
@@ -166,11 +228,16 @@ class TestCompaction:
         assert len(store_mod._stats_path().read_text().strip().splitlines()) == 1
 
     def test_post_compaction_new_events_merge(self, isolated_stats_dir):
-        from memory.curator.helpers import compact_stats_snapshot
+        from mem_reflection_hermes.memory.curator.helpers import compact_stats_snapshot
         from tests._helpers import MockStore
 
         store = MockStore()
         store._plugin_config_override = {"curator": {"stats": {"compact_threshold_lines": 2}}}
+
+        # Seed the mock store with the memory so compaction retains its stats.
+        fm = MemoryFrontmatter.new(source="test", confidence="medium")
+        fm.id = "m1"
+        store.put("user", fm, "body m1")
 
         # Initial events.
         _write_event(store_mod._stats_path(), "m1", "accessed", "2026-06-01T00:00:00+00:00")
@@ -185,6 +252,74 @@ class TestCompaction:
         eff = store_mod.load_effectiveness()
         assert eff["m1"].accessed == 3  # snapshot(2) + tail(1)
         assert eff["m2"].loaded == 1
+
+    def test_compaction_removes_dead_rows(self, isolated_stats_dir):
+        """P2-16: rows for deleted/archived memories are GC'd during compaction."""
+        from mem_reflection_hermes.memory.curator.helpers import compact_stats_snapshot
+        from tests._helpers import MockStore
+
+        store = MockStore()
+        store._plugin_config_override = {"curator": {"stats": {"compact_threshold_lines": 2}}}
+
+        fm = MemoryFrontmatter.new(source="test", confidence="medium")
+        fm.id = "alive"
+        store.put("user", fm, "body alive")
+
+        _write_event(store_mod._stats_path(), "alive", "accessed", "2026-06-01T00:00:00+00:00")
+        _write_event(store_mod._stats_path(), "dead", "accessed", "2026-06-01T00:00:00+00:00")
+
+        result = compact_stats_snapshot(store)
+        assert result["compacted"] is True
+        assert result.get("removed_dead_rows", 0) == 1
+
+        eff = store_mod.load_effectiveness()
+        assert "alive" in eff
+        assert "dead" not in eff
+
+    def test_compaction_holds_lock_against_concurrent_appends(self, isolated_stats_dir, monkeypatch):
+        """P1-4: concurrent stat appends during compaction must not be lost."""
+        import threading
+        import time
+        from mem_reflection_hermes.memory.curator.helpers import compact_stats_snapshot
+        from tests._helpers import MockStore
+
+        store = MockStore()
+        store._plugin_config_override = {
+            "curator": {"stats": {"compact_threshold_lines": 3}}
+        }
+
+        # Seed m1 so compaction retains its stats.
+        fm = MemoryFrontmatter.new(source="test", confidence="medium")
+        fm.id = "m1"
+        store.put("user", fm, "body m1")
+
+        t = "2026-06-01T00:00:00+00:00"
+        stats_path = store_mod._stats_path()
+        _write_event(stats_path, "m1", "accessed", t)
+        _write_event(stats_path, "m1", "accessed", t)
+        _write_event(stats_path, "m1", "accessed", t)
+
+        appended = []
+        barrier = threading.Barrier(2)
+
+        def _concurrent_appender():
+            # Synchronize with compaction so we append right inside the critical window.
+            barrier.wait()
+            time.sleep(0.01)
+            for i in range(3):
+                record_memory_stat("m1", "accessed")
+                appended.append(i)
+
+        appender = threading.Thread(target=_concurrent_appender)
+        appender.start()
+        barrier.wait()
+        result = compact_stats_snapshot(store)
+        appender.join(timeout=5)
+
+        assert result["compacted"] is True
+        # After compaction the snapshot plus any post-fold tail must account for all events.
+        eff = store_mod.load_effectiveness()
+        assert eff["m1"].accessed >= 3 + len(appended)
 
     def test_write_snapshot_skips_allzero_rows(self, isolated_stats_dir):
         # A memory with no activity should not appear in the snapshot.

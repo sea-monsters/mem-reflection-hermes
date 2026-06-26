@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _reflect_log_lock = threading.Lock()
 _pending_skills_lock = threading.Lock()
 _current_session_memory_ids = threading.local()
+_raw_chunk_count = threading.local()
 
 __all__ = [
     "_FULL_REFLECT_SYSTEM",
@@ -255,6 +256,7 @@ def _record_semantic_relation_sidecar(
     relation = "merges" if action == "merge" else "scope_split_with"
     kind = "semantic_merge" if action == "merge" else "semantic_scope_split"
     zone = getattr(fm, "zone", "general") or "general"
+    failures: List[str] = []
     for target_id in target_ids:
         try:
             graph.record_typed_fact(
@@ -271,8 +273,29 @@ def _record_semantic_relation_sidecar(
                 confidence=float(confidence),
             )
         except Exception as e:
-            logger.warning("Semantic relation sidecar failed for %s: %s", fm.id, e, exc_info=True)
-            break
+            # Do not break on the first failing target; collect failures so the
+            # remaining targets are not silently dropped.
+            failures.append(target_id)
+            logger.warning(
+                "Semantic relation sidecar failed for %s -> %s: %s",
+                fm.id, target_id, e, exc_info=True,
+            )
+
+    if failures:
+        logger.warning(
+            "Semantic relation sidecar recorded %d/%d targets; failures: %s",
+            len(target_ids) - len(failures), len(target_ids), failures,
+        )
+
+    # P3-5: scope_split must invalidate the target memory's typed facts,
+    # just as merge does, so stale facts are not retained.
+    if action == "scope_split":
+        invalidate = getattr(graph, "invalidate_facts_for_memories", None)
+        if invalidate is not None:
+            try:
+                invalidate(list(target_ids), invalidated_by=fm.id)
+            except Exception as e:
+                logger.warning("Semantic relation invalidation failed for %s: %s", fm.id, e, exc_info=True)
 
 
 def _build_audit_entry(
@@ -318,9 +341,23 @@ def _remember_current_session_memory_id(memory_id: str) -> None:
 
 
 
+def _get_raw_chunk_session_count() -> int:
+    return int(getattr(_raw_chunk_count, "value", 0) or 0)
+
+
+def _increment_raw_chunk_session_count() -> None:
+    _raw_chunk_count.value = _get_raw_chunk_session_count() + 1
+
+
+def _reset_raw_chunk_session_count() -> None:
+    if hasattr(_raw_chunk_count, "value"):
+        delattr(_raw_chunk_count, "value")
+
+
 def _reset_current_session_memory_ids() -> None:
     if hasattr(_current_session_memory_ids, "ids"):
         delattr(_current_session_memory_ids, "ids")
+    _reset_raw_chunk_session_count()
 
 
 # # Block 1: Reflection log
@@ -838,6 +875,7 @@ def _run_full_reflection(
     mem_store = _get_mem_store()
     accepted_memories = []
 
+    current_session_ids = _get_current_session_memory_ids()
     for cand in parsed.get("memory_candidates", []):
         body = cand.get("fact", "")
         scope = cand.get("scope", "user")
@@ -848,7 +886,10 @@ def _run_full_reflection(
         candidate_supersedes = list(cand.get("supersedes", []) or [])
         novelty = 0.0
         try:
-            novelty = _compute_novelty_score(body, mem_store.list_active(filters=scope_filters))
+            novelty = _compute_novelty_score(
+                body, mem_store.list_active(filters=scope_filters),
+                exclude_ids=current_session_ids,
+            )
         except Exception:
             pass
 
@@ -862,7 +903,11 @@ def _run_full_reflection(
             explicit_supersedes=candidate_supersedes,
         )
 
-        conflict = mem_store.check_conflict(body, exclude_ids=list(candidate_supersedes), filters=scope_filters)
+        conflict = mem_store.check_conflict(
+            body,
+            exclude_ids=list(current_session_ids | set(candidate_supersedes)),
+            filters=scope_filters,
+        )
         if conflict:
             existing_id, score = conflict
             logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
@@ -1027,13 +1072,17 @@ def _run_micro_reflection(
     accepted = None
     audit_entries: List[Dict[str, Any]] = []
 
+    current_session_ids = _get_current_session_memory_ids()
     for cand in parsed.get("memory_candidates", [])[:1]:
         body = cand.get("fact", "")
         scope = cand.get("scope", "user")
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         novelty = 0.0
         try:
-            novelty = _compute_novelty_score(body, mem_store.list_active(filters=scope_filters))
+            novelty = _compute_novelty_score(
+                body, mem_store.list_active(filters=scope_filters),
+                exclude_ids=current_session_ids,
+            )
         except Exception:
             pass
 
@@ -1051,7 +1100,11 @@ def _run_micro_reflection(
         )
         supersedes = candidate_supersedes if plan["action"] == "supersede" else []
 
-        conflict = mem_store.check_conflict(body, exclude_ids=list(candidate_supersedes), filters=scope_filters)
+        conflict = mem_store.check_conflict(
+            body,
+            exclude_ids=list(current_session_ids | set(candidate_supersedes)),
+            filters=scope_filters,
+        )
         if conflict:
             existing_id, score = conflict
             audit_entries.append(_build_audit_entry(
@@ -1140,6 +1193,33 @@ def _run_micro_reflection(
 
 PENDING_SKILLS_PATH = _plugin_data_dir() / "pending-skills.json"
 _MAX_PENDING_SKILLS = 200  # P2-27: max pending items before archive
+_MAX_PENDING_SKILL_ARCHIVE_AGE_DAYS = 30
+_MAX_PENDING_SKILL_ARCHIVES = 10
+_MAX_RAW_CHUNK_PER_SESSION = 20
+
+
+def _cleanup_pending_skill_archives() -> None:
+    """Purge old pending-skills archives by age and count (P3-6)."""
+    try:
+        archives = sorted(
+            PENDING_SKILLS_PATH.parent.glob("pending-skills.*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not archives:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - _MAX_PENDING_SKILL_ARCHIVE_AGE_DAYS * 86400
+        for idx, arch in enumerate(archives):
+            mtime = arch.stat().st_mtime
+            if idx >= _MAX_PENDING_SKILL_ARCHIVES or mtime < cutoff:
+                arch.unlink(missing_ok=True)
+                logger.debug(
+                    "Deleted old pending-skills archive %s (mtime %s)",
+                    arch,
+                    datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                )
+    except Exception as e:
+        logger.debug("Pending-skills archive cleanup failed: %s", e)
 
 
 def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
@@ -1168,6 +1248,9 @@ def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
             existing.extend(candidates)
             with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
+            # P3-6: prune archive files after every save so old timestamped
+            # archives do not grow without bound.
+            _cleanup_pending_skill_archives()
     except Exception as e:
         logger.warning("Failed to save pending skill candidates: %s", e)
 
@@ -1717,6 +1800,33 @@ def _run_raw_chunk_reflection(
     accepted = []
     audit_entries: List[Dict[str, Any]] = []
 
+    # P3-7: enforce a per-session cap on raw_chunk episode memories.
+    try:
+        max_raw = int(plugin_config().get("reflection", {}).get("max_raw_chunk_per_session", _MAX_RAW_CHUNK_PER_SESSION))
+    except Exception:
+        max_raw = _MAX_RAW_CHUNK_PER_SESSION
+    current_raw_count = _get_raw_chunk_session_count()
+    if current_raw_count >= max_raw:
+        logger.info(
+            "Raw chunk reflection cap reached (%d/%d); skipping new chunks for this session",
+            current_raw_count, max_raw,
+        )
+        summary = f"Raw chunk reflection: cap reached ({current_raw_count}/{max_raw}); 0 chunks stored from {len(messages)} messages."
+        _append_reflect_log({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "raw_chunk",
+            "summary": summary,
+            "accepted_memories": 0,
+            "audit_entries": audit_entries,
+        })
+        return {
+            "mode": "raw_chunk",
+            "summary": summary,
+            "accepted_memories": accepted,
+            "chunks_created": 0,
+            "cap_reached": True,
+        }
+
     # Group messages into 3-turn windows
     chunk_size = 3
     for i in range(0, len(messages), chunk_size):
@@ -1759,12 +1869,19 @@ def _run_raw_chunk_reflection(
             )
             accepted.append({"id": fm.id, "body_preview": body[:120], "kind": "raw_chunk"})
             _remember_current_session_memory_id(fm.id)
+            _increment_raw_chunk_session_count()
             audit_entries.append(_build_audit_entry(
                 candidate_id=f"chunk_{fm.id}",
                 decision="accepted",
                 decision_reason="raw chunk stored (zero LLM)",
                 assigned_zone="episode",
             ))
+            if _get_raw_chunk_session_count() >= max_raw:
+                logger.info(
+                    "Raw chunk reflection cap reached (%d/%d); stopping further chunks",
+                    max_raw, max_raw,
+                )
+                break
         except Exception as e:
             logger.debug("Raw chunk storage failed: %s", e)
             audit_entries.append(_build_audit_entry(
@@ -1803,6 +1920,7 @@ def _run_embedding_micro_reflection(
     scope_filters = _scope_filters_from_context(None, scope_filters)
     mem_store = _get_mem_store()
     active_memories = mem_store.list_active(filters=scope_filters)
+    current_session_ids = _get_current_session_memory_ids()
 
     combined = f"{user_msg} {assistant_msg}"
     cand_id = f"cand_{uuid.uuid4().hex[:12]}"
@@ -1811,7 +1929,7 @@ def _run_embedding_micro_reflection(
     # Extract facts first - if user has explicit intent, always process
     facts = _extract_facts_from_turn(user_msg, assistant_msg)
     # Quick novelty check - but skip if user explicitly wants to remember
-    novelty = _compute_novelty_score(combined, active_memories)
+    novelty = _compute_novelty_score(combined, active_memories, exclude_ids=current_session_ids)
     if not has_explicit_intent and novelty < 0.25:
         logger.debug("Micro-reflection: turn too similar to existing memories (%.3f), skipping", novelty)
         _append_reflect_log({
@@ -1850,7 +1968,9 @@ def _run_embedding_micro_reflection(
     best = facts[0]
 
     # Check conflict
-    conflict_mem = _find_conflicting_memory(best["text"], active_memories)
+    conflict_mem = _find_conflicting_memory(
+        best["text"], active_memories, exclude_ids=current_session_ids
+    )
     tags = _extract_keywords(best["text"], top_k=3)
 
     supersedes = []

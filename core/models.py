@@ -267,6 +267,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     data.setdefault("zone", "general")
     data.setdefault("always_active", False)
     data.setdefault("rank", 0)
+    data.setdefault("version", 1)
     data.setdefault("user_id", None)
     data.setdefault("agent_id", None)
     data.setdefault("run_id", None)
@@ -302,6 +303,9 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
     rank = data.get("rank")
     if rank is not None and rank != 0:
         buf.append(f"rank: {rank}")
+    version = data.get("version")
+    if version is not None:
+        buf.append(f"version: {version}")
     buf.append("---")
     if body:
         buf.append("")
