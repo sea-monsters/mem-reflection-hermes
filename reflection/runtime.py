@@ -21,6 +21,7 @@ from ..core.store import (
     micro_reflection_enabled, profile_mode_enabled, plugin_config,
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
+    _bm25_search_scored,
 )
 from ..core.search import (
     _embed_single, _cosine_sim, _extract_keywords,
@@ -77,40 +78,39 @@ __all__ = [
     "_update_pending_skill_status",
 ]
 
-def _package_root():
-    pkg_name = __package__.rsplit(".", 1)[0] if __package__ and "." in __package__ else __package__
-    if not pkg_name:
-        raise RuntimeError("reflection engine package root is unavailable")
-    pkg = sys.modules.get(pkg_name)
-    if pkg is None:
-        raise RuntimeError(f"Package module {pkg_name!r} is not loaded")
-    return pkg
-
-
 def _get_mem_store():
     """Return the package-level MemoryStore singleton."""
-    return _package_root()._get_mem_store()
+    from ..runtime.state import _get_mem_store as _impl
+    return _impl()
 
 
 def _get_skill_store():
-    return _package_root()._get_skill_store()
+    from ..runtime.state import _get_skill_store as _impl
+    return _impl()
 
 
 def _estimate_tokens(text):
-    return _package_root()._estimate_tokens(text)
+    from ..runtime.helpers import _estimate_tokens as _impl
+    return _impl(text)
 
 
 def _auto_rebalance_zones():
-    return _package_root()._auto_rebalance_zones()
+    from ..runtime.tools import _auto_rebalance_zones as _impl
+    return _impl()
 
 
 def _build_context_block(query=""):
-    return _package_root()._build_context_block(query)
+    from ..runtime.helpers import _build_context_block as _impl
+    return _impl(query)
 
 
 def _reflection_mode() -> str:
     """Reflection mode from config."""
-    return _package_root()._reflection_mode()
+    from ..core.store import plugin_config
+    cfg = plugin_config().get("reflection", {})
+    if isinstance(cfg, dict):
+        return str(cfg.get("mode", "auto"))
+    return "auto"
 
 
 def _scope_filters_from_context(ctx=None, filters: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Optional[str]]]:
@@ -668,7 +668,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
 
 def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
     """Max BM25 similarity between text and existing memories (0-1 normalized)."""
-    scored = _package_root()._bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
+    scored = _bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
     if scored:
         # Normalize BM25 score to 0-1 using sigmoid approximation
         raw = scored[0][1]

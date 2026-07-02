@@ -475,33 +475,31 @@ def _delegate_runtime_reflection(name: str):
 
 
 def _get_mem_store():
-    from mem_reflection_hermes import _get_mem_store as _root_get_mem_store
-
-    return _root_get_mem_store()
+    from ..runtime.state import _get_mem_store as _impl
+    return _impl()
 
 
 def _get_skill_store():
-    from mem_reflection_hermes import _get_skill_store as _root_get_skill_store
-
-    return _root_get_skill_store()
+    from ..runtime.state import _get_skill_store as _impl
+    return _impl()
 
 
 def _reflection_mode() -> str:
-    from mem_reflection_hermes import _reflection_mode as _root_reflection_mode
-
-    return _root_reflection_mode()
+    from ..core.store import plugin_config
+    cfg = plugin_config().get("reflection", {})
+    if isinstance(cfg, dict):
+        return str(cfg.get("mode", "auto"))
+    return "auto"
 
 
 def _build_context_block(query: str = ""):
-    from mem_reflection_hermes import _build_context_block as _root_build_context_block
-
-    return _root_build_context_block(query)
+    from ..runtime.helpers import _build_context_block as _impl
+    return _impl(query)
 
 
 def _auto_rebalance_zones():
-    from mem_reflection_hermes import _auto_rebalance_zones as _root_auto_rebalance_zones
-
-    return _root_auto_rebalance_zones()
+    from ..runtime.tools import _auto_rebalance_zones as _impl
+    return _impl()
 
 
 def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
