@@ -1,5 +1,123 @@
 # Changelog
 
+## v1.7 — Scope-Aware Reflection Propagation (release hardening)
+
+### Phase A: Reflection Scope Context
+
+- **Central scope helper**: `core/scope.py` now exposes a shared `scope_from_context()` helper so hooks, curator, and reflection can resolve `user_id` / `agent_id` / `run_id` the same way.
+- **Reflection write paths**: `_run_full_reflection()`, `_run_micro_reflection()`, `_run_embedding_reflection()`, `_run_raw_chunk_reflection()`, and `_compact_episode_zone()` now stamp scope fields onto new memories when the host provides them.
+- **Reflection reads and conflict checks**: scoped reflection paths now pass `filters` into `list_active()`, `check_conflict()`, and compaction reads instead of falling back to global store reads.
+- **Hook propagation**: `pre_llm_call` and `on_session_end` now forward scope filters into context assembly, micro-reflection, full reflection, compaction, and curator runs.
+- **Manual reflection tool**: `srh_reflect_now` now accepts optional `filters` so agents can manually run reflection without accidentally widening the scope.
+
+### Phase B: Refined Extraction Baseline
+
+- **Shared extraction module**: `reflection/extraction.py` now centralizes refined candidate extraction so runtime and engine stop drifting apart.
+- **Typed candidate kinds**: extracted candidates now carry `kind` / `priority` metadata for `intent`, `correction`, `decision`, `todo`, `preference`, `policy`, and `procedure`.
+- **Lossless propagation**: `kind` now survives from extraction into `memory_candidates` and `accepted_memories`, so downstream callers can inspect what kind of memory was stored.
+- **Regression coverage**: new `tests/test_reflection_refinement.py` locks the decision / todo / preference behavior before future tuning.
+
+### Phase C: Semantic Supersedes Start
+
+- **Semantic resolver**: `reflection/supersedes_resolver.py` now separates correction, merge, store, skip, and scope-split decisions from raw conflict detection.
+- **Heuristic reflection update**: embedding-based micro/full reflection paths now preserve explicit memory intent without automatically promoting it to supersedes, while true correction flows still supersede the prior memory.
+- **LLM reflection update**: full/micro LLM reflection paths now route candidate supersedes through the same resolver so generic intent strips replacement edges instead of writing them blindly.
+- **Scope guard**: `MemoryStore.put()` now rejects supersedes targets that belong to a different scope or tenant root.
+- **Regression coverage**: `tests/test_semantic_supersedes.py` locks correction, merge, store, scope-split, and cross-scope rejection behavior.
+
+### Phase D: Typed Fact Sidecar Start
+
+- **Typed sidecar table**: `core/graph.py` now stores typed fact rows with source memory, target memory, episode lineage, relation, kind, and invalidation metadata.
+- **Reflection writes**: micro/full/raw-chunk reflection now best-effort record typed sidecar facts when a graph backend is attached to the store.
+- **Distillation lineage**: `GraphIndex.distill()` now records both the semantic summary row and member-of relations in the typed sidecar.
+- **Regression coverage**: `tests/test_typed_fact_sidecar.py` locks sidecar write, invalidation, and distill lineage behavior.
+
+### Phase E: Compaction Quality
+
+- **Scored fallback**: `_compact_episode_zone()` and the LLM fallback now prefer concise, conclusion-like fragments instead of the longest raw transcript chunk.
+- **Conservative merge**: the fallback may join up to two non-duplicate high-signal fragments when they complement each other.
+- **Token accounting**: compaction summaries now report source/summary token counts and compression ratio so fallback quality can be inspected directly.
+- **Quality gate**: verbose or noisy LLM summaries are rejected when they score worse than the scored fallback, and the fallback summary is used instead.
+- **Regression coverage**: `tests/test_compaction.py` now locks the representative-fragment behavior, token accounting, and noisy LLM fallback regressions.
+
+### Phase F: Release Hardening
+
+- **Windows test isolation**: pytest now uses a per-run plugin-specific `basetemp`, avoiding stale Windows temp-directory ACL conflicts during suite setup.
+- **Recovery callback compatibility**: runtime import-hygiene tests now accept scoped recovery kwargs, matching the current checkpoint recovery contract.
+- **Scoped compaction boundary**: reflection scope tests now assert that compacting one tenant scope does not supersede another scope's raw episodes.
+- **Coverage index sync**: `docs/testing/test-coverage.md` has been synchronized with the current `638` collected tests and v1.7 acceptance surfaces.
+- **Full-suite validation**: current v1.7 hardening baseline is `pytest tests -q` -> `686 passed` (includes 2026-06-26 round-5 fixes).
+- **Test grouping simplification**: markers are now registered in `pytest.ini` and auto-assigned per-file in `tests/conftest.py`; new `v17` group covers the round-3 functional fixes (typed sidecar invalidation, semantic supersedes merge/scope_split, kind typing, ScopeIntent). Marker coverage closed for the 11 previously-untagged test files.
+
+### Round-3 Functional Fixes (`v17`)
+
+- **P1-1 typed sidecar invalidation**: `core/graph.py` gains `invalidate_facts_for_memories()`; `_record_typed_fact_sidecar()` now accepts `superseded_memory_ids` and all supersede/compaction paths invalidate the folded facts.
+- **P1-2 semantic merge/scope_split**: `_record_semantic_relation_sidecar()` writes `merges` / `scope_split_with` typed edges so the resolver's decision is no longer silently dropped; merge also invalidates the merge target's facts.
+- **P2-1 kind typing**: `REFINED_MEMORY_KINDS` vocabulary + `normalize_memory_kind()`; the LLM reflection schema and prompts now emit `kind`, ending the silent degeneration of the sidecar's kind column to `fact`.
+- **P2-2 dead-code cleanup**: removed the latent broken `_memory_tokens` import in `reflection/engine.py`; consolidated the triplicated `_is_memorable_content` / `_is_noise_text` / `_text_similarity` onto the CJK-aware `extraction.py` source of truth.
+- **P2-3 ScopeIntent**: `core/scope.py` introduces `ScopeIntent` (UNSCOPED/TENANT/GLOBAL_ONLY) and `global_only_scope()` so the IS NULL intent is finally expressible; `None`/`{}` semantics unchanged for backward compatibility.
+- **A5 palace_recall schema stability**: `runtime/tools.py::_tool_srh_palace_recall` now returns `graph_expanded: []` in scoped mode to keep the response schema stable; `tests/test_palace_recall.py` locks the regression.
+- **Regression coverage**: 20 new tests (suite 617 -> 638); see `docs/dev/1.7/v1.7-round3-functional-audit.md`.
+
+### Round-4 P3 Root-Cause Fixes
+
+- **P3-1 batch stats recording**: `record_memory_stat()` loops in `runtime/tools.py` and `runtime/hooks.py` are now batched through `batch_record_stats()` to reduce lock churn and make the batch API actually used in production.
+- **P3-2 async write fallback failure propagation**: `core/store.py::async_write_memory()` now raises `RuntimeError` when the synchronous fallback fails, instead of silently logging a warning.
+- **P3-3 frontmatter version preservation**: `MemoryFrontmatter.version` is now serialized by `serialize_frontmatter()` and `_frontmatter_to_data()`, surviving disk round-trips.
+- **P3-4 MockStore scope parity**: `tests/_helpers.py::MockStore.list()` now filters through `core.scope.filter_memories_by_scope()` so tests mirror production scope semantics.
+- **P3-5 scope_split fact invalidation**: `_record_semantic_relation_sidecar()` now invalidates target-memory typed facts for `scope_split` as well as `merge`.
+- **P3-6 pending-skills archive retention**: old `pending-skills.<timestamp>.json` archives are pruned after 30 days or when more than 10 archives accumulate.
+- **P3-7 raw_chunk per-session cap**: `_run_raw_chunk_reflection()` now limits raw-chunk episode memories to 20 per session (configurable via `plugin_config().reflection.max_raw_chunk_per_session`).
+- **P3-8 atomic cold-store prune**: `memory/curator/cold_store.py::_prune_cold_store()` rewrites the cold store atomically via temp-file + `os.replace()`.
+- **P3-9 dashboard update 404**: `web/api.py::update_memory()` now returns HTTP 404 instead of 500 for non-existent memory IDs.
+- **P3-10 capped auto-association**: `web/api.py::create_memory()` caps graph auto-association to the 20 most recent tag-overlapping memories.
+- **Regression coverage**: 9 new tests; full-suite baseline moves to 656 passed.
+
+### Round-5 Schema / Graph / Curator Hardening (2026-06-26)
+
+Triggered by a systematic-debugging review of the latest v1.7 beta fixes. All items below are confirmed by new regression tests; full-suite baseline is **686 passed**.
+
+- **R5-1 graph feature registration wired**: `runtime/registration.py::register()` now calls `runtime/graph.py::register_graph_features()` so the `/graph` slash command, graph lifecycle hook, and hook-side graph manager getter are actually registered. `register_graph_features()` uses a context-idempotency guard to avoid duplicate registration.
+- **R5-2 `srh_graph_retrieve` parameter compatibility**: the handler now accepts both `memory_ids` (canonical) and the deprecated `seed_ids`; passing `seed_ids` alone logs a deprecation warning. The schema uses `anyOf` to keep old clients valid.
+- **R5-3 `MergeSimilar` scan cap restored**: `_scan_for_similar()` now sorts and slices active memories to the intended 500 most-recent before grouping by scope, fixing the O(n²) regression introduced in v1.6.
+- **R5-4 stats compaction concurrency safety**: `memory/curator/helpers.py::compact_stats_snapshot()` holds `_stat_write_lock` from snapshot load through stream truncate, preventing event loss from concurrent `record_memory_stat()` writes.
+- **R5-5 SQLite stats dead path deprecated**: `core/store_methods.py::effectiveness()` and `record_stat()` now forward to the JSONL truth path (`store.effectiveness()` / `record_memory_stat()`) and emit `DeprecationWarning`; the SQLite `stats` table DDL is kept only for existing databases.
+- **R5-6 `srh_memory_delete` return shape unified**: single-ID and filter-batch paths now both return `{success, id, deleted_count}`.
+- **R5-7 orphan-edge cleanup fail-safe**: `GraphIndex.clean_orphan_edges()` treats an empty `valid_ids` set as a caller error and returns 0 instead of wiping the whole graph.
+- **R5-8 graph scope boundary filtering**: `srh_graph_retrieve` and `srh_graph_viz` accept optional `filters`; graph traversal is restricted to nodes in the active scope (`allowed_nodes`) so Hebbian retrieval does not leak across tenants. `_GraphStoreShim.spread_activation()` / `propagate_activation()` and `GraphManagerCompat.retrieve_related()` / `propagate_activation()` propagate `allowed_nodes`.
+- **R5-9 semantic sidecar partial-failure resilience**: `_record_semantic_relation_sidecar()` in `reflection/runtime.py` now tries every target individually, collects failures, and logs warnings instead of silently stopping on the first error.
+- **R5-10 reflection excludes current session IDs in LLM/micro paths**: `_run_full_reflection()` and `_run_micro_reflection()` now pass `current_session_ids` as `exclude_ids` to novelty/conflict checks in the LLM branch, matching the embedding path.
+- **R5-11 `ReflectionEngine` scope-aware**: `ReflectionEngine.__init__` accepts optional `scope_filters` and stamps `user_id`/`agent_id`/`run_id` onto newly created memories in `micro()`/`full()`.
+- **R5-12 `srh_reflect_now` response normalization**: `_tool_srh_reflect_now()` post-processes `_run_full_reflection()` results so the returned JSON always contains `{mode, summary, accepted_memories, skill_candidates, conflicts, chunks_created, error}`, regardless of reflection mode.
+- **R5-13 palace read-zone return shape unified**: `_tool_srh_palace_read_zone` now returns a single schema `{zone, source, count, memories, content, message}` across all branches.
+- **R5-14 ArchiveStale age fallback**: when a memory has no effectiveness or `last_access` record, `ArchiveStale` now falls back to `frontmatter.created` and then file mtime for staleness decisions.
+- **R5-15 curator recovery journal**: `memory/curator/__init__.py::_run_curator()` writes a `curator_recovery.jsonl` with mutation entries and supports a `curator.stop_on_error` config flag to halt the pipeline on first failure.
+- **R5-16 effectiveness snapshot GC**: `compact_stats_snapshot()` removes snapshot rows for memory IDs that no longer exist in the store.
+- **R5-17 `_scope_filters_from_kwargs` deprecation guard**: legacy bare `user_id`/`agent_id`/`run_id` kwargs to lifecycle hooks still work but now emit a `DeprecationWarning`; explicit `scope_filters` dict is preferred.
+- **R5-18 memory-event truncation auditability**: `core/store.py::_event_json()` now records an `_original_frontmatter_hash` when frontmatter is truncated to >8KB, preserving a verifiable link to the original event payload.
+- **R5-19 spread_activation / decay counter decoupled**: `GraphIndex.spread()` gains `increment_step=False` and `allowed_nodes` parameters; search-time Hebbian boost calls it with `increment_step=False` so retrieval no longer advances the decay step counter.
+- **Regression coverage**: ~30 new tests across `test_schema_module.py`, `test_runtime_graph_aliases.py`, `test_curator_pipeline.py`, `test_effectiveness_snapshot.py`, `test_graph.py`, `test_reflection.py`, `test_semantic_supersedes.py`, and `test_memory_events.py`; full-suite baseline moves to 686 passed.
+
+### Round-4 Slash-Command / Graph / Curator / Stats Fixes (`v17`)
+
+Triggered by: plugin-registered slash commands (e.g. `/reflect`) not executing at runtime. Root cause was a missing `import os` (fixed upstream in `49dccbd`) that aborted module load, masking a chain of latent defects surfaced once the module loaded. All five below are confirmed by importlib.util host-loader reproduction; see `docs/review/v1.7-slashcmd-graph-curator-audit.md`.
+
+- **R4-1 `/skills <query>` import**: `runtime/hooks.py::_slash_skills` did `from . import match_skills`, but `runtime/__init__.py` does not export it. Fixed to `from .. import match_skills` (the form `runtime/tools.py` already used correctly). The no-arg branch worked; only `/skills <query>` crashed with `ImportError`.
+- **R4-2 graph manager singleton**: `runtime/state.py::_get_graph_mgr` imported `_get_graph_mgr` from `runtime.graph`, which defines no such name (only `get_graph_manager_compat`). This raised `ImportError` on first call, which `registration.py` swallowed in `try/except`, so `ms.set_graph(gm)` never ran and graph boost was silently disabled. Fixed to call `get_graph_manager_compat()`.
+- **R4-3 `runtime.store` misreference**: `runtime/graph.py` imported `plugin_data_dir` from `.store`, but `runtime/` has no `store.py`. Fixed to `from ..core.store import plugin_data_dir` (two sites). Was masked by R4-2 until that was fixed.
+- **R4-4 curator effectiveness API**: `memory/curator/helpers.py::_load_effectiveness` called `mem_store.list_active_effectiveness()`, a method that does not exist on `MemoryStore` (real API: `effectiveness(memory_id)`). The `AttributeError` was swallowed, so effectiveness-based archival was dead. Fixed to use `effectiveness(memory_id)`.
+- **R4-5 dataclass-as-dict access + combined score**: `scan_for_stale` / `ArchiveStale` / `MergeSimilar` called `.get("effectiveness")` / `.get("last_accessed")` on a `MemoryEffectiveness` dataclass, which has no `.get()`. Fixed to use `eff.factor() * eff.decay_factor()` (combined hit-rate × time-decay score). Default `effectiveness_threshold` raised `0.1` -> `0.2` because the combined floor is `0.5 * 0.3 = 0.15` (the old threshold never triggered).
+- **Stats persistence unification (JSONL truth path)**: discovered while fixing R4-4 — production writes stats to `memory-stats.jsonl` (`record_memory_stat`), but `MemoryStore.effectiveness()` read the SQLite `stats` table, which was never populated (the only writer, `record_stat()`, had zero production callers). Unified on JSONL: `effectiveness()` now reads via `load_effectiveness()` with a 30s TTL cache; `record_stat()` marked `[DEPRECATED]`.
+- **Dual-track stats compaction**: `memory-stats.jsonl` was append-only with no compaction (~15 lines/query, unbounded). Added `effectiveness-index.jsonl` (one row per memory) as an aggregate snapshot; `load_effectiveness()` reads snapshot baseline + event-stream tail (`at > folded_at`); `compact_stats_snapshot()` (curator session_end, threshold 5000 lines) folds the stream into the snapshot and truncates it via atomic `_safe_write`.
+- **Test isolation**: added `tests/conftest.py` autouse fixtures resetting graph singletons + isolating the graph manager for curator tests (monkeypatch `get_graph_manager_compat` to a temp-db instance). Fixed the pre-existing `test_memory_store_save_duplicate` to match the real `put()` / id-dedup contract (it called a non-existent `.save()` and asserted body-based dedup the store never performed).
+- **`debug_curator_bug.py` rewrite**: the diagnostic script had a broken import and documented the now-fixed R4-4/R4-5 bugs. Rewritten as a 10-check regression script (`python debug_curator_bug.py`, exit 0 on success).
+- **Regression coverage**: 8 new tests in `tests/test_effectiveness_snapshot.py` (suite 638 -> 647); full audit + systematic-debugging skill gap analysis in `docs/review/v1.7-slashcmd-graph-curator-audit.md`.
+
+### Development Notes
+
+- Scope propagation, refined extraction, semantic supersedes, typed fact sidecar, compaction quality, and release-hardening coverage are now all represented in code and tests.
+- Remaining future work is deeper relation-aware recall and more advanced fact-level temporal querying, not a blocker for the v1.7 scope/quality release line.
+
 ## v1.6 — Memory Event Ledger & Scoped Filters
 
 ### Memory Event Ledger (Wave 1)

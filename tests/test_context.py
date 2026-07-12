@@ -131,6 +131,27 @@ class TestBuildContextPriority:
         assert "Relevant Memories" in ctx
         assert "dark mode" in ctx.lower()
 
+    def test_context_filters_pinned_and_dynamic_memories_by_scope(self, temp_store):
+        """Context injection must not include pinned or dynamic memories from other scopes."""
+        store = temp_store
+        pinned_u1 = MemoryFrontmatter.new(source="test", pinned=True, zone="core", user_id="u1")
+        pinned_u2 = MemoryFrontmatter.new(source="test", pinned=True, zone="core", user_id="u2")
+        dynamic_u1 = MemoryFrontmatter.new(source="test", zone="general", user_id="u1")
+        dynamic_u2 = MemoryFrontmatter.new(source="test", zone="general", user_id="u2")
+        store.put("user", pinned_u1, "Pinned only for u1")
+        store.put("user", pinned_u2, "Pinned only for u2")
+        store.put("user", dynamic_u1, "Scoped dark mode for u1")
+        store.put("user", dynamic_u2, "Scoped dark mode for u2")
+
+        search = SearchIndex(store)
+        skills = FakeSkills([])
+        ctx = build_context(store, search, skills, "dark mode", max_tokens=4000, filters={"user_id": "u1"})
+
+        assert "Pinned only for u1" in ctx
+        assert "Scoped dark mode for u1" in ctx
+        assert "Pinned only for u2" not in ctx
+        assert "Scoped dark mode for u2" not in ctx
+
     def test_always_active_skills_included(self, temp_store, temp_skills_dir):
         """Skills marked always_active appear in context."""
         store = temp_store

@@ -60,16 +60,16 @@ def test_runtime_hooks_session_recovery_runs_v15_stage_runners(monkeypatch):
     monkeypatch.setattr(
         hooks_mod,
         "_run_full_reflection",
-        lambda seen_ctx, messages: calls["reflection"].append((seen_ctx, messages)),
+        lambda seen_ctx, messages, **_kwargs: calls["reflection"].append((seen_ctx, messages)),
     )
     monkeypatch.setattr(plugin, "_config_compaction", lambda: True)
     monkeypatch.setattr(
         reflection_runtime,
         "_compact_episode_zone",
-        lambda seen_store, seen_ctx: calls["compaction"].append((seen_store, seen_ctx)),
+        lambda seen_store, seen_ctx, **_kwargs: calls["compaction"].append((seen_store, seen_ctx)),
     )
     fake_curator_enabled = lambda seen_store: seen_store is mem_store
-    fake_run_curator = lambda seen_ctx, seen_store: calls["curator"].append((seen_ctx, seen_store))
+    fake_run_curator = lambda seen_ctx, seen_store, **_kwargs: calls["curator"].append((seen_ctx, seen_store))
     monkeypatch.setattr(curator_mod, "_curator_enabled", fake_curator_enabled)
     monkeypatch.setattr(curator_mod, "_run_curator", fake_run_curator)
     monkeypatch.setattr(memory_pkg, "_curator_enabled", fake_curator_enabled)

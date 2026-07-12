@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from .scope import normalize_scope_value
+except ImportError:
+    from core.scope import normalize_scope_value
 from .utils import normalize_zone
 
 
@@ -67,9 +71,9 @@ class MemoryFrontmatter:
             supersedes=list(supersedes or []),
             supersedes_reason=supersedes_reason,
             zone=normalize_zone(zone),
-            user_id=user_id,
-            agent_id=agent_id,
-            run_id=run_id,
+            user_id=normalize_scope_value(user_id),
+            agent_id=normalize_scope_value(agent_id),
+            run_id=normalize_scope_value(run_id),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -84,8 +88,8 @@ class MemoryFrontmatter:
                    "context_scope", "zone", "rank", "version",
                    "user_id", "agent_id", "run_id"):
             v = getattr(self, f)
-            if v == "" and f in ("user_id", "agent_id", "run_id"):
-                v = None
+            if f in ("user_id", "agent_id", "run_id"):
+                v = normalize_scope_value(v)
             if v is not None and v != [] and v is not False and v != 0 and v != "general" and v != "medium":
                 d[f] = v
             elif f in ("id", "created", "source", "confidence"):
@@ -263,6 +267,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     data.setdefault("zone", "general")
     data.setdefault("always_active", False)
     data.setdefault("rank", 0)
+    data.setdefault("version", 1)
     data.setdefault("user_id", None)
     data.setdefault("agent_id", None)
     data.setdefault("run_id", None)
@@ -298,6 +303,9 @@ def serialize_frontmatter(data: Dict[str, Any], body: str) -> str:
     rank = data.get("rank")
     if rank is not None and rank != 0:
         buf.append(f"rank: {rank}")
+    version = data.get("version")
+    if version is not None:
+        buf.append(f"version: {version}")
     buf.append("---")
     if body:
         buf.append("")

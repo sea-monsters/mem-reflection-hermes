@@ -18,13 +18,8 @@ def register(ctx: Any) -> None:
     # Deferred imports to avoid circular dependency at module load time.
     from ..runtime.hooks import register_hooks, register_commands
     from ..runtime.schemas import (
-        _SRH_ASSOCIATE_SCHEMA,
         _SRH_COMPILE_PROFILE_SCHEMA,
-        _SRH_GRAPH_RETRIEVE_SCHEMA,
-        _SRH_GRAPH_STATS_SCHEMA,
-        _SRH_GRAPH_VIZ_SCHEMA,
         _SRH_MEMORY_DELETE_SCHEMA,
-        _SRH_MEMORY_HEALTH_SCHEMA,
         _SRH_MEMORY_HISTORY_SCHEMA,
         _SRH_MEMORY_SEARCH_SCHEMA,
         _SRH_MEMORY_WRITE_SCHEMA,
@@ -42,6 +37,7 @@ def register(ctx: Any) -> None:
         srh_reflect_now,
         srh_skill_query,
     )
+    from ..runtime.graph import register_graph_features
     from .. import _get_mem_store, _get_graph_mgr
 
     # Register runtime hooks
@@ -57,27 +53,27 @@ def register(ctx: Any) -> None:
     except Exception as e:
         logger.warning("Built-in memory sync failed: %s", e)
 
-    # Register tools (7 base + 5 graph/health = 12 total)
+    # Register tools (8 base + 5 graph/health = 13 total)
     ctx.register_tool(
         name="srh_memory_write",
         toolset=_TOOLSET,
         schema=_SRH_MEMORY_WRITE_SCHEMA,
         handler=srh_memory_write,
-        description="Write a new memory or update existing memory",
+        description="Write a new memory or update existing memory, including optional user_id/agent_id/run_id scope",
     )
     ctx.register_tool(
         name="srh_memory_search",
         toolset=_TOOLSET,
         schema=_SRH_MEMORY_SEARCH_SCHEMA,
         handler=srh_memory_search,
-        description="Search memories by query",
+        description="Search memories by query with optional scope filters",
     )
     ctx.register_tool(
         name="srh_memory_delete",
         toolset=_TOOLSET,
         schema=_SRH_MEMORY_DELETE_SCHEMA,
         handler=srh_memory_delete,
-        description="Delete a memory by ID",
+        description="Delete a memory by ID or batch-delete by scope filters",
     )
     ctx.register_tool(
         name="srh_memory_history",
@@ -91,14 +87,14 @@ def register(ctx: Any) -> None:
         toolset=_TOOLSET,
         schema=_SRH_PALACE_NAVIGATE_SCHEMA,
         handler=srh_palace_navigate,
-        description="Navigate palace index",
+        description="Navigate palace index with optional zone and scope filters",
     )
     ctx.register_tool(
         name="srh_reflect_now",
         toolset=_TOOLSET,
         schema=_SRH_REFLECT_NOW_SCHEMA,
         handler=srh_reflect_now,
-        description="Trigger immediate reflection",
+        description="Trigger immediate reflection with optional scope filters",
     )
     ctx.register_tool(
         name="srh_skill_query",
@@ -112,61 +108,24 @@ def register(ctx: Any) -> None:
         toolset=_TOOLSET,
         schema=_SRH_COMPILE_PROFILE_SCHEMA,
         handler=srh_compile_profile,
-        description="Compile user profile from memories",
+        description="Compile profile/palace/zone summaries, optionally scoped to a tenant/user/run",
     )
 
-    # Register graph/health tools (5)
-    from ..runtime.graph import (
-        srh_associate,
-        srh_graph_retrieve,
-        srh_graph_stats,
-        srh_graph_viz,
-        srh_memory_health,
-    )
-
-    ctx.register_tool(
-        name="srh_associate",
-        toolset=_TOOLSET,
-        schema=_SRH_ASSOCIATE_SCHEMA,
-        handler=srh_associate,
-        description="Associate memories in graph",
-    )
-    ctx.register_tool(
-        name="srh_graph_retrieve",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_RETRIEVE_SCHEMA,
-        handler=srh_graph_retrieve,
-        description="Retrieve graph neighbors",
-    )
-    ctx.register_tool(
-        name="srh_graph_stats",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_STATS_SCHEMA,
-        handler=srh_graph_stats,
-        description="Get graph statistics",
-    )
-    ctx.register_tool(
-        name="srh_graph_viz",
-        toolset=_TOOLSET,
-        schema=_SRH_GRAPH_VIZ_SCHEMA,
-        handler=srh_graph_viz,
-        description="Generate graph visualization",
-    )
-    ctx.register_tool(
-        name="srh_memory_health",
-        toolset=_TOOLSET,
-        schema=_SRH_MEMORY_HEALTH_SCHEMA,
-        handler=srh_memory_health,
-        description="Check memory health",
-    )
+    # Register graph tools, graph maintenance hook, /graph slash command,
+    # and the memory-health tool. This also sets the hook-side graph manager
+    # getter so that _post_tool_call() and _get_graph_neighbors() can use it.
+    register_graph_features(ctx, get_mem_store=_get_mem_store)
 
     logger.info("mem-reflection-hermes plugin registered successfully")
 
-    # P2a: Register post-delete callback for graph cleanup
+    # P2a: Wire graph manager into the store and register post-delete callback.
+    # Without set_graph(), SearchIndex._graph and typed-fact sidecar remain
+    # disabled for the lifetime of the process (v1.7 regression).
     try:
         ms = _get_mem_store()
         gm = _get_graph_mgr()
         if ms is not None and gm is not None:
+            ms.set_graph(gm)
             def _on_memory_delete(mem_id: str) -> None:
                 try:
                     gm.store.remove_memory(mem_id)
@@ -174,4 +133,4 @@ def register(ctx: Any) -> None:
                     logger.warning("Graph cleanup failed for deleted memory %s", mem_id, exc_info=True)
             ms._post_delete_callbacks.append(_on_memory_delete)
     except Exception as e:
-        logger.warning("Failed to register post-delete graph callback: %s", e)
+        logger.warning("Failed to wire graph manager to store: %s", e)

@@ -65,7 +65,8 @@ def _get_mem_store():
         with _mem_store_lock:
             if _mem_store is None:
                 from ..core.store import MemoryStore
-                _mem_store = MemoryStore()
+                from ..core.config import user_memories_dir
+                _mem_store = MemoryStore(user_root=user_memories_dir())
     return _mem_store
 
 
@@ -76,7 +77,8 @@ def _get_skill_store():
         with _skill_store_lock:
             if _skill_store is None:
                 from ..core.store import SkillStore
-                _skill_store = SkillStore()
+                from ..core.config import user_memories_dir
+                _skill_store = SkillStore(user_root=user_memories_dir())
     return _skill_store
 
 
@@ -94,7 +96,11 @@ def _get_search_index():
                     reranker = _build_reranker(cfg.get(CONFIG_KEY_RERANKER, {}))
                 except Exception:
                     reranker = None
-                _search_index = SearchIndex(_get_mem_store(), reranker=reranker)
+                _search_index = SearchIndex(
+                    _get_mem_store(),
+                    graph=_get_graph_mgr().store if _graph_mgr is not None else None,
+                    reranker=reranker,
+                )
     return _search_index
 
 
@@ -104,7 +110,9 @@ def _get_graph_mgr():
     if _graph_mgr is None:
         with _graph_mgr_lock:
             if _graph_mgr is None:
-                # Import from runtime.graph (which uses core.graph)
-                from ..runtime.graph import _get_graph_mgr as _ggm
+                # runtime/graph.py exposes get_graph_manager_compat(), the
+                # thread-safe singleton factory. (_get_graph_mgr did not exist
+                # on runtime.graph, so the old import raised ImportError.)
+                from ..runtime.graph import get_graph_manager_compat as _ggm
                 _graph_mgr = _ggm()
     return _graph_mgr

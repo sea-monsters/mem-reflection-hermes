@@ -11,6 +11,9 @@ from .engine import (
     _is_explicit_memory_intent,
 )
 
+from .extraction import extract_refined_memory_candidates
+from .supersedes_resolver import resolve_semantic_supersedes
+
 from .runtime import (
     _run_full_reflection,
     _run_micro_reflection,
@@ -24,6 +27,8 @@ __all__ = [
     "ReflectionEngine",
     "_is_memorable_content",
     "_is_explicit_memory_intent",
+    "extract_refined_memory_candidates",
+    "resolve_semantic_supersedes",
     # Runtime exports
     "_run_full_reflection",
     "_run_micro_reflection",

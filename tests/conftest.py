@@ -1,4 +1,11 @@
-"""conftest.py — Shared test fixtures for mem-reflection-hermes test suite."""
+"""conftest.py — Shared test fixtures for mem-reflection-hermes test suite.
+
+NOTE: Some test files load modules via importlib with unique names
+(e.g. _store_mod, _memory_store_module), creating SEPARATE singleton
+instances (_effectiveness_cache, _write_queue, etc.). Cross-instance
+state bugs are invisible to these tests. Fix: use canonical module
+names across all importlib loads.
+"""
 from __future__ import annotations
 
 import os
@@ -17,47 +24,66 @@ def pytest_configure(config):
 
     On Windows, the default pytest temp directory (pytest-of-<user>) can accumulate
     stale ACLs from other processes, causing PermissionError during test setup.
-    Using a plugin-specific basetemp avoids this entirely and works on all platforms.
+    Using a per-run plugin-specific basetemp avoids this entirely and works on all platforms.
     """
     if config.option.basetemp is None:
-        config.option.basetemp = str(Path(tempfile.gettempdir()) / "hermes_pytest")
+        unique = f"hermes_pytest_{os.getpid()}_{time.time_ns()}"
+        config.option.basetemp = str(Path(tempfile.gettempdir()) / unique)
 
 
 _FILE_MARKERS = {
+    # ── Store & data layer ──────────────────────────────────────────────
     "test_store.py": ("store", "compatibility"),
     "test_core_data.py": ("store", "compatibility"),
+    "test_store_module_split.py": ("store", "compatibility"),
+    "test_async_writer.py": ("store", "v14"),
+    # ── Retrieval, ranking, entities ───────────────────────────────────
     "test_search.py": ("search", "retrieval"),
     "test_bm25.py": ("search", "retrieval", "cjk"),
     "test_fusion_rerank.py": ("search", "retrieval"),
     "test_wave3_retrieval.py": ("search", "retrieval", "graph"),
     "test_reranker.py": ("search", "retrieval", "reranker"),
     "test_reranker_exceptions.py": ("search", "retrieval", "reranker", "v14"),
+    "test_entity_extraction.py": ("search", "retrieval", "v14"),
+    "test_palace_recall.py": ("search", "retrieval", "tools"),
+    # ── Graph layer ────────────────────────────────────────────────────
     "test_graph.py": ("graph",),
     "test_graph_operations.py": ("graph", "compatibility"),
     "test_graph_distil_failure.py": ("graph", "v14"),
+    "test_runtime_graph_aliases.py": ("graph", "runtime", "compatibility"),
+    # ── Scope & filters (v1.6 + round-3 ScopeIntent) ───────────────────
+    "test_scope_filters.py": ("scope", "store", "search"),
+    # ── Reflection, extraction, supersedes, sidecar ────────────────────
     "test_reflect.py": ("reflection", "compatibility"),
     "test_reflection.py": ("reflection", "runtime"),
+    "test_reflection_refinement.py": ("reflection", "extraction", "v17"),
+    "test_reflection_scope.py": ("reflection", "scope", "runtime"),
+    "test_semantic_supersedes.py": ("reflection", "supersedes", "v17"),
+    "test_typed_fact_sidecar.py": ("graph", "reflection", "sidecar", "v17"),
+    "test_compaction.py": ("compaction", "runtime", "reflection"),
+    # ── Context, runtime, hooks, config ────────────────────────────────
     "test_context.py": ("context", "runtime"),
     "test_hooks.py": ("runtime", "v14"),
     "test_runtime_import_hygiene.py": ("runtime", "compatibility"),
-    "test_memory_curator.py": ("curator",),
-    "test_curator_pipeline.py": ("curator", "integration"),
-    "test_bridge.py": ("bridge", "integration"),
-    "test_dashboard.py": ("dashboard", "integration"),
-    "test_tool_handlers.py": ("tools", "runtime"),
-    "test_compaction.py": ("compaction", "runtime", "reflection"),
-    "test_e2e.py": ("e2e", "integration"),
-    "test_host_contract_smoke.py": ("contract", "smoke", "integration"),
     "test_checkpoint.py": ("runtime", "config"),
     "test_checkpoint_backup_failure.py": ("runtime", "v14"),
     "test_config.py": ("config",),
+    "test_optional_deps.py": ("config", "v14"),
     "test_backend.py": ("backend",),
     "test_schema_module.py": ("runtime", "tools", "contract"),
     "test_lb.py": ("runtime", "compatibility"),
-    "test_entity_extraction.py": ("search", "retrieval", "v14"),
-    "test_async_writer.py": ("store", "v14"),
-    "test_optional_deps.py": ("config", "v14"),
-    "test_store_module_split.py": ("store", "compatibility"),
+    # ── Curation & lifecycle ───────────────────────────────────────────
+    "test_memory_curator.py": ("curator",),
+    "test_curator_pipeline.py": ("curator", "integration"),
+    "test_effectiveness_snapshot.py": ("curator", "store", "v17"),
+    "test_memory_events.py": ("curator", "events", "v16"),
+    # ── Integration & host surfaces ────────────────────────────────────
+    "test_bridge.py": ("bridge", "integration"),
+    "test_dashboard.py": ("dashboard", "integration"),
+    "test_dashboard_integration.py": ("dashboard", "integration"),
+    "test_tool_handlers.py": ("tools", "runtime"),
+    "test_e2e.py": ("e2e", "integration"),
+    "test_host_contract_smoke.py": ("contract", "smoke", "integration"),
 }
 
 _V14_NODE_MARKERS = {
@@ -206,10 +232,7 @@ def temp_store(temp_dir):
     store = MemoryStore(user_root=memories_root, db_path=db_path)
     yield store
     try:
-        conn = getattr(store._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            store._local.conn = None
+        store.close()
     except Exception:
         pass
 
@@ -223,6 +246,80 @@ def temp_graph():
     yield store
     store.close()
     _rmtree_safe(tmpdir)
+
+
+@pytest.fixture(autouse=True)
+def _reset_graph_singletons():
+    """Reset module-level graph singletons before each test.
+
+    runtime/graph.get_graph_manager_compat() and runtime/state._get_graph_mgr()
+    both cache a singleton GraphManagerCompat. Without a reset, a test that
+    populates graph state leaks into later tests (e.g. CleanOrphanEdges'
+    "no graph" path would see a non-empty singleton from a prior test). This
+    fixture clears those caches so every test starts from a clean graph state.
+
+    Scope: global autouse. We deliberately do NOT redirect HERMES_HOME here --
+    other tests (checkpoint persistence, reflect-log) depend on the real home
+    dir semantics, and a global env override broke them. The narrower
+    graph.db isolation that curator tests need is provided by
+    _isolated_curator_graph_db below (marker-scoped).
+    """
+    import mem_reflection_hermes.runtime.graph as _rt_graph
+    import mem_reflection_hermes.runtime.state as _rt_state
+
+    _rt_graph._graph_manager_compat = None
+    _rt_state._graph_mgr = None
+    yield
+    if _rt_graph._graph_manager_compat is not None:
+        try:
+            _rt_graph._graph_manager_compat.close()
+        except Exception:
+            pass
+        _rt_graph._graph_manager_compat = None
+    _rt_state._graph_mgr = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_curator_graph_db(request, monkeypatch, tmp_path):
+    """Isolate the graph manager for curator tests.
+
+    Curator's CleanOrphanEdges calls get_graph_manager_compat(), which returns
+    a process-wide singleton backed by the real ~/.hermes/memory/graph.db. That
+    singleton (and its db) persists across tests and even across runs, so a
+    prior test that wrote graph edges leaks into CleanOrphanEdges' "no graph"
+    assertions.
+
+    Rather than chasing the db path through several re-export layers (which
+    breaks depending on import order), we patch the resolver itself to build a
+    fresh GraphManagerCompat against a per-test temp db. Tests that need a
+    specific fake manager (e.g. test_counts_cleaned_edges_when_graph_available)
+    still monkeypatch get_graph_manager_compat themselves and override this.
+
+    Scope: tests marked "curator" only; other suites keep real home semantics.
+    """
+    markers = {m.name for m in request.node.iter_markers()}
+    if "curator" not in markers:
+        yield
+        return
+
+    import mem_reflection_hermes.runtime.graph as _rt_graph
+
+    db_path = tmp_path / "curator_graph.db"
+
+    def _fresh_isolated_manager(_db_path=None):
+        # Always rebuild against the isolated path so no state leaks in or out.
+        return _rt_graph.GraphManagerCompat(db_path)
+
+    # Patch BOTH the runtime.graph symbol (used by state._get_graph_mgr) and
+    # the curator.actions resolver, since they resolve via different paths.
+    monkeypatch.setattr(_rt_graph, "get_graph_manager_compat", _fresh_isolated_manager)
+    try:
+        import mem_reflection_hermes.memory.curator.actions as _cur_actions
+        monkeypatch.setattr(_cur_actions, "get_graph_manager_compat", _fresh_isolated_manager)
+    except Exception:
+        pass
+
+    yield
 
 
 @pytest.fixture

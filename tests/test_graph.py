@@ -132,6 +132,31 @@ class TestStepDecay:
         r2 = gi.step_decay()
         assert r2["steps_since_last_decay"] == 2
 
+    def test_read_only_spread_does_not_increment_step_counter(self, temp_graph_index):
+        """P2-7: search-time spreading activation must not advance per-step decay."""
+        gi = temp_graph_index
+        gi.associate(["a", "b"])
+
+        gi.spread(["a"])  # default: increments counter
+        assert gi._step_counter == 1
+
+        gi.spread(["a"], increment_step=False)
+        assert gi._step_counter == 1  # unchanged
+
+        gi.spread(["a"], increment_step=True)
+        assert gi._step_counter == 2
+
+    def test_spread_allowed_nodes_restricts_activation(self, temp_graph_index):
+        """P2-5/P2-7: allowed_nodes keeps search-time expansion inside scope."""
+        gi = temp_graph_index
+        gi.associate(["a", "b"])
+        gi.associate(["b", "c"])
+
+        activation = gi.spread(["a"], allowed_nodes={"a", "b"})
+        assert "a" in activation
+        assert "b" in activation
+        assert "c" not in activation, "cross-scope neighbor must not be activated"
+
     def test_multiple_decay_calls_cumulative(self, temp_graph_index):
         """Multiple step_decay calls use cumulative steps since last decay."""
         gi = temp_graph_index
@@ -347,19 +372,18 @@ class TestCleanOrphanEdges:
         ).fetchone()
         assert row["cnt"] == 0
 
-    def test_empty_valid_ids_clears_all(self, temp_graph_index):
-        """Passing empty set clears all graph rows (all are orphaned)."""
+    def test_empty_valid_ids_is_noop(self, temp_graph_index):
+        """Passing empty set is a caller error and deletes nothing."""
         gi = temp_graph_index
         gi.ensure_meta("mem-1", zone="general")
         gi.ensure_meta("mem-2", zone="general")
         gi.associate(["mem-1", "mem-2"])
-        # Both rows exist — empty valid set means all orphaned
         cleaned = gi.clean_orphan_edges(set())
-        assert cleaned >= 2  # 2 meta + 1 edge
+        assert cleaned == 0
         row = gi._get_conn().execute(
             "SELECT COUNT(*) as cnt FROM graph_meta"
         ).fetchone()
-        assert row["cnt"] == 0
+        assert row["cnt"] == 2
 
     def test_removes_orphan_meta_only(self, temp_graph_index):
         """graph_meta row for non-existent memory is deleted even without edges."""

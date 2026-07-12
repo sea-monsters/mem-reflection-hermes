@@ -47,6 +47,9 @@ AGENTS.md
 # when it's tracked via explicit add.
 memory/
 
+# Claude Code / Codex local assistant state
+.claude/
+
 # Package dirs (tracked) — negate any blanket ignores
 !/core/
 !/reflection/

@@ -5,6 +5,11 @@ All registered Hermes tool schemas live here so the package entrypoint
 """
 from __future__ import annotations
 
+try:
+    from ..core.scope import SCOPE_FILTER_SCHEMA
+except ImportError:
+    from core.scope import SCOPE_FILTER_SCHEMA
+
 _SRH_MEMORY_WRITE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -31,7 +36,7 @@ _SRH_MEMORY_SEARCH_SCHEMA = {
         "zone": {"type": "string", "description": "Filter to a specific zone"},
         "include_history": {"type": "boolean", "description": "Include superseded memories"},
         "explain": {"type": "boolean", "description": "Include score breakdown metadata"},
-        "filters": {"type": "object", "description": "Optional scope filters (user_id, agent_id, run_id). None means IS NULL (universally visible)."},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
     },
     "required": ["query"],
 }
@@ -41,7 +46,7 @@ _SRH_MEMORY_DELETE_SCHEMA = {
     "properties": {
         "id": {"type": "string", "description": "Memory ID to delete"},
         "scope": {"type": "string", "enum": ["user", "project"], "description": "User or project scope"},
-        "filters": {"type": "object", "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional batch delete scope filters (user_id, agent_id, run_id). When provided, id may be omitted."},
     },
     "required": [],
     "anyOf": [
@@ -56,6 +61,7 @@ _SRH_PALACE_NAVIGATE_SCHEMA = {
         "topic": {"type": "string", "description": "Topic to recall memories for"},
         "limit": {"type": "integer", "description": "Maximum memories to return (default 5)"},
         "zone": {"type": "string", "description": "Specific zone to search, or null for active zone"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id)."},
     },
     "required": ["topic"],
 }
@@ -65,6 +71,7 @@ _SRH_REFLECT_NOW_SCHEMA = {
     "properties": {
         "messages": {"type": "array", "description": "Conversation messages to reflect on"},
         "mode": {"type": "string", "enum": ["full", "micro", "embedding"], "description": "Reflection mode"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters for reflection writes and context assembly."},
     },
     "required": ["messages"],
 }
@@ -82,6 +89,7 @@ _SRH_COMPILE_PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
         "mode": {"type": "string", "enum": ["profile", "palace_index", "zone"], "description": "Compilation mode"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters for per-scope profile compilation."},
     },
     "required": ["mode"],
 }
@@ -92,7 +100,6 @@ _SRH_ASSOCIATE_SCHEMA = {
         "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to associate (max 20)"},
         "context": {"type": "string", "description": "Optional context string"},
         "relation": {"type": "string", "enum": ["co_occurs", "supersedes", "related"], "description": "Relation type"},
-        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs for spreading activation"},
     },
     "required": ["memory_ids"],
 }
@@ -100,11 +107,16 @@ _SRH_ASSOCIATE_SCHEMA = {
 _SRH_GRAPH_RETRIEVE_SCHEMA = {
     "type": "object",
     "properties": {
-        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "Seed memory IDs to start retrieval from"},
+        "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to start retrieval from"},
+        "seed_ids": {"type": "array", "items": {"type": "string"}, "description": "[DEPRECATED] Use memory_ids instead"},
         "max_results": {"type": "integer", "description": "Maximum number of results (default 10)"},
         "tier": {"type": "string", "enum": ["count", "list", "detail"], "description": "Result tier"},
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
     },
-    "required": ["seed_ids"],
+    "anyOf": [
+        {"required": ["memory_ids"]},
+        {"required": ["seed_ids"]},
+    ],
 }
 
 _SRH_GRAPH_STATS_SCHEMA = {
@@ -115,7 +127,9 @@ _SRH_GRAPH_STATS_SCHEMA = {
 
 _SRH_GRAPH_VIZ_SCHEMA = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
+    },
     "required": [],
 }
 

@@ -19,7 +19,7 @@ supersedes_reason: ""
 valid_from: null
 valid_until: null
 context_scope: null
-version: "1.0"
+version: 1
 ---
 
 Always use anyhow for app-level error handling in Rust.
@@ -38,7 +38,7 @@ Always use anyhow for app-level error handling in Rust.
 | `zone` | string | Memory Palace zone: `core`, `work`, `episode`, `general`, `project:*` |
 | `rank` | int (v0.6.1+) | Explicit ordering. Higher rank = appears earlier. Default 0 |
 | `supersedes` | string[] | Memory IDs this memory replaces (version lineage) |
-| `version` | string (v0.8.0+) | Optional version string for tracking iterations |
+| `version` | integer (v1.7+) | Frontmatter revision counter. Default `1`, preserved across disk round-trips |
 | `supersedes_reason` | string | Human-readable reason why this memory supersedes the referenced IDs |
 | `valid_from` | ISO 8601 | Earliest date this memory is considered active |
 | `valid_until` | ISO 8601 | Expiration date; memories past this date are flagged as expired in health checks |
@@ -115,7 +115,8 @@ valid and readable.
 │   │       └── SKILL.md
 │   ├── zone-cache/                   # Per-zone summary caches
 │   ├── palace-index.md              # Palace zone index
-│   ├── memory-stats.jsonl           # Effectiveness tracking
+│   ├── memory-stats.jsonl           # Effectiveness event stream (append-only; compacted by curator)
+│   ├── effectiveness-index.jsonl    # Effectiveness aggregate snapshot (one row per memory, v1.7 round-4)
 │   └── cold_store.jsonl             # Curator cold storage archive (v1.2)
 ├── plugins/
 │   └── mem-reflection-hermes/

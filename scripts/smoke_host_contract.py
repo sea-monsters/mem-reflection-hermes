@@ -430,9 +430,10 @@ def test_register_contract():
             "memories",
             "skills",
             "compile-profile",
+            "graph",  # registered by runtime.graph.register_graph_features
         }
         if set(fake2.slash) == expected_slash:
-            ok("register(ctx): 8 slash commands")
+            ok(f"register(ctx): {len(expected_slash)} slash commands")
         else:
             fail(
                 "register(ctx): 8 slash commands",

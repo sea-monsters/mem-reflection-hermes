@@ -9,6 +9,7 @@ PageRank scores, cross-zone analysis, CLUQI-style queries.
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -17,6 +18,11 @@ from pydantic import BaseModel
 import logging
 
 logger = logging.getLogger(__name__)
+
+try:
+    from ..core.scope import normalize_scope_filters, scope_from_values
+except ImportError:
+    from core.scope import normalize_scope_filters, scope_from_values
 
 try:
     from .. import __dict__ as _srh_dict
@@ -45,6 +51,9 @@ else:
 
 router = APIRouter()
 
+# Cap on related memories used for graph auto-association in create_memory.
+_MAX_AUTO_ASSOCIATE_RELATED = 20
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models for request validation
@@ -57,6 +66,9 @@ class MemoryCreate(BaseModel):
     tags: List[str] = []
     pinned: bool = False
     scope: Literal["user", "project"] = "user"
+    user_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
 
 
 class MemoryUpdate(BaseModel):
@@ -78,6 +90,18 @@ class MemoryReorder(BaseModel):
 def _get_store():
     """Get the memory store instance."""
     return srh._get_mem_store()
+
+
+def _scope_filters(
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> Optional[Dict[str, Optional[str]]]:
+    filters = scope_from_values(user_id=user_id, agent_id=agent_id, run_id=run_id)
+    try:
+        return normalize_scope_filters(filters) or None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
@@ -111,21 +135,24 @@ def _memory_to_dict(m: srh.LoadedMemory) -> Dict[str, Any]:
 
 
 def _get_graph_interface():
-    """Get the available graph interface."""
+    """Get the available graph interface.
+
+    v1.7: resolve through the canonical runtime.graph module. The legacy
+    ``runtime_graph`` module was removed during the package refactor; using it
+    here caused the dashboard to silently degrade to no graph in production.
+    """
     try:
-        from ..runtime_graph import GraphManagerCompat
-        from ..store import plugin_data_dir
-        return GraphManagerCompat(plugin_data_dir() / "graph.db")
+        from ..runtime.graph import get_graph_manager_compat
+        return get_graph_manager_compat(Path(srh._plugin_data_dir()) / "graph.db")
     except ImportError:
         try:
-            from mem_reflection_hermes.runtime_graph import GraphManagerCompat
-            from mem_reflection_hermes.store import plugin_data_dir
-            return GraphManagerCompat(plugin_data_dir() / "graph.db")
+            from mem_reflection_hermes.runtime.graph import get_graph_manager_compat
+            return get_graph_manager_compat(Path(srh._plugin_data_dir()) / "graph.db")
         except Exception:
-            logger.warning("Graph init (runtime_graph) failed", exc_info=True)
+            logger.warning("Graph manager resolution failed", exc_info=True)
             return None
     except Exception:
-        logger.warning("Graph init failed", exc_info=True)
+        logger.warning("Graph manager resolution failed", exc_info=True)
         return None
 
 
@@ -168,8 +195,16 @@ class _CrossLayerQueryCompat:
         include_superseded: bool = False,
         k: int = 10,
         weights: Optional[Dict[str, float]] = None,
+        filters: Optional[Dict[str, Optional[str]]] = None,
     ) -> List[_CrossLayerResult]:
-        mems = self.store.search(query, k=max(k * 3, k), zone=zone, include_history=include_superseded)
+        filters = normalize_scope_filters(filters)
+        mems = self.store.search(
+            query,
+            k=max(k * 3, k),
+            zone=zone,
+            include_history=include_superseded,
+            filters=filters,
+        )
         conf_order = {"low": 0, "medium": 1, "high": 2}
         if tags or min_confidence:
             min_level = conf_order.get(min_confidence, 0) if min_confidence else 0
@@ -183,7 +218,7 @@ class _CrossLayerQueryCompat:
             mems = filtered
 
         pagerank_scores: Dict[str, float] = {}
-        if self.gm is not None:
+        if self.gm is not None and not filters:
             try:
                 pagerank_scores = self.gm.pagerank()
             except Exception:
@@ -248,18 +283,12 @@ async def list_memories(
     run_id: Optional[str] = None,
 ):
     """List memories with optional zone, search, sorting, and scope filters."""
-    filters = {}
-    if user_id is not None:
-        filters["user_id"] = user_id
-    if agent_id is not None:
-        filters["agent_id"] = agent_id
-    if run_id is not None:
-        filters["run_id"] = run_id
+    filters = _scope_filters(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
     if query:
-        memories = _get_store().search(query, k=100, filters=filters or None)
+        memories = _get_store().search(query, k=100, filters=filters)
     else:
-        memories = _get_store().list_active(filters=filters or None)
+        memories = _get_store().list_active(filters=filters)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
 
@@ -286,6 +315,9 @@ async def create_memory(payload: MemoryCreate):
         "tags": payload.tags,
         "pinned": payload.pinned,
         "scope": payload.scope,
+        "user_id": payload.user_id,
+        "agent_id": payload.agent_id,
+        "run_id": payload.run_id,
     })
     # Parse tool result and propagate errors
     result_obj = None
@@ -304,29 +336,47 @@ async def create_memory(payload: MemoryCreate):
             new_id = result_obj.get("id") if isinstance(result_obj, dict) else None
             new_mem = _get_store().get(new_id) if new_id else None
             if new_mem:
-                all_mems = _get_store().list_active()
-                related = [m.id() for m in all_mems
-                          if m.id() != new_mem.id()
-                          and set(m.frontmatter.tags or []) & set(payload.tags)]
-                if related:
-                    gm.associator.on_memory_coactivation([new_mem.id()] + related)
+                filters = _scope_filters(
+                    user_id=payload.user_id,
+                    agent_id=payload.agent_id,
+                    run_id=payload.run_id,
+                )
+                all_mems = _get_store().list_active(filters=filters)
+                related_mems = [
+                    m for m in all_mems
+                    if m.id() != new_mem.id()
+                    and set(m.frontmatter.tags or []) & set(payload.tags)
+                ]
+                # Most recent first to prefer currently relevant context.
+                related_mems.sort(key=lambda m: m.frontmatter.created or "", reverse=True)
+                related_ids = [
+                    m.id() for m in related_mems[:_MAX_AUTO_ASSOCIATE_RELATED]
+                ]
+                if related_ids:
+                    gm.associator.on_memory_coactivation([new_mem.id()] + related_ids)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("Graph auto-associate failed: %s", e)
-    return {"status": "ok", "result": result}
+            logger.warning("Graph auto-associate failed: %s", e, exc_info=True)
+    return {"status": "ok", "result": result, "degraded": gm is None}
 
 
 @router.put("/memories/{mem_id}")
 async def update_memory(mem_id: str, payload: MemoryUpdate):
     """Update a memory's content or metadata."""
-    mem = _get_store().update(
-        mem_id,
-        body=payload.body,
-        zone=payload.zone,
-        confidence=payload.confidence,
-        tags=payload.tags,
-        pinned=payload.pinned,
-    )
+    try:
+        mem = _get_store().update(
+            mem_id,
+            body=payload.body,
+            zone=payload.zone,
+            confidence=payload.confidence,
+            tags=payload.tags,
+            pinned=payload.pinned,
+        )
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail="Memory not found") from e
+        raise
+    if mem is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     # Update graph meta if zone changed
     if payload.zone:
         gm = _get_graph_interface()
@@ -354,9 +404,8 @@ async def delete_memory(mem_id: str):
             if gi is not None:
                 gi.remove_memory(mem_id)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("Graph cleanup failed for %s: %s", mem_id, e)
-    return {"status": "deleted", "id": mem_id}
+            logger.warning("Graph cleanup failed for %s: %s", mem_id, e, exc_info=True)
+    return {"status": "deleted", "id": mem_id, "degraded": gm is None}
 
 
 @router.post("/memories/reorder")
@@ -386,17 +435,12 @@ async def get_graph(
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     seen_nodes: set = set()
+    degraded = False
 
-    filters = {}
-    if user_id is not None:
-        filters["user_id"] = user_id
-    if agent_id is not None:
-        filters["agent_id"] = agent_id
-    if run_id is not None:
-        filters["run_id"] = run_id
+    filters = _scope_filters(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
     # Get active memories as nodes, optionally scoped
-    memories = _get_store().list_active(filters=filters or None)
+    memories = _get_store().list_active(filters=filters)
     if zone:
         memories = [m for m in memories if m.frontmatter.zone == zone]
 
@@ -449,18 +493,18 @@ async def get_graph(
 
             # Compute PageRank directly from the compat surface.
             try:
-                pagerank_scores = gm.pagerank()
+                pagerank_scores = {} if filters else gm.pagerank()
                 for node in nodes:
                     node["pagerank"] = round(pagerank_scores.get(node["id"], 0.0), 4)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("PageRank computation failed: %s", e)
+                logger.warning("PageRank computation failed: %s", e, exc_info=True)
 
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("Graph query failed: %s", e)
+            logger.warning("Graph query failed: %s", e, exc_info=True)
+            degraded = True
     else:
         # Fallback: only supersedes edges from flat files
+        degraded = True
         if include_supersedes:
             for mem in memories:
                 if mem.frontmatter.supersedes:
@@ -477,13 +521,13 @@ async def get_graph(
     # Skill tag overlap edges
     # M18: cache SkillStore instance instead of reconstructing per request
     try:
-        skill_store = getattr(_get_graph, '_cached_skill_store', None)
+        skill_store = getattr(get_graph, '_cached_skill_store', None)
         if skill_store is None:
             skill_store = srh.SkillStore(
                 srh._user_skills_dir(),
                 srh._project_skills_dir(),
             )
-            _get_graph._cached_skill_store = skill_store
+            get_graph._cached_skill_store = skill_store
         skills = skill_store.list()
         skill_nodes = []
         for sk in skills:
@@ -524,6 +568,7 @@ async def get_graph(
     return {
         "nodes": nodes,
         "edges": edges,
+        "degraded": degraded,
         "stats": {
             "node_count": len(nodes),
             "edge_count": len(edges),
@@ -552,8 +597,12 @@ async def get_graph_neighbors(
     # Fallback to raw graph store
     gm = _get_graph_interface()
     if gm:
-        neighbors = gm.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
-        return {"memory_id": mem_id, "neighbors": neighbors}
+        try:
+            neighbors = gm.get_neighbors(mem_id, min_weight=min_weight, limit=limit)
+            return {"memory_id": mem_id, "neighbors": neighbors}
+        except Exception as e:
+            logger.warning("Graph neighbors query failed for %s: %s", mem_id, e, exc_info=True)
+            raise HTTPException(status_code=503, detail="Graph system temporarily unavailable")
 
     raise HTTPException(status_code=503, detail="Graph system not available")
 
@@ -566,9 +615,14 @@ async def get_zone_analysis():
         if gm:
             return gm.cross_zone(_get_store())
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Zone analysis failed: %s", e)
-    return {"zone_matrix": {}, "bridge_memories": [], "zone_centrality": {}, "isolated_zones": []}
+        logger.warning("Zone analysis failed: %s", e, exc_info=True)
+    return {
+        "zone_matrix": {},
+        "bridge_memories": [],
+        "zone_centrality": {},
+        "isolated_zones": [],
+        "degraded": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +685,7 @@ async def list_reflection_audit(limit: int = Query(100, ge=1, le=1000), decision
 
     Args:
         limit: Maximum number of audit entries to return
-        decision: Filter by decision type (accepted, rejected, skipped, superseded, pending)
+        decision: Filter by decision type (accepted, rejected, skipped, superseded, pending_storage)
     """
     log_path = srh._plugin_data_dir() / "reflect-log.jsonl"
     audit_entries = []
@@ -670,15 +724,9 @@ async def get_stats(
     run_id: Optional[str] = None,
 ):
     """Return aggregate statistics, optionally scoped."""
-    filters = {}
-    if user_id is not None:
-        filters["user_id"] = user_id
-    if agent_id is not None:
-        filters["agent_id"] = agent_id
-    if run_id is not None:
-        filters["run_id"] = run_id
+    filters = _scope_filters(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
-    memories = _get_store().list_active(filters=filters or None)
+    memories = _get_store().list_active(filters=filters)
     zones: Dict[str, int] = {}
     for m in memories:
         z = m.frontmatter.zone or "general"
@@ -689,12 +737,22 @@ async def get_stats(
     gm = _get_graph_interface()
     if gm:
         try:
-            graph_stats = {
-                "available": True,
-                **gm.store.stats(),
-            }
+            if filters:
+                graph_stats = {
+                    "available": True,
+                    "node_count": len(memories),
+                    "edge_count": 0,
+                    "scoped": True,
+                }
+            else:
+                graph_stats = {
+                    "available": True,
+                    **gm.store.stats(),
+                    "scoped": False,
+                }
         except Exception:
             logger.warning("Graph stats collection failed in dashboard", exc_info=True)
+            graph_stats = {"available": False, "degraded": True}
 
     # Cache stats
     cache_stats = {"available": False}
@@ -714,6 +772,7 @@ async def get_stats(
             }
         except Exception:
             logger.warning("Cache stats collection failed in dashboard", exc_info=True)
+            cache_stats = {"available": False, "degraded": True}
 
     # Health metrics (WS-5)
     health = _get_store().health_metrics()
@@ -724,6 +783,7 @@ async def get_stats(
         "graph": graph_stats,
         "cache": cache_stats,
         "health": health,
+        "degraded": graph_stats.get("degraded", False) or cache_stats.get("degraded", False),
     }
 
 
@@ -751,7 +811,12 @@ async def get_curator():
             import sys
             # Only use absolute import if the memory package is already in sys.modules
             # (i.e., the package namespace was explicitly set up)
-            if "mem_reflection_hermes.memory.curator" in sys.modules:
+            # Hermes loads plugins under hermes_plugins.<name> — check both bare
+            # name and the loader-prefixed form.
+            if (
+                "mem_reflection_hermes.memory.curator" in sys.modules
+                or "hermes_plugins.mem_reflection_hermes.memory.curator" in sys.modules
+            ):
                 from mem_reflection_hermes.memory.curator import _curator_enabled, _curator_config, _cold_store_path, _load_cold_store
                 curator = True
             else:
@@ -801,7 +866,7 @@ async def get_curator():
                     # Fall back to showing only the filename
                     display_path = cold_path.name
             except Exception:
-                logger.debug("Path display normalization failed: %s", cold_path)
+                logger.debug("Path display normalization failed", exc_info=True)
                 display_path = cold_path.name
 
             result["cold_storage"] = {
@@ -843,13 +908,17 @@ async def cluqi_query(
     q: str,
     zone: Optional[str] = None,
     k: int = Query(10, ge=1, le=100),
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ):
     """Cross-layer unified query across MemoryStore, GraphStore, and Supersedes chains."""
     cluqi = _get_cross_layer_query()
     if not cluqi:
         raise HTTPException(status_code=503, detail="CLUQI not available")
     try:
-        results = cluqi.query(q, zone=zone, k=k)
+        filters = _scope_filters(user_id=user_id, agent_id=agent_id, run_id=run_id)
+        results = cluqi.query(q, zone=zone, k=k, filters=filters)
         return {
             "query": q,
             "results": [
@@ -864,12 +933,11 @@ async def cluqi_query(
             ],
         }
     except Exception as e:
-        import logging, uuid
         trace_id = str(uuid.uuid4())[:8]
-        logging.getLogger(__name__).exception("Query failed (trace=%s)", trace_id)
+        logger.exception("Query failed (trace=%s)", trace_id)
         raise HTTPException(
             status_code=500,
-            detail="Internal server error",
+            detail=f"Internal server error (trace={trace_id})",
         )
 
 

@@ -21,11 +21,15 @@ from ..core.store import (
     micro_reflection_enabled, profile_mode_enabled, plugin_config,
     parse_frontmatter, serialize_frontmatter,
     _tokenise, _lineage_cycle_check,
+    _bm25_search_scored,
 )
 from ..core.search import (
     _embed_single, _cosine_sim, _extract_keywords,
-    _is_explicit_memory_intent, _is_correction, _is_procedure,
+    _is_explicit_memory_intent, _is_procedure,
 )
+from ..core.scope import normalize_scope_filters, scope_from_context
+from .extraction import extract_refined_memory_candidates, REFINED_MEMORY_KINDS, normalize_memory_kind
+from .supersedes_resolver import resolve_semantic_supersedes
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,7 @@ logger = logging.getLogger(__name__)
 _reflect_log_lock = threading.Lock()
 _pending_skills_lock = threading.Lock()
 _current_session_memory_ids = threading.local()
+_raw_chunk_count = threading.local()
 
 __all__ = [
     "_FULL_REFLECT_SYSTEM",
@@ -73,40 +78,224 @@ __all__ = [
     "_update_pending_skill_status",
 ]
 
-def _package_root():
-    pkg_name = __package__.rsplit(".", 1)[0] if __package__ and "." in __package__ else __package__
-    if not pkg_name:
-        raise RuntimeError("reflection engine package root is unavailable")
-    pkg = sys.modules.get(pkg_name)
-    if pkg is None:
-        raise RuntimeError(f"Package module {pkg_name!r} is not loaded")
-    return pkg
-
-
 def _get_mem_store():
     """Return the package-level MemoryStore singleton."""
-    return _package_root()._get_mem_store()
+    from ..runtime.state import _get_mem_store as _impl
+    return _impl()
 
 
 def _get_skill_store():
-    return _package_root()._get_skill_store()
+    from ..runtime.state import _get_skill_store as _impl
+    return _impl()
 
 
 def _estimate_tokens(text):
-    return _package_root()._estimate_tokens(text)
+    from ..runtime.helpers import _estimate_tokens as _impl
+    return _impl(text)
 
 
 def _auto_rebalance_zones():
-    return _package_root()._auto_rebalance_zones()
+    from ..runtime.tools import _auto_rebalance_zones as _impl
+    return _impl()
 
 
 def _build_context_block(query=""):
-    return _package_root()._build_context_block(query)
+    from ..runtime.helpers import _build_context_block as _impl
+    return _impl(query)
 
 
 def _reflection_mode() -> str:
     """Reflection mode from config."""
-    return _package_root()._reflection_mode()
+    from ..core.store import plugin_config
+    cfg = plugin_config().get("reflection", {})
+    if isinstance(cfg, dict):
+        return str(cfg.get("mode", "auto"))
+    return "auto"
+
+
+def _scope_filters_from_context(ctx=None, filters: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Optional[str]]]:
+    """Resolve reflection scope from a host context object and/or explicit filters."""
+    return scope_from_context(ctx, filters)
+
+
+def _frontmatter_for_scope(
+    *,
+    source: str,
+    confidence: str,
+    tags: List[str],
+    zone: str,
+    supersedes: Optional[List[str]] = None,
+    supersedes_reason: str = "",
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> MemoryFrontmatter:
+    """Build a MemoryFrontmatter with optional tenant scope fields applied."""
+    normalized = normalize_scope_filters(scope_filters) or {}
+    return MemoryFrontmatter.new(
+        source=source,
+        confidence=confidence,
+        tags=tags,
+        zone=zone,
+        supersedes=supersedes or [],
+        supersedes_reason=supersedes_reason,
+        user_id=normalized.get("user_id"),
+        agent_id=normalized.get("agent_id"),
+        run_id=normalized.get("run_id"),
+    )
+
+
+def _graph_for_store(mem_store: Any) -> Optional[Any]:
+    """Resolve the graph interface for a store without coupling to _graph attr.
+
+    Production runtime sets store._graph via registration, but tests and scripts
+    may not. Fall back to the package-level graph manager so typed sidecar and
+    other graph consumers still work.
+    """
+    graph = getattr(mem_store, "_graph", None)
+    if graph is not None and hasattr(graph, "record_typed_fact"):
+        return graph
+    try:
+        from ..runtime.graph import get_graph_manager_compat
+        return get_graph_manager_compat()
+    except Exception:
+        try:
+            from mem_reflection_hermes.runtime.graph import get_graph_manager_compat
+            return get_graph_manager_compat()
+        except Exception:
+            return None
+
+
+def _record_typed_fact_sidecar(
+    mem_store: Any,
+    fm: MemoryFrontmatter,
+    body: str,
+    *,
+    relation: str = "describes",
+    kind: str = "fact",
+    subject: Optional[str] = None,
+    object: Optional[str] = None,
+    target_memory_id: Optional[str] = None,
+    episode_id: Optional[str] = None,
+    source: str = "reflection",
+    confidence: float = 0.5,
+    superseded_memory_ids: Optional[List[str]] = None,
+) -> None:
+    """Best-effort typed sidecar write for graph-enabled stores.
+
+    When ``superseded_memory_ids`` is provided, the typed facts owned by those
+    memories are invalidated by the newly written memory (``fm.id``). This is
+    what makes the Phase D sidecar actually carry temporal truth — without it
+    the invalidation column stayed NULL forever and ``include_invalidated=False``
+    queries kept returning superseded facts.
+    """
+    graph = _graph_for_store(mem_store)
+    if graph is None:
+        return
+    try:
+        graph.record_typed_fact(
+            fm.id,
+            body,
+            relation=relation,
+            kind=kind,
+            subject=subject,
+            object=object,
+            target_memory_id=target_memory_id or fm.id,
+            episode_id=episode_id or fm.id,
+            zone=getattr(fm, "zone", "general") or "general",
+            source=source,
+            confidence=float(confidence),
+        )
+        if hasattr(graph, "record_entity_mentions"):
+            graph.record_entity_mentions(
+                fm.id,
+                body,
+                episode_id=episode_id or fm.id,
+                zone=getattr(fm, "zone", "general") or "general",
+                source=source,
+                target_memory_id=target_memory_id or fm.id,
+                confidence=float(confidence),
+            )
+        # Phase D: invalidate the typed facts owned by memories this one
+        # supersedes, so the sidecar reflects temporal truth instead of
+        # accumulating stale rows alongside the replacement.
+        if superseded_memory_ids:
+            invalidate = getattr(graph, "invalidate_facts_for_memories", None)
+            if invalidate is not None:
+                # Batch-invalidate all typed facts owned by superseded memories.
+                # If per-fact invalidation is needed later (invalidate one fact
+                # while keeping others from the same source), also available:
+                #   graph.invalidate_typed_fact(fact_id, invalidated_by=...)
+                invalidate(list(superseded_memory_ids), invalidated_by=fm.id)
+    except Exception as e:
+        logger.warning("Typed sidecar write failed for %s: %s", fm.id, e, exc_info=True)
+
+
+def _record_semantic_relation_sidecar(
+    mem_store: Any,
+    fm: MemoryFrontmatter,
+    *,
+    action: str,
+    target_ids: List[str],
+    reason: str = "",
+    confidence: float = 0.5,
+) -> None:
+    """Record a Phase C semantic-relation typed edge for merge/scope_split.
+
+    ``supersede`` already carries its lineage through ``fm.supersedes`` plus the
+    sidecar invalidation in :func:`_record_typed_fact_sidecar`. ``merge`` and
+    ``scope_split`` carry no supersedes edge, so without this helper their
+    decisions were silently dropped (round-3 audit P1-2). This writes a single
+    typed edge per target so the relation is queryable without re-running the
+    resolver.
+    """
+    target_ids = [tid for tid in (target_ids or []) if tid]
+    if action not in ("merge", "scope_split") or not target_ids:
+        return
+    graph = _graph_for_store(mem_store)
+    if graph is None:
+        return
+    relation = "merges" if action == "merge" else "scope_split_with"
+    kind = "semantic_merge" if action == "merge" else "semantic_scope_split"
+    zone = getattr(fm, "zone", "general") or "general"
+    failures: List[str] = []
+    for target_id in target_ids:
+        try:
+            graph.record_typed_fact(
+                fm.id,
+                reason or f"{action} {target_id}",
+                relation=relation,
+                kind=kind,
+                subject=fm.id,
+                object=target_id,
+                target_memory_id=target_id,
+                episode_id=fm.id,
+                zone=zone,
+                source="reflection",
+                confidence=float(confidence),
+            )
+        except Exception as e:
+            # Do not break on the first failing target; collect failures so the
+            # remaining targets are not silently dropped.
+            failures.append(target_id)
+            logger.warning(
+                "Semantic relation sidecar failed for %s -> %s: %s",
+                fm.id, target_id, e, exc_info=True,
+            )
+
+    if failures:
+        logger.warning(
+            "Semantic relation sidecar recorded %d/%d targets; failures: %s",
+            len(target_ids) - len(failures), len(target_ids), failures,
+        )
+
+    # P3-5: scope_split must invalidate the target memory's typed facts,
+    # just as merge does, so stale facts are not retained.
+    if action == "scope_split":
+        invalidate = getattr(graph, "invalidate_facts_for_memories", None)
+        if invalidate is not None:
+            try:
+                invalidate(list(target_ids), invalidated_by=fm.id)
+            except Exception as e:
+                logger.warning("Semantic relation invalidation failed for %s: %s", fm.id, e, exc_info=True)
 
 
 def _build_audit_entry(
@@ -122,7 +311,7 @@ def _build_audit_entry(
 ) -> Dict[str, Any]:
     """Build a structured reflection audit entry for the reflect log.
 
-    decision values: accepted | rejected | conflicted | superseded | skipped
+    decision values: accepted | rejected | superseded | skipped
     """
     return {
         "candidate_id": candidate_id,
@@ -152,9 +341,23 @@ def _remember_current_session_memory_id(memory_id: str) -> None:
 
 
 
+def _get_raw_chunk_session_count() -> int:
+    return int(getattr(_raw_chunk_count, "value", 0) or 0)
+
+
+def _increment_raw_chunk_session_count() -> None:
+    _raw_chunk_count.value = _get_raw_chunk_session_count() + 1
+
+
+def _reset_raw_chunk_session_count() -> None:
+    if hasattr(_raw_chunk_count, "value"):
+        delattr(_raw_chunk_count, "value")
+
+
 def _reset_current_session_memory_ids() -> None:
     if hasattr(_current_session_memory_ids, "ids"):
         delattr(_current_session_memory_ids, "ids")
+    _reset_raw_chunk_session_count()
 
 
 # # Block 1: Reflection log
@@ -254,7 +457,13 @@ exploration.
 2. MEMORY CANDIDATES — durable facts, conventions, preferences, or
 constraints the agent discovered that should persist across sessions.
 One claim per memory. Default `scope` to `user`; pick `project` only
-when the fact is specific to the current repo / codebase.
+when the fact is specific to the current repo / codebase. Set `kind`
+to the most specific category that applies: "fact" (default, a bare
+factual statement), "preference" (what the user likes/dislikes/wants),
+"decision" (a choice or policy adopted going forward), "policy"
+(convention/rule/config), "todo" (a follow-up / action item),
+"correction" (a revision of a prior statement), or "intent"
+(an explicit "remember this" request).
 
 3. CONFLICTS — when a new memory candidate contradicts, duplicates, or
 subsumes an existing memory, report a conflict referencing the existing
@@ -285,6 +494,7 @@ markdown fences. No commentary.
       "fact": "one short statement; one fact per memory",
       "tags": ["rust", "convention"],
       "scope": "user" | "project",
+      "kind": "fact" | "preference" | "decision" | "policy" | "todo" | "correction" | "intent",
       "confidence": "low" | "medium" | "high",
       "rationale": "why this should persist",
       "supersedes": ["mem_xxxx"],
@@ -308,6 +518,7 @@ Rules:
 - Only propose a memory if the user stated a durable preference, convention, or fact.
 - Only propose a skill if the assistant followed a multi-step procedure that would be reusable verbatim next time.
 - Never propose more than 1 memory and 1 skill per micro-reflection.
+- Set `kind` to the most specific category: "preference", "decision", "policy", "todo", "correction", "intent", or default "fact".
 - Confidence should be "low" or "medium" — never "high" for micro-reflection.
 - If the conversation reveals that an existing memory is WRONG or OUTDATED, produce a memory_candidates entry with the corrected fact and set `supersedes` to the old memory's id, plus a conflicts entry with kind "stale".
 
@@ -315,7 +526,7 @@ Reply with EXACTLY ONE JSON object:
 {
   "summary": "<one sentence>",
   "skill_candidates": [],
-  "memory_candidates": [{"fact": "<short statement>", "tags": [], "scope": "user", "confidence": "low|medium", "rationale": "<why>", "supersedes": ["mem_xxx"]}],
+  "memory_candidates": [{"fact": "<short statement>", "tags": [], "scope": "user", "kind": "fact", "confidence": "low|medium", "rationale": "<why>", "supersedes": ["mem_xxx"]}],
   "conflicts": [{"with": "mem_xxx", "kind": "stale", "explain": "<why old memory is wrong>", "options": ["keep_new", "keep_old"]}]
 }"""
 
@@ -382,6 +593,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
         json.loads(s)
         return None
     except Exception:
+        logger.debug("_repair_truncated_json: plain load failed")
         pass
 
     repaired_full = _close_open_containers(s)
@@ -392,6 +604,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
                 json.loads(repaired_full)
                 return repaired_full
             except Exception:
+                logger.debug("_repair_truncated_json: repaired_full load failed")
                 pass
 
     for end in range(len(s) - 1, 0, -1):
@@ -407,6 +620,7 @@ def _repair_truncated_json(s: str) -> Optional[str]:
             json.loads(repaired)
             return repaired
         except Exception:
+            logger.debug("_repair_truncated_json: truncation prefix load failed")
             continue
     return None
 
@@ -426,6 +640,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
                 if isinstance(obj, dict):
                     return obj
             except Exception:
+                logger.debug("_parse_reflect_output: raw_decode failed at pos %d", i)
                 pass
         i += 1
     # Fallback: try the whole string
@@ -437,6 +652,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
             try:
                 return _json.loads(repaired)
             except Exception:
+                logger.debug("_parse_reflect_output: repaired load failed")
                 pass
         logger.warning("Reflection JSON parse failed: %s", first_err)
         return None
@@ -452,7 +668,7 @@ def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
 
 def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
     """Max BM25 similarity between text and existing memories (0-1 normalized)."""
-    scored = _package_root()._bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
+    scored = _bm25_search_scored(memories, text, k=min(5, len(memories) or 1))
     if scored:
         # Normalize BM25 score to 0-1 using sigmoid approximation
         raw = scored[0][1]
@@ -462,6 +678,9 @@ def _tfidf_max_similarity(text: str, memories: List[LoadedMemory]) -> float:
 
 def _build_reflect_schema() -> Dict[str, Any]:
     """Build JSON schema for reflection structured output."""
+    # Exclude internal-only kinds (summary/raw_chunk) from the LLM-facing enum:
+    # those are produced by the embedding/compaction pipeline, not by the model.
+    llm_kinds = [k for k in REFINED_MEMORY_KINDS if k not in ("summary", "raw_chunk")]
     return {
         "type": "object",
         "properties": {
@@ -489,6 +708,7 @@ def _build_reflect_schema() -> Dict[str, Any]:
                         "fact": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "scope": {"type": "string", "enum": ["user", "project"]},
+                        "kind": {"type": "string", "enum": llm_kinds},
                         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                         "rationale": {"type": "string"},
                         "supersedes": {"type": "array", "items": {"type": "string"}},
@@ -561,12 +781,13 @@ def _format_messages_for_reflection(messages: List[Dict[str, Any]]) -> str:
     return result
 
 
-def _format_inventory() -> str:
+def _format_inventory(scope_filters: Optional[Dict[str, Any]] = None) -> str:
     """Format current memory and skill inventory for reflection context."""
     mem_store = _get_mem_store()
     skill_store = _get_skill_store()
     lines = ["=== Current Memory Inventory ==="]
-    for m in mem_store.list_active():
+    active_mems = mem_store.list_active(filters=scope_filters)
+    for m in active_mems:
         lines.append(f"- [{m.id()}] {m.body[:120]} (tags: {m.frontmatter.tags}, confidence: {m.frontmatter.confidence})")
     lines.append("")
     lines.append("=== Current Skill Inventory ===")
@@ -575,22 +796,27 @@ def _format_inventory() -> str:
     return "\n".join(lines)
 
 
-def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _run_full_reflection(
+    ctx,
+    messages: List[Dict[str, Any]],
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Run a full reflection. Default is raw_chunk (zero LLM cost);
     falls back to embedding/LLM if configured."""
     mode = _reflection_mode()
+    scope_filters = _scope_filters_from_context(ctx, scope_filters)
 
     # W2: raw_chunk mode — zero LLM calls, store raw conversation chunks
     if mode == "raw_chunk":
-        return _run_raw_chunk_reflection(messages)
+        return _run_raw_chunk_reflection(messages, scope_filters=scope_filters)
 
     # embedding-based (local, zero cost)
     if mode in ("embedding", "local"):
-        return _run_embedding_reflection(messages)
+        return _run_embedding_reflection(messages, scope_filters=scope_filters)
 
     # Hybrid: try embedding first, if no candidates found, try LLM
     if mode == "hybrid":
-        emb_result = _run_embedding_reflection(messages)
+        emb_result = _run_embedding_reflection(messages, scope_filters=scope_filters)
         if emb_result.get("accepted_memories") or emb_result.get("skill_candidates"):
             return emb_result
         logger.info("Hybrid mode: embedding found no candidates, trying LLM fallback")
@@ -602,7 +828,17 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"error": "No LLM available"}
 
     transcript = _format_messages_for_reflection(messages)
-    inventory = _format_inventory()
+    user_msgs = []
+    for msg in messages:
+        if msg.get("role", "") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                content = " ".join(texts)
+            if isinstance(content, str):
+                user_msgs.append(content)
+    full_user = " ".join(user_msgs)
+    inventory = _format_inventory(scope_filters)
 
     instructions = (
         "Analyze the following conversation transcript and current agent inventory. "
@@ -639,18 +875,39 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     mem_store = _get_mem_store()
     accepted_memories = []
 
+    current_session_ids = _get_current_session_memory_ids()
     for cand in parsed.get("memory_candidates", []):
         body = cand.get("fact", "")
         scope = cand.get("scope", "user")
+        # P2-1: normalize the LLM-provided kind so the sidecar vocabulary
+        # stays consistent (unknown/missing kinds fall back to "fact").
+        candidate_kind = normalize_memory_kind(cand.get("kind"))
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
+        candidate_supersedes = list(cand.get("supersedes", []) or [])
         novelty = 0.0
         try:
-            novelty = _compute_novelty_score(body, mem_store.list_active())
+            novelty = _compute_novelty_score(
+                body, mem_store.list_active(filters=scope_filters),
+                exclude_ids=current_session_ids,
+            )
         except Exception:
             pass
 
-        supersedes = cand.get("supersedes", [])
-        conflict = mem_store.check_conflict(body, exclude_ids=list(supersedes))
+        plan = resolve_semantic_supersedes(
+            candidate_text=body,
+            candidate_kind=candidate_kind,
+            user_msg=full_user,
+            conflict_memory=None,
+            conflict_similarity=0.0,
+            scope_filters=scope_filters,
+            explicit_supersedes=candidate_supersedes,
+        )
+
+        conflict = mem_store.check_conflict(
+            body,
+            exclude_ids=list(current_session_ids | set(candidate_supersedes)),
+            filters=scope_filters,
+        )
         if conflict:
             existing_id, score = conflict
             logger.info("Reflection memory candidate conflicts with %s (%.2f), skipping", existing_id, score)
@@ -666,24 +923,51 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         try:
             supersedes_reason = cand.get("supersedes_reason", "")
+            supersedes = candidate_supersedes if plan["action"] == "supersede" else []
             if not supersedes_reason and supersedes:
-                supersedes_reason = "LLM suggested replacement"
-            fm = MemoryFrontmatter.new(
+                supersedes_reason = plan["reason"]
+            fm = _frontmatter_for_scope(
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
                 zone="episode",
                 supersedes=supersedes,
                 supersedes_reason=supersedes_reason,
+                scope_filters=scope_filters,
             )
-            _validate_supersedes_targets(mem_store, fm.supersedes)
+            if fm.supersedes:
+                _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
+            # Phase C: a merge carries no lineage edge but the resolver still
+            # named targets whose facts are now superseded in truth-value.
+            merge_targets = plan["target_ids"] if plan["action"] == "merge" else []
+            _record_typed_fact_sidecar(
+                mem_store,
+                fm,
+                body,
+                relation="describes",
+                kind=candidate_kind,
+                target_memory_id=fm.id,
+                episode_id=fm.id,
+                source="reflection",
+                confidence=0.9 if cand.get("confidence") == "high" else 0.6,
+                superseded_memory_ids=list(fm.supersedes or []) + list(merge_targets) or None,
+            )
+            # Record merge / scope_split semantic edges (round-3 P1-2).
+            if plan["action"] in ("merge", "scope_split") and plan.get("target_ids"):
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=plan["action"],
+                    target_ids=plan["target_ids"],
+                    reason=plan["reason"],
+                    confidence=plan.get("confidence", 0.6),
+                )
             _remember_current_session_memory_id(fm.id)
-            accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
+            accepted_memories.append({"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")})
             audit_entries.append(_build_audit_entry(
                 candidate_id=cand_id,
                 decision="accepted" if not fm.supersedes else "superseded",
-                decision_reason="novelty sufficient, no conflict" if not fm.supersedes else f"supersedes {fm.supersedes}",
+                decision_reason=plan["reason"] if not fm.supersedes else f"supersedes {fm.supersedes}",
                 novelty_score=novelty,
                 supersedes_ids=fm.supersedes or [],
                 supersedes_reason=supersedes_reason,
@@ -738,12 +1022,18 @@ def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
+def _run_micro_reflection(
+    ctx,
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Run a micro-reflection. Uses embedding-based by default; falls back to LLM only in 'llm' mode."""
     mode = _reflection_mode()
+    scope_filters = _scope_filters_from_context(ctx, scope_filters)
 
     if mode in ("embedding", "local", "hybrid"):
-        return _run_embedding_micro_reflection(user_msg, assistant_msg)
+        return _run_embedding_micro_reflection(user_msg, assistant_msg, scope_filters=scope_filters)
 
     # LLM mode (expensive)
     if not hasattr(ctx, "llm"):
@@ -782,18 +1072,39 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
     accepted = None
     audit_entries: List[Dict[str, Any]] = []
 
+    current_session_ids = _get_current_session_memory_ids()
     for cand in parsed.get("memory_candidates", [])[:1]:
         body = cand.get("fact", "")
         scope = cand.get("scope", "user")
         cand_id = f"cand_{uuid.uuid4().hex[:12]}"
         novelty = 0.0
         try:
-            novelty = _compute_novelty_score(body, mem_store.list_active())
+            novelty = _compute_novelty_score(
+                body, mem_store.list_active(filters=scope_filters),
+                exclude_ids=current_session_ids,
+            )
         except Exception:
             pass
 
-        supersedes = cand.get("supersedes", [])
-        conflict = mem_store.check_conflict(body, exclude_ids=list(supersedes))
+        candidate_supersedes = list(cand.get("supersedes", []) or [])
+        # P2-1: normalize the LLM-provided kind to the canonical vocabulary.
+        candidate_kind = normalize_memory_kind(cand.get("kind"))
+        plan = resolve_semantic_supersedes(
+            candidate_text=body,
+            candidate_kind=candidate_kind,
+            user_msg=user_msg,
+            conflict_memory=None,
+            conflict_similarity=0.0,
+            scope_filters=scope_filters,
+            explicit_supersedes=candidate_supersedes,
+        )
+        supersedes = candidate_supersedes if plan["action"] == "supersede" else []
+
+        conflict = mem_store.check_conflict(
+            body,
+            exclude_ids=list(current_session_ids | set(candidate_supersedes)),
+            filters=scope_filters,
+        )
         if conflict:
             existing_id, score = conflict
             audit_entries.append(_build_audit_entry(
@@ -807,24 +1118,50 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
             continue
 
         try:
-            fm = MemoryFrontmatter.new(
+            fm = _frontmatter_for_scope(
                 source="micro_reflection",
                 confidence=cand.get("confidence", "low"),
                 tags=cand.get("tags", []),
+                zone=cand.get("zone", "episode"),
                 supersedes=supersedes,
-                supersedes_reason=cand.get("supersedes_reason", "LLM suggested replacement"),
+                supersedes_reason=cand.get("supersedes_reason", "") if not supersedes else plan["reason"],
+                scope_filters=scope_filters,
             )
-            _validate_supersedes_targets(mem_store, fm.supersedes)
+            if fm.supersedes:
+                _validate_supersedes_targets(mem_store, fm.supersedes)
             path = mem_store.put(scope, fm, body)
+            # Phase C: merge targets carry no lineage edge but should still
+            # invalidate the superseded facts and record a relation edge.
+            merge_targets = plan["target_ids"] if plan["action"] == "merge" else []
+            _record_typed_fact_sidecar(
+                mem_store,
+                fm,
+                body,
+                relation="describes",
+                kind=candidate_kind,
+                target_memory_id=fm.id,
+                episode_id=fm.id,
+                source="micro_reflection",
+                confidence=0.9 if cand.get("confidence") == "high" else 0.6,
+                superseded_memory_ids=list(fm.supersedes or []) + list(merge_targets) or None,
+            )
+            if plan["action"] in ("merge", "scope_split") and plan.get("target_ids"):
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=plan["action"],
+                    target_ids=plan["target_ids"],
+                    reason=plan["reason"],
+                    confidence=plan.get("confidence", 0.6),
+                )
             _remember_current_session_memory_id(fm.id)
-            accepted = {"id": fm.id, "body": body, "path": str(path)}
+            accepted = {"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")}
             audit_entries.append(_build_audit_entry(
                 candidate_id=cand_id,
                 decision="accepted" if not fm.supersedes else "superseded",
-                decision_reason="micro-reflection auto-accepted",
+                decision_reason=plan["reason"] if not fm.supersedes else f"supersedes {fm.supersedes}",
                 novelty_score=novelty,
                 supersedes_ids=fm.supersedes or [],
-                supersedes_reason=cand.get("supersedes_reason", "LLM suggested replacement"),
+                supersedes_reason=cand.get("supersedes_reason", "") if not fm.supersedes else plan["reason"],
                 assigned_zone="episode",
             ))
         except Exception as e:
@@ -856,6 +1193,33 @@ def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Di
 
 PENDING_SKILLS_PATH = _plugin_data_dir() / "pending-skills.json"
 _MAX_PENDING_SKILLS = 200  # P2-27: max pending items before archive
+_MAX_PENDING_SKILL_ARCHIVE_AGE_DAYS = 30
+_MAX_PENDING_SKILL_ARCHIVES = 10
+_MAX_RAW_CHUNK_PER_SESSION = 20
+
+
+def _cleanup_pending_skill_archives() -> None:
+    """Purge old pending-skills archives by age and count (P3-6)."""
+    try:
+        archives = sorted(
+            PENDING_SKILLS_PATH.parent.glob("pending-skills.*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not archives:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - _MAX_PENDING_SKILL_ARCHIVE_AGE_DAYS * 86400
+        for idx, arch in enumerate(archives):
+            mtime = arch.stat().st_mtime
+            if idx >= _MAX_PENDING_SKILL_ARCHIVES or mtime < cutoff:
+                arch.unlink(missing_ok=True)
+                logger.debug(
+                    "Deleted old pending-skills archive %s (mtime %s)",
+                    arch,
+                    datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                )
+    except Exception as e:
+        logger.debug("Pending-skills archive cleanup failed: %s", e)
 
 
 def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
@@ -884,6 +1248,9 @@ def _save_pending_skill_candidates(candidates: List[Dict[str, Any]]) -> None:
             existing.extend(candidates)
             with open(PENDING_SKILLS_PATH, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
+            # P3-6: prune archive files after every save so old timestamped
+            # archives do not grow without bound.
+            _cleanup_pending_skill_archives()
     except Exception as e:
         logger.warning("Failed to save pending skill candidates: %s", e)
 
@@ -1082,193 +1449,21 @@ def _find_conflicting_memory(new_text: str, existing: List[LoadedMemory], thresh
 
 
 def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str, Any]]:
-    """Extract potential fact statements from a conversation turn using heuristics."""
-    facts = []
-    combined = f"{user_msg} {assistant_msg}"
-
-    # Heuristic 1: Explicit memory intent
-    if _is_explicit_memory_intent(user_msg):
-        # Extract the sentence containing the intent marker
-        sentences = re.split(r'[。！？.!?\n]+', user_msg)
-        for s in sentences:
-            if _is_explicit_memory_intent(s):
-                s = s.strip()
-                if len(s) > 10 and _is_memorable_content(s):
-                    facts.append({
-                        "text": s,
-                        "confidence": "high",
-                        "rationale": "User explicitly requested to remember",
-                        "source": "explicit_intent",
-                    })
-
-    # Heuristic 2: Corrections
-    if _is_correction(user_msg):
-        sentences = re.split(r'[。！？.!?\n]+', user_msg)
-        for s in sentences:
-            if _is_correction(s) and len(s) > 10 and _is_memorable_content(s):
-                facts.append({
-                    "text": s.strip(),
-                    "confidence": "medium",
-                    "rationale": "User corrected a previous statement",
-                    "source": "correction",
-                })
-
-    # Heuristic 3: Preference statements
-    # HIGH-9: use restrictive char classes instead of `.` to avoid capturing
-    # trailing punctuation / half-sentences. Stop at sentence boundaries.
-    _NOT_SENTENCE_END = r"[^\n。！？.!?]"
-    pref_patterns = [
-        (r"(?:我|i)\s+(?:喜欢|prefer|like|want|想|要)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
-        (r"(?:我|i)\s+(?:不喜欢|hate|dislike|不想)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
-        (r"(?:我|i)\s+(?:总是|always|usually|never)\s+(" + _NOT_SENTENCE_END + r"{5,80})", "preference"),
-        (r"(?:用|use)\s+(" + _NOT_SENTENCE_END + r"{3,40})\s+(?:因为|because)", "preference"),
-    ]
-    for pat, source in pref_patterns:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            text = m.group(0).strip()
-            if len(text) > 10 and _is_memorable_content(text):
-                facts.append({
-                    "text": text,
-                    "confidence": "medium",
-                    "rationale": "Detected preference statement",
-                    "source": source,
-                })
-
-    # Heuristic 4: Convention / config statements
-    conv_patterns = [
-        r"(?:配置|config|setting|设置)\s*[：:]\s*(.{5,80})",
-        r"(?:默认|default)\s*[：:]\s*(.{5,80})",
-        r"(?:约定|convention)\s*[：:]\s*(.{5,80})",
-        r"(?:规则|rule)\s*[：:]\s*(.{5,80})",
-    ]
-    for pat in conv_patterns:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            text = m.group(0).strip()
-            if len(text) > 10 and _is_memorable_content(text):
-                facts.append({
-                    "text": text,
-                    "confidence": "medium",
-                    "rationale": "Detected configuration or convention",
-                    "source": "convention",
-                })
-
-    # Deduplicate by text similarity
-    deduped = []
-    seen_texts = []
-    for f in facts:
-        # Filter out system notes and tool call artifacts
-        if _is_noise_text(f["text"]):
-            continue
-        is_dup = False
-        for st in seen_texts:
-            if _text_similarity(f["text"], st) > 0.8:
-                is_dup = True
-                break
-        if not is_dup:
-            seen_texts.append(f["text"])
-            deduped.append(f)
-
-    return deduped
+    """Extract refined fact candidates using the shared refinement helper."""
+    return extract_refined_memory_candidates(user_msg, assistant_msg)
 
 
-def _is_noise_text(text: str) -> bool:
-    """Check if extracted text is a system note or tool artifact, not genuine user content.
-
-    These texts should never be saved as memories.
-    """
-    stripped = text.strip()
-
-    # System-level bookkeeping notes
-    if stripped.startswith("[System note:") or stripped.startswith("[System]"):
-        return True
-
-    # Tool placeholder markers
-    if stripped.startswith("[tool]") or stripped.startswith("{"):
-        return True
-
-    # "Review the conversation above and update the skill library" — auto-injected task
-    if "Review the conversation above and update the skill library" in stripped:
-        return True
-
-    # Gateway shutdown / restart notes
-    if "gateway shutdown" in stripped.lower() or "interrupted by a gateway" in stripped.lower():
-        return True
-
-    # Pure JSON / data dumps (tool outputs leaked into message text)
-    if stripped.startswith('{"') or stripped.startswith('['):
-        return True
-
-    return False
-
-
-def _text_similarity(a: str, b: str) -> float:
-    """Quick text similarity using token overlap."""
-    ta = set(_tokenise(a))
-    tb = set(_tokenise(b))
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    return inter / max(len(ta), len(tb))
-
-
-def _is_memorable_content(text: str) -> bool:
-    """Filter out non-memorable content that shouldn't be stored as memory.
-
-    Rejects:
-    - Tool output patterns (code blocks, exit codes, stdout/stderr)
-    - File paths and code patterns
-    - Very short or very repetitive content
-    - System-like messages
-
-    Returns True if content is worth remembering, False otherwise.
-    """
-    if not text or not isinstance(text, str):
-        return False
-
-    text = text.strip()
-
-    # Too short
-    if len(text) < 15:
-        return False
-
-    # Tool output patterns
-    tool_indicators = [
-        "```", "Exit code", "stdout", "stderr", "Tool ran without output",
-        "Process completed", "Command output", "Execution result",
-        "File created", "File modified", "File deleted",
-    ]
-    text_lower = text.lower()
-    for indicator in tool_indicators:
-        if indicator.lower() in text_lower:
-            return False
-
-    # File paths (Windows and Unix)
-    if re.search(r'[a-zA-Z]:\\[\w\\.-]+|/[\w/\-._]+', text):
-        # Only reject if looks like a file path, not just a path-like string
-        if re.search(r'[\\/]([\w-]+\.[\w]{2,4}|[\w-]+[\\/])', text):
-            return False
-
-    # Code patterns (function/class definitions, imports)
-    code_patterns = [
-        r'^def\s+\w+\s*\(', r'^class\s+\w+', r'^import\s+\w+',
-        r'^from\s+\w+\s+import', r'^\s*(public|private|protected)\s+(void|int|String)',
-        r'^function\s+\w+\s*\(', r'^const\s+\w+\s*=',
-    ]
-    for pat in code_patterns:
-        if re.match(pat, text, re.MULTILINE):
-            return False
-
-    # Very repetitive content (e.g., "------" or "aaaaa")
-    if len(set(text[:50])) < 5:
-        return False
-
-    # System-like messages
-    system_prefixes = ["[system]", "[error]", "[warning]", "[info]", "[debug]"]
-    for prefix in system_prefixes:
-        if text_lower.startswith(prefix.lower()):
-            return False
-
-    return True
+# P2-2 (round-3): these helpers previously lived as local copies in this
+# module AND in extraction.py/engine.py, with subtly different behaviour (the
+# local ``_is_memorable_content`` ignored CJK weight, so Chinese short
+# fragments were scored inconsistently between micro-reflection and the
+# compaction fallback). They are now re-exported from extraction.py, the
+# single CJK-aware source of truth, so every path agrees.
+from .extraction import (  # noqa: E402,F401
+    _is_noise_text,
+    _is_memorable_content,
+    _text_similarity,
+)
 
 
 def _infer_zone_from_scope(scope: str) -> str:
@@ -1286,7 +1481,10 @@ def _validate_supersedes_targets(mem_store: Any, supersedes: List[str]) -> None:
             raise ValueError(f"supersedes would create a cycle: {' -> '.join(cycle)}")
 
 
-def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _run_embedding_reflection(
+    messages: List[Dict[str, Any]],
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Run a full reflection using local embeddings + rule engine (zero LLM cost).
 
     This replaces the expensive LLM-based reflection with:
@@ -1295,9 +1493,10 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     3. Conflict detection via embedding similarity
     4. Conservative candidate generation
     """
+    scope_filters = _scope_filters_from_context(None, scope_filters)
     mem_store = _get_mem_store()
     skill_store = _get_skill_store()
-    active_memories = mem_store.list_active()
+    active_memories = mem_store.list_active(filters=scope_filters)
     current_session_ids = _get_current_session_memory_ids()
     all_skills = skill_store.list()
 
@@ -1355,63 +1554,63 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Check for conflicts
         conflict_mem = _find_conflicting_memory(text, active_memories, exclude_ids=current_session_ids)
         tags = _extract_keywords(text, top_k=3)
+        candidate_kind = fact.get("kind", "fact")
+        supersedes: List[str] = []
+        plan: Optional[Dict[str, Any]] = None
 
         if conflict_mem:
             mem, sim = conflict_mem
-            # If very similar but user is correcting, mark as stale
-            if _is_correction(full_user) and sim > 0.8:
-                conflicts.append({
-                    "with": mem.id(),
-                    "kind": "stale",
-                    "explain": f"User corrected previous information. Similarity: {sim:.2f}",
-                    "options": ["keep_new", "keep_old"],
-                })
-                memory_candidates.append({
-                    "fact": text,
-                    "tags": tags,
-                    "scope": "user",
-                    "confidence": fact["confidence"],
-                    "rationale": fact["rationale"],
-                    "supersedes": [mem.id()],
-                })
-                audit_entries.append(_build_audit_entry(
-                    candidate_id=cand_id,
-                    decision="superseded",
-                    decision_reason=f"user corrected previous info; similarity {sim:.2f}",
-                    novelty_score=novelty,
-                    conflict_id=mem.id(),
-                    supersedes_ids=[mem.id()],
-                    supersedes_reason="user correction",
-                    assigned_zone=_infer_zone_from_scope("user"),
-                ))
-            else:
-                # Just similar, not necessarily conflicting - skip to avoid duplication
+            plan = resolve_semantic_supersedes(
+                candidate_text=text,
+                candidate_kind=candidate_kind,
+                user_msg=full_user,
+                conflict_memory=mem,
+                conflict_similarity=sim,
+                scope_filters=scope_filters,
+            )
+            if plan["action"] == "skip":
                 logger.debug("Similar to existing memory %s (%.3f), skipping", mem.id(), sim)
                 audit_entries.append(_build_audit_entry(
                     candidate_id=cand_id,
                     decision="skipped",
-                    decision_reason=f"similar to {mem.id()} (sim {sim:.2f}) without explicit correction",
+                    decision_reason=plan["reason"],
                     novelty_score=novelty,
                     conflict_id=mem.id(),
                     assigned_zone=_infer_zone_from_scope("user"),
                 ))
                 continue
-        else:
-            memory_candidates.append({
-                "fact": text,
-                "tags": tags,
-                "scope": "user",
-                "confidence": fact["confidence"],
-                "rationale": fact["rationale"],
-                "supersedes": [],
-            })
-            audit_entries.append(_build_audit_entry(
-                candidate_id=cand_id,
-                decision="pending_storage",
-                decision_reason="novelty sufficient, no conflict",
-                novelty_score=novelty,
-                assigned_zone=_infer_zone_from_scope("user"),
-            ))
+            if plan["action"] == "supersede":
+                supersedes = plan["target_ids"]
+                conflicts.append({
+                    "with": mem.id(),
+                    "kind": "stale",
+                    "explain": plan["reason"],
+                    "options": ["keep_new", "keep_old"],
+                })
+            # merge / scope_split carry no supersedes edge; capture the targets
+            # so the storage loop can record a semantic-relation sidecar edge.
+        memory_candidates.append({
+            "fact": text,
+            "tags": tags,
+            "scope": "user",
+            "confidence": fact["confidence"],
+            "rationale": fact["rationale"],
+            "supersedes": supersedes,
+            "kind": candidate_kind,
+            "semantic_action": (plan or {}).get("action") if (plan or {}).get("action") in ("merge", "scope_split") else None,
+            "semantic_target_ids": (plan or {}).get("target_ids") if (plan or {}).get("action") in ("merge", "scope_split") else [],
+            "semantic_reason": (plan or {}).get("reason", "") if (plan or {}).get("action") in ("merge", "scope_split") else "",
+        })
+        audit_entries.append(_build_audit_entry(
+            candidate_id=cand_id,
+            decision="superseded" if supersedes else "accepted",
+            decision_reason=plan["reason"] if plan else "novelty sufficient, no conflict",
+            novelty_score=novelty,
+            conflict_id=mem.id() if conflict_mem else "",
+            supersedes_ids=supersedes,
+            supersedes_reason=plan["reason"] if supersedes else "",
+            assigned_zone=_infer_zone_from_scope("user"),
+        ))
 
     summary_text = ""
     summary_tags: List[str] = []
@@ -1429,6 +1628,7 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "confidence": "low",
                 "rationale": "Session contained novel concepts not matching existing memories",
                 "supersedes": [],
+                "kind": "summary",
             })
             audit_entries.append(_build_audit_entry(
                 candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
@@ -1477,17 +1677,18 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         scope = cand.get("scope", "user")
         zone = _infer_zone_from_scope(scope)
         try:
-            fm = MemoryFrontmatter.new(
+            fm = _frontmatter_for_scope(
                 source="reflection",
                 confidence=cand.get("confidence", "medium"),
                 tags=cand.get("tags", []),
                 zone=zone,
+                supersedes=cand.get("supersedes", []),
+                scope_filters=scope_filters,
             )
-            fm.supersedes = cand.get("supersedes", [])
             _validate_supersedes_targets(mem_store, fm.supersedes)
             exclude_ids = list(current_session_ids | set(fm.supersedes or []))
             # Final conflict check
-            conflict = mem_store.check_conflict(body, exclude_ids=exclude_ids)
+            conflict = mem_store.check_conflict(body, exclude_ids=exclude_ids, filters=scope_filters)
             if conflict:
                 existing_id, score = conflict
                 logger.info("Embedding reflection: memory conflicts with %s (%.2f), skipping", existing_id, score)
@@ -1501,8 +1702,30 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ))
                 continue
             path = mem_store.put(scope, fm, body)
-            accepted_memories.append({"id": fm.id, "body": body, "path": str(path)})
+            accepted_memories.append({"id": fm.id, "body": body, "path": str(path), "kind": cand.get("kind")})
             _remember_current_session_memory_id(fm.id)
+            # Phase C: record merge / scope_split semantic edges so the
+            # resolver's decision is not silently dropped (round-3 P1-2).
+            semantic_action = cand.get("semantic_action")
+            semantic_targets = cand.get("semantic_target_ids") or []
+            if semantic_action in ("merge", "scope_split") and semantic_targets:
+                _record_semantic_relation_sidecar(
+                    mem_store, fm,
+                    action=semantic_action,
+                    target_ids=semantic_targets,
+                    reason=cand.get("semantic_reason", ""),
+                    confidence=0.6,
+                )
+                # A merge is a semantic update: the merge target's own facts
+                # are now superseded in truth-value by this memory.
+                if semantic_action == "merge":
+                    _record_typed_fact_sidecar(
+                        mem_store, fm, body,
+                        relation="describes", kind=cand.get("kind", "fact"),
+                        target_memory_id=fm.id, episode_id=fm.id,
+                        source="reflection", confidence=0.6,
+                        superseded_memory_ids=semantic_targets,
+                    )
             # Update the matching pending_storage audit entry if present
             updated = False
             for ae in audit_entries:
@@ -1562,16 +1785,47 @@ def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _run_raw_chunk_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _run_raw_chunk_reflection(
+    messages: List[Dict[str, Any]],
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Save raw conversation chunks as episode memories. Zero LLM calls.
 
     Academic basis: [Retrieval Bottleneck] arXiv:2603.02473, Sec.3.1.
     Basic RAG (zero LLM calls) with hybrid retrieval reaches 81.1%,
     outperforming Mem0-style Extracted Facts (77.3%).
     """
+    scope_filters = _scope_filters_from_context(None, scope_filters)
     mem_store = _get_mem_store()
     accepted = []
     audit_entries: List[Dict[str, Any]] = []
+
+    # P3-7: enforce a per-session cap on raw_chunk episode memories.
+    try:
+        max_raw = int(plugin_config().get("reflection", {}).get("max_raw_chunk_per_session", _MAX_RAW_CHUNK_PER_SESSION))
+    except Exception:
+        max_raw = _MAX_RAW_CHUNK_PER_SESSION
+    current_raw_count = _get_raw_chunk_session_count()
+    if current_raw_count >= max_raw:
+        logger.info(
+            "Raw chunk reflection cap reached (%d/%d); skipping new chunks for this session",
+            current_raw_count, max_raw,
+        )
+        summary = f"Raw chunk reflection: cap reached ({current_raw_count}/{max_raw}); 0 chunks stored from {len(messages)} messages."
+        _append_reflect_log({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "raw_chunk",
+            "summary": summary,
+            "accepted_memories": 0,
+            "audit_entries": audit_entries,
+        })
+        return {
+            "mode": "raw_chunk",
+            "summary": summary,
+            "accepted_memories": accepted,
+            "chunks_created": 0,
+            "cap_reached": True,
+        }
 
     # Group messages into 3-turn windows
     chunk_size = 3
@@ -1593,22 +1847,41 @@ def _run_raw_chunk_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
 
         # Direct write without LLM analysis
-        fm = MemoryFrontmatter.new(
+        fm = _frontmatter_for_scope(
             source="raw_chunk",
             confidence="low",
             tags=["episode", "raw_chunk"],
             zone="episode",
+            scope_filters=scope_filters,
         )
         try:
             path = mem_store.put("user", fm, body)
-            accepted.append({"id": fm.id, "body_preview": body[:120]})
+            _record_typed_fact_sidecar(
+                mem_store,
+                fm,
+                body,
+                relation="captures",
+                kind="raw_chunk",
+                target_memory_id=fm.id,
+                episode_id=fm.id,
+                source="raw_chunk",
+                confidence=0.3,
+            )
+            accepted.append({"id": fm.id, "body_preview": body[:120], "kind": "raw_chunk"})
             _remember_current_session_memory_id(fm.id)
+            _increment_raw_chunk_session_count()
             audit_entries.append(_build_audit_entry(
                 candidate_id=f"chunk_{fm.id}",
                 decision="accepted",
                 decision_reason="raw chunk stored (zero LLM)",
                 assigned_zone="episode",
             ))
+            if _get_raw_chunk_session_count() >= max_raw:
+                logger.info(
+                    "Raw chunk reflection cap reached (%d/%d); stopping further chunks",
+                    max_raw, max_raw,
+                )
+                break
         except Exception as e:
             logger.debug("Raw chunk storage failed: %s", e)
             audit_entries.append(_build_audit_entry(
@@ -1635,23 +1908,28 @@ def _run_raw_chunk_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
+def _run_embedding_micro_reflection(
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Run a micro-reflection using local embeddings (zero LLM cost).
 
     Much faster than LLM-based micro-reflection (~50ms vs ~2000ms).
     """
+    scope_filters = _scope_filters_from_context(None, scope_filters)
     mem_store = _get_mem_store()
-    active_memories = mem_store.list_active()
+    active_memories = mem_store.list_active(filters=scope_filters)
+    current_session_ids = _get_current_session_memory_ids()
 
     combined = f"{user_msg} {assistant_msg}"
     cand_id = f"cand_{uuid.uuid4().hex[:12]}"
+    has_explicit_intent = _is_explicit_memory_intent(user_msg)
 
     # Extract facts first - if user has explicit intent, always process
     facts = _extract_facts_from_turn(user_msg, assistant_msg)
-    has_explicit_intent = _is_explicit_memory_intent(user_msg)
-
     # Quick novelty check - but skip if user explicitly wants to remember
-    novelty = _compute_novelty_score(combined, active_memories)
+    novelty = _compute_novelty_score(combined, active_memories, exclude_ids=current_session_ids)
     if not has_explicit_intent and novelty < 0.25:
         logger.debug("Micro-reflection: turn too similar to existing memories (%.3f), skipping", novelty)
         _append_reflect_log({
@@ -1690,18 +1968,24 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
     best = facts[0]
 
     # Check conflict
-    conflict_mem = _find_conflicting_memory(best["text"], active_memories)
+    conflict_mem = _find_conflicting_memory(
+        best["text"], active_memories, exclude_ids=current_session_ids
+    )
     tags = _extract_keywords(best["text"], top_k=3)
 
     supersedes = []
+    plan: Optional[Dict[str, Any]] = None
     if conflict_mem:
         mem, sim = conflict_mem
-        if _is_correction(user_msg) and sim > 0.7:
-            supersedes = [mem.id()]
-        elif has_explicit_intent and sim > 0.85:
-            # Very similar and user explicitly stated - likely an update
-            supersedes = [mem.id()]
-        else:
+        plan = resolve_semantic_supersedes(
+            candidate_text=best["text"],
+            candidate_kind=best.get("kind", "fact"),
+            user_msg=user_msg,
+            conflict_memory=mem,
+            conflict_similarity=sim,
+            scope_filters=scope_filters,
+        )
+        if plan["action"] == "skip":
             logger.debug("Micro-reflection: similar to %s (%.3f), skipping", mem.id(), sim)
             _append_reflect_log({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1717,19 +2001,50 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
                 )],
             })
             return None
+        if plan["action"] == "supersede":
+            supersedes = plan["target_ids"]
 
     try:
-        fm = MemoryFrontmatter.new(
+        fm = _frontmatter_for_scope(
             source="micro_reflection",
             confidence=best["confidence"],
             tags=tags,
             zone="episode",
             supersedes=supersedes,
+            scope_filters=scope_filters,
         )
         _validate_supersedes_targets(mem_store, fm.supersedes)
         path = mem_store.put("user", fm, best["text"])
+        # Phase C: a merge is a semantic update, so the merge target's facts
+        # are superseded in truth-value even though no lineage edge is written.
+        semantic_action = (plan or {}).get("action")
+        semantic_targets = (plan or {}).get("target_ids") or []
+        merge_supersede_ids = list(fm.supersedes or [])
+        if semantic_action == "merge" and semantic_targets:
+            merge_supersede_ids.extend(semantic_targets)
+        _record_typed_fact_sidecar(
+            mem_store,
+            fm,
+            best["text"],
+            relation="describes",
+            kind=best.get("kind", "fact"),
+            target_memory_id=fm.id,
+            episode_id=fm.id,
+            source="micro_reflection",
+            confidence=0.8 if best.get("confidence") == "high" else 0.6,
+            superseded_memory_ids=merge_supersede_ids or None,
+        )
+        # Record the merge / scope_split relation edge (round-3 P1-2).
+        if semantic_action in ("merge", "scope_split") and semantic_targets:
+            _record_semantic_relation_sidecar(
+                mem_store, fm,
+                action=semantic_action,
+                target_ids=semantic_targets,
+                reason=(plan or {}).get("reason", ""),
+                confidence=0.6,
+            )
         _remember_current_session_memory_id(fm.id)
-        accepted = {"id": fm.id, "body": best["text"], "path": str(path)}
+        accepted = {"id": fm.id, "body": best["text"], "path": str(path), "kind": best.get("kind")}
 
         _append_reflect_log({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1740,10 +2055,10 @@ def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Option
             "audit_entries": [_build_audit_entry(
                 candidate_id=cand_id,
                 decision="accepted" if not supersedes else "superseded",
-                decision_reason="micro-reflection auto-accepted" if not supersedes else f"supersedes {supersedes}",
+                decision_reason="micro-reflection auto-accepted" if not supersedes else plan["reason"],
                 novelty_score=novelty,
                 supersedes_ids=supersedes,
-                supersedes_reason="user correction" if _is_correction(user_msg) else "explicit intent update",
+                supersedes_reason=plan["reason"] if supersedes else "",
                 assigned_zone="episode",
             )],
         })
@@ -1806,7 +2121,178 @@ def _generate_skill_name(text: str) -> str:
 _COMPACT_THRESHOLD = 20
 
 
-def _compact_episode_zone(mem_store, ctx=None) -> dict:
+def _split_compaction_fragments(text: str) -> List[str]:
+    """Split a compaction candidate into sentence-like fragments."""
+    return [part.strip() for part in re.split(r"[。！？.!?\n]+", text or "") if part.strip()]
+
+
+def _compaction_fragment_score(text: str) -> float:
+    """Score how representative a fragment is for a compacted summary."""
+    fragment = (text or "").strip()
+    if not fragment or not _is_memorable_content(fragment) or _is_noise_text(fragment):
+        return -1.0
+
+    score = 0.0
+    lowered = fragment.lower()
+
+    # Prefer concise, conclusion-like fragments over long transcript chunks.
+    length = len(fragment)
+    if 40 <= length <= 220:
+        score += 3.0
+    elif length < 40:
+        score += 1.0
+    elif length <= 320:
+        score += 1.5
+    else:
+        score -= 1.5
+
+    # Reuse the refined extraction layer as the primary signal source.
+    candidates = _extract_facts_from_turn(fragment, "")
+    if candidates:
+        best = candidates[0]
+        kind = best.get("kind", "")
+        priority = int(best.get("priority", 9) or 9)
+        score += max(0.0, 7.0 - float(priority))
+        if best.get("text", "").strip() != fragment:
+            score += 0.5
+        if kind in {"intent", "decision", "preference", "policy", "correction", "todo"}:
+            score += 2.0
+    else:
+        if any(marker in lowered for marker in ("decided", "decision", "prefer", "prefer", "use", "must", "should", "always", "never")):
+            score += 2.0
+        if any(marker in fragment for marker in ("决定", "约定", "采用", "喜欢", "不喜欢", "总是", "以后", "必须")):
+            score += 2.0
+
+    # Penalize commentary that describes the absence of a conclusion instead of the conclusion itself.
+    if any(marker in lowered for marker in (
+        "never states",
+        "doesn't state",
+        "didn't state",
+        "not state",
+        "no decision",
+        "process chatter",
+        "setup details",
+        "scaffolding",
+    )):
+        score -= 3.0
+
+    # Reward short, information-dense fragments and lightly penalize noisy scaffolding.
+    keywords = _extract_keywords(fragment, top_k=3)
+    score += min(len(keywords), 3) * 0.3
+    if len(set(fragment[:80])) < 10:
+        score -= 1.0
+
+    return score
+
+
+def _build_compaction_fallback_summary(bodies: List[str]) -> str:
+    """Pick the best compacted fallback summary from a set of raw bodies."""
+    fragment_pool: List[Tuple[str, float]] = []
+    for body in bodies:
+        if not body:
+            continue
+        stripped = body.strip()
+        if not stripped or not _is_memorable_content(stripped) or _is_noise_text(stripped):
+            continue
+
+        candidates = _extract_facts_from_turn(stripped, "")
+        fragments: List[str] = []
+        if candidates:
+            fragments.extend(candidate["text"].strip() for candidate in candidates[:2] if candidate.get("text"))
+        fragments.extend(_split_compaction_fragments(stripped)[:3])
+        if not fragments:
+            fragments.append(stripped)
+
+        for fragment in fragments:
+            fragment = fragment.strip()
+            if not fragment:
+                continue
+            fragment_pool.append((fragment, _compaction_fragment_score(fragment)))
+
+    if not fragment_pool:
+        return ""
+
+    fragment_pool.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+
+    selected: List[str] = []
+    for fragment, score in fragment_pool:
+        if score < 0:
+            continue
+        if any(_text_similarity(fragment, seen) > 0.8 for seen in selected):
+            continue
+        selected.append(fragment)
+        if len(selected) >= 2:
+            break
+
+    if not selected:
+        selected = [fragment_pool[0][0]]
+
+    summary = " ".join(re.sub(r"\s+", " ", part).strip() for part in selected if part.strip())
+    return summary[:500]
+
+
+def _compaction_token_count(texts: List[str]) -> int:
+    """Estimate total token count across a set of texts."""
+    total = 0
+    for text in texts:
+        if not text:
+            continue
+        try:
+            total += max(0, int(_estimate_tokens(text)))
+        except Exception:
+            total += len((text or "").split())
+    return total
+
+
+def _compaction_summary_quality(
+    summary: str,
+    bodies: List[str],
+    fallback_summary: str = "",
+) -> Dict[str, Any]:
+    """Evaluate whether a compaction summary is better than the fallback."""
+    cleaned = (summary or "").strip()
+    fallback_clean = (fallback_summary or "").strip()
+    source_tokens = _compaction_token_count(bodies)
+    summary_tokens = _compaction_token_count([cleaned])
+    fallback_tokens = _compaction_token_count([fallback_clean]) if fallback_clean else 0
+    summary_score = _compaction_fragment_score(cleaned)
+    fallback_score = _compaction_fragment_score(fallback_clean) if fallback_clean else -1.0
+    compression_ratio = round(summary_tokens / source_tokens, 4) if source_tokens else 0.0
+    reasons: List[str] = []
+
+    if not cleaned:
+        reasons.append("empty")
+    if source_tokens and summary_tokens > max(12, int(source_tokens * 0.9)):
+        reasons.append("too_long")
+    if summary_score < 0:
+        reasons.append("low_signal")
+    if fallback_clean and summary_score + 0.25 < fallback_score:
+        reasons.append("worse_than_fallback")
+    if any(marker in cleaned.lower() for marker in (
+        "never states",
+        "doesn't state",
+        "didn't state",
+        "no decision",
+        "process chatter",
+        "setup details",
+        "scaffolding",
+    )):
+        reasons.append("commentary_noise")
+
+    passed = not reasons
+    return {
+        "passed": passed,
+        "reasons": reasons,
+        "source_tokens": source_tokens,
+        "summary_tokens": summary_tokens,
+        "fallback_tokens": fallback_tokens,
+        "compression_ratio": compression_ratio,
+        "summary_score": round(summary_score, 4),
+        "fallback_score": round(fallback_score, 4) if fallback_clean else None,
+    }
+
+
+def _compact_episode_zone(mem_store, ctx=None, filters: Optional[Dict[str, Any]] = None) -> dict:
     """Compress raw episode entries into daily summaries.
 
     Triggers when the count of non-compacted episode entries reaches
@@ -1834,8 +2320,10 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
     except Exception:
         llm_summary_enabled = True
 
-    # Get all episode entries
-    all_episode = mem_store.list_by_zone("episode")
+    scope_filters = _scope_filters_from_context(ctx, filters)
+
+    # Get episode entries for the current scope
+    all_episode = mem_store.list_by_zone("episode", filters=scope_filters)
 
     # Filter: only non-compacted entries
     raw_mems = [
@@ -1860,37 +2348,79 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
 
     summaries = []
     total_raw_consumed = 0
+    total_source_tokens = 0
+    total_summary_tokens = 0
 
     for day, mems in sorted(clusters.items()):
         if len(mems) < 2:
             continue  # Skip single-entry days
 
         bodies = [m.body.strip() for m in mems]
+        fallback_summary = _build_compaction_fallback_summary(bodies)
+        if not fallback_summary:
+            fallback_summary = max(bodies, key=len)
+        if len(fallback_summary) > 500:
+            fallback_summary = fallback_summary[:497] + "..."
 
-        # Build summary: LLM if available, otherwise longest
+        # Build summary: LLM if available, otherwise the scored fallback.
+        summary_mode = "fallback"
+        quality = None
         if ctx is not None and llm_summary_enabled and hasattr(ctx, "llm"):
-            summary = _llm_summarize_cluster(day, bodies, ctx)
+            llm_summary = _llm_summarize_cluster(day, bodies, ctx)
+            if llm_summary:
+                quality = _compaction_summary_quality(llm_summary, bodies, fallback_summary)
+                if quality["passed"]:
+                    summary = llm_summary
+                    summary_mode = "llm"
+                else:
+                    summary = fallback_summary
+                    summary_mode = "llm_fallback"
+            else:
+                summary = fallback_summary
         else:
-            summary = max(bodies, key=len)
-            if len(summary) > 300:
-                summary = summary[:297] + "..."
+            summary = fallback_summary
 
-        fm = MemoryFrontmatter.new(
+        source_tokens = _compaction_token_count(bodies)
+        summary_tokens = _compaction_token_count([summary])
+        compression_ratio = round(summary_tokens / source_tokens, 4) if source_tokens else 0.0
+        total_source_tokens += source_tokens
+        total_summary_tokens += summary_tokens
+
+        fm = _frontmatter_for_scope(
             source="system",
             confidence="medium",
             tags=["compacted", "auto-summary"],
             zone="episode",
+            supersedes=[m.id() for m in mems],
+            supersedes_reason=f"Compacted {len(mems)} entries from {day}",
+            scope_filters=scope_filters,
         )
-        fm.supersedes = [m.id() for m in mems]
-        fm.supersedes_reason = f"Compacted {len(mems)} entries from {day}"
 
         try:
             mem_store.put("user", fm, summary)
+            _record_typed_fact_sidecar(
+                mem_store,
+                fm,
+                summary,
+                relation="summarizes",
+                kind="compaction_summary",
+                target_memory_id=fm.id,
+                episode_id=day,
+                source="compaction",
+                confidence=0.6,
+                superseded_memory_ids=[m.id() for m in mems],
+            )
             summaries.append({
                 "day": day,
                 "compacted": len(mems),
                 "summary": summary,
                 "new_id": fm.id,
+                "summary_mode": summary_mode,
+                "source_tokens": source_tokens,
+                "summary_tokens": summary_tokens,
+                "compression_ratio": compression_ratio,
+                "quality_gate": None if quality is None else quality["passed"],
+                "quality_reasons": [] if quality is None else quality["reasons"],
             })
             total_raw_consumed += len(mems)
         except Exception as e:
@@ -1900,13 +2430,17 @@ def _compact_episode_zone(mem_store, ctx=None) -> dict:
         "compacted": len(summaries),
         "summaries": summaries,
         "total_raw_consumed": total_raw_consumed,
+        "total_source_tokens": total_source_tokens,
+        "total_summary_tokens": total_summary_tokens,
+        "average_compression_ratio": round(total_summary_tokens / total_source_tokens, 4) if total_source_tokens else 0.0,
     }
 
 
-def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
+def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> Optional[str]:
     """Generate a brief summary of a day's episode entries using the LLM.
 
-    Falls back to the longest body if LLM call fails.
+    Returns ``None`` when the LLM is unavailable or fails so the caller can
+    apply the scored fallback and quality gate consistently.
     """
     prompt = (
         f"Below are {len(bodies)} raw memory entries from {day}. "
@@ -1914,10 +2448,6 @@ def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
         "in a neutral, factual tone:\n\n"
         + "\n---\n".join(f"[{i+1}] {b[:300]}" for i, b in enumerate(bodies))
     )
-    fallback = max(bodies, key=len)
-    if len(fallback) > 300:
-        fallback = fallback[:297] + "..."
-
     try:
         if hasattr(ctx, "llm") and callable(ctx.llm):
             response = ctx.llm(prompt)
@@ -1927,4 +2457,4 @@ def _llm_summarize_cluster(day: str, bodies: List[str], ctx) -> str:
     except Exception as e:
         logger.debug("LLM summary failed for %s: %s", day, e)
 
-    return fallback
+    return None

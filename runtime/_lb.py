@@ -52,7 +52,11 @@ def _lb(name: str) -> Optional[Any]:
         if "." in name:
             value = None
         else:
+            # Hermes loads plugins under hermes_plugins.<name>, but some
+            # import paths reference the bare package name.  Check both.
             pkg = sys.modules.get("mem_reflection_hermes")
+            if pkg is None:
+                pkg = sys.modules.get("hermes_plugins.mem_reflection_hermes")
             if pkg is None:
                 logger.debug(
                     "Late-bound symbol lookup of %r failed: package not loaded", name

@@ -10,6 +10,7 @@ Run: pytest tests/test_async_writer.py -v
 from __future__ import annotations
 
 import importlib.util
+import json
 import queue
 import sys
 import tempfile
@@ -78,7 +79,7 @@ class TestAsyncWriterFallback:
         assert path.exists()
 
     def test_async_write_exception_in_sync_fallback_is_logged(self, monkeypatch, caplog):
-        """If both async and sync fallback fail, warning is logged."""
+        """If both async and sync fallback fail, an exception is raised and warning is logged."""
         path = Path(tempfile.mkdtemp(prefix="hermes_async_")) / "test.md"
         fm = _store.MemoryFrontmatter.new(source="test")
 
@@ -90,9 +91,23 @@ class TestAsyncWriterFallback:
 
         import logging
         with caplog.at_level(logging.WARNING, logger="mem_reflection_hermes.core.store"):
-            _store.async_write_memory(path, fm, "body")
+            with pytest.raises(RuntimeError, match="disk full"):
+                _store.async_write_memory(path, fm, "body")
 
         assert "Sync write fallback failed" in caplog.text
+
+    def test_batch_record_stats_writes_multiple_entries(self, monkeypatch, tmp_path):
+        """batch_record_stats should append multiple stat entries in one call."""
+        monkeypatch.setattr(_store, "plugin_data_dir", lambda: tmp_path)
+        entries = [("mem-1", "accessed"), ("mem-2", "accessed"), ("mem-3", "loaded")]
+        _store.batch_record_stats(entries)
+        stats_path = tmp_path / "memory-stats.jsonl"
+        assert stats_path.exists()
+        lines = stats_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 3
+        parsed = [json.loads(line) for line in lines]
+        assert [e["memory_id"] for e in parsed] == ["mem-1", "mem-2", "mem-3"]
+        assert [e["event"] for e in parsed] == ["accessed", "accessed", "loaded"]
 
 
 class TestFileFlushWorker:

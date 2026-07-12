@@ -39,6 +39,7 @@ def empty_store():
     s = MockStore()
     with tempfile.TemporaryDirectory() as td:
         s._cold_store_path_override = str(Path(td) / "_cold_store.jsonl")
+        s._test_data_dir = td
         yield s
 
 
@@ -94,6 +95,23 @@ class TestCuratorContext:
         ctx = CuratorContext(mem_store=empty_store)
         assert ctx.errors == []
         assert isinstance(ctx.errors, list)
+
+    def test_context_filters_active_memories_by_scope(self, empty_store):
+        """CuratorContext.list_active applies scope filters unless admin_global is explicit."""
+        from memory.curator.actions import CuratorContext
+
+        empty_store.memories["u1"] = MockMemory("u1", "body")
+        empty_store.memories["u2"] = MockMemory("u2", "body")
+        setattr(empty_store.memories["u1"].frontmatter, "user_id", "u1")
+        setattr(empty_store.memories["u2"].frontmatter, "user_id", "u2")
+
+        scoped = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        admin = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"}, admin_global=True)
+
+        assert [m.id() for m in scoped.list_active()] == ["u1"]
+        assert {m.id() for m in admin.list_active()} == {"u1", "u2"}
+        assert scoped.scope_label == "scoped"
+        assert admin.scope_label == "global_admin"
 
 
 class TestCuratorResult:
@@ -186,7 +204,12 @@ class TestLoadLastAccess:
 
         ts = load_last_access(stale_store, "fresh")
         assert ts > 0
-        assert ts == _MOCK_TIME
+        # The timestamp is derived from MemoryEffectiveness.last_event_at, which
+        # is stored as an ISO-8601 string (microsecond precision, matching how
+        # the real stats pipeline writes it). A raw float epoch like _MOCK_TIME
+        # may carry sub-microsecond digits that do not survive the ISO round
+        # trip, so compare with pytest.approx rather than exact equality.
+        assert ts == pytest.approx(_MOCK_TIME)
         assert isinstance(ts, float)
 
     def test_returns_zero_on_missing_memory(self, empty_store):
@@ -364,7 +387,7 @@ class TestCuratorConfig:
         cfg = _curator_config(empty_store)
         assert cfg["enabled"] is False
         assert cfg["stale"]["days"] == 30
-        assert cfg["stale"]["effectiveness_threshold"] == 0.1  # default preserved
+        assert cfg["stale"]["effectiveness_threshold"] == 0.2  # default preserved
         assert cfg["similarity"]["enabled"] is False
         assert cfg["similarity"]["bm25_threshold"] == 0.6  # default preserved
 
@@ -450,21 +473,62 @@ class TestArchiveStaleAction:
         assert "bad_date" in empty_store.memories
 
     def test_effectiveness_below_threshold_triggers_archive(self, empty_store):
-        """Low effectiveness (even with recent access) triggers stale archive."""
+        """Low combined effectiveness (hit-rate x decay) triggers stale archive.
+
+        Combined score = factor() * decay_factor(); range ~0.15-1.0. A memory
+        is archived when it is both rarely referenced (low factor) AND long
+        untouched (low decay). Here: never referenced (factor=0.5) and last
+        touched ~120 days ago (decay floored at 0.3) -> 0.15, below threshold.
+        """
         from memory.curator.actions import ArchiveStale, CuratorContext
 
         empty_store.memories["low_eff"] = MockMemory(
             "low_eff", "low effectiveness memory", confidence="high"
         )
         empty_store.eff_data["low_eff"] = {
-            "last_accessed": _MOCK_TIME,
-            "effectiveness": 0.05,  # below default threshold 0.1
+            # ~120 days old so decay_factor() floors at 0.3; combined = 0.15
+            "last_accessed": _MOCK_TIME - 120 * 86400,
+            "effectiveness": 0.05,  # signals "low"; adapter maps to factor=0.5
         }
         ctx = CuratorContext(mem_store=empty_store)
         result = ArchiveStale().execute(ctx)
 
         assert result.archived == 1
         assert "low_eff" in empty_store.deleted
+
+    def test_archives_by_created_when_no_effectiveness(self, empty_store):
+        """P2-14: memories without effectiveness stats are archived by age fallback."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        old_created = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+        empty_store.memories["old_no_eff"] = MockMemory(
+            "old_no_eff", "old memory without stats", created=old_created
+        )
+        ctx = CuratorContext(mem_store=empty_store)
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 1
+        assert "old_no_eff" in empty_store.deleted
+
+    def test_scoped_run_archives_only_matching_scope(self, empty_store):
+        """ArchiveStale must not archive stale memories from other scopes."""
+        from memory.curator.actions import ArchiveStale, CuratorContext
+
+        empty_store.memories["stale_u1"] = MockMemory("stale_u1", "old u1")
+        empty_store.memories["stale_u2"] = MockMemory("stale_u2", "old u2")
+        setattr(empty_store.memories["stale_u1"].frontmatter, "user_id", "u1")
+        setattr(empty_store.memories["stale_u2"].frontmatter, "user_id", "u2")
+        empty_store.eff_data = {
+            "stale_u1": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.01},
+            "stale_u2": {"last_accessed": _MOCK_TIME - 100 * 86400, "effectiveness": 0.01},
+        }
+
+        ctx = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        result = ArchiveStale().execute(ctx)
+
+        assert result.archived == 1
+        assert "stale_u1" in empty_store.deleted
+        assert "stale_u2" not in empty_store.deleted
 
     def test_recent_high_effectiveness_is_not_archived(self, empty_store):
         """Recent access and high effectiveness keep memory active."""
@@ -698,6 +762,45 @@ class TestMergeSimilarAction:
         assert result.merged >= 1
         assert len(empty_store.deleted) >= 1
 
+    def test_scan_for_similar_caps_at_500_memories(self, empty_store, monkeypatch):
+        """P1-3: _scan_for_similar must cap the input set to 500 memories before O(n²) comparisons."""
+        from memory.curator.actions import MergeSimilar, CuratorContext
+
+        call_count = 0
+        tokenised_bodies: set[str] = set()
+        original_tokenise = MergeSimilar._tokenise_fn
+
+        def _counting_tokenise(_self, mem_store):
+            base = original_tokenise(_self, mem_store)
+
+            def _wrapper(text):
+                nonlocal call_count
+                call_count += 1
+                tokenised_bodies.add(text)
+                return base(text)
+
+            return _wrapper
+
+        monkeypatch.setattr(MergeSimilar, "_tokenise_fn", _counting_tokenise)
+
+        for i in range(600):
+            empty_store.memories[f"mem-{i}"] = MockMemory(
+                f"mem-{i}", f"repeated shared token {i}",
+            )
+
+        ctx = CuratorContext(mem_store=empty_store)
+        action = MergeSimilar()
+        candidates = action._scan_for_similar(empty_store, ctx)
+
+        # With a 500-memory global cap, at most 500 distinct bodies are tokenised.
+        assert len(tokenised_bodies) <= 500
+        # Without the cap, 600 memories would produce ~600*599 tokenise calls in a single
+        # scope group. With the cap the call count must be strictly below that upper bound.
+        assert call_count < 600 * 599
+        # All candidate pairs must come from within the capped set.
+        candidate_ids = {mid for pair in candidates for mid in pair[:2]}
+        assert len(candidate_ids) <= 500
+
     def test_below_merge_threshold_does_not_merge(self, empty_store):
         """Pairs with similarity below merge_threshold are only counted, not merged."""
         from memory.curator.actions import MergeSimilar, CuratorContext
@@ -814,6 +917,69 @@ class TestCleanOrphanEdgesAction:
         assert result.orphan_edges == 7
         assert cleaned["count"] == 2
 
+    def test_scoped_run_skips_global_orphan_cleanup(self, empty_store, monkeypatch):
+        """Scoped curator must not feed scoped IDs into global graph cleanup."""
+        from memory.curator.actions import CleanOrphanEdges, CuratorContext
+
+        called = {"clean": False}
+
+        class FakeGraphStore:
+            def clean_orphan_edges(self, active_ids):
+                called["clean"] = True
+                return 7
+
+            def compact_typed_facts(self, retention_days=30):
+                return 0
+
+        class FakeManager:
+            store = FakeGraphStore()
+
+        import memory.curator.actions as _actions_mod
+
+        monkeypatch.setattr(_actions_mod, "get_graph_manager_compat", lambda: FakeManager())
+        empty_store.memories["u1"] = MockMemory("u1", "body")
+        setattr(empty_store.memories["u1"].frontmatter, "user_id", "u1")
+
+        ctx = CuratorContext(mem_store=empty_store, filters={"user_id": "u1"})
+        result = CleanOrphanEdges().execute(ctx)
+
+        assert result.orphan_edges == 0
+        assert called["clean"] is False
+
+    def test_compacts_typed_facts_when_graph_available(self, empty_store, monkeypatch):
+        """P2-4: CleanOrphanEdges invokes compact_typed_facts() with configured retention."""
+        from memory.curator.actions import CleanOrphanEdges, CuratorContext
+
+        called = {"retention": None}
+
+        class FakeGraphIndex:
+            def compact_typed_facts(self, retention_days=30):
+                called["retention"] = retention_days
+                return 12
+
+        class FakeGraphStore:
+            def __init__(self):
+                self._gi = FakeGraphIndex()
+
+            def clean_orphan_edges(self, active_ids):
+                return 0
+
+        class FakeManager:
+            store = FakeGraphStore()
+
+        import memory.curator.actions as _actions_mod
+
+        monkeypatch.setattr(_actions_mod, "get_graph_manager_compat", lambda: FakeManager())
+        empty_store._plugin_config_override = {
+            "curator": {"gc": {"typed_fact_retention_days": 7}}
+        }
+
+        ctx = CuratorContext(mem_store=empty_store)
+        result = CleanOrphanEdges().execute(ctx)
+
+        assert called["retention"] == 7
+        assert result.typed_facts_deleted == 12
+
 
 class TestGenerateReportAction:
     """Tests for GenerateReport action."""
@@ -926,6 +1092,19 @@ class TestReportPersistence:
         assert payload["report"] == result["report"]
         assert payload["total_archived"] == result["total_archived"]
         assert reflected and reflected[0]["summary"] == result["report"]
+
+    def test_run_curator_reports_scope_policy(self, empty_store):
+        """Pipeline result exposes whether the run was scoped or admin global."""
+        from memory.curator import _run_curator
+
+        result = _run_curator(None, empty_store, filters={"user_id": "u1"})
+        admin_result = _run_curator(None, empty_store, filters={"user_id": "u1"}, admin_global=True)
+
+        assert result["scope"] == "scoped"
+        assert result["filters"] == {"user_id": "u1"}
+        assert result["admin_global"] is False
+        assert admin_result["scope"] == "global_admin"
+        assert admin_result["admin_global"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1281,65 @@ class TestErrorIsolation:
         assert result["compacted"] == 2  # v2, v3 archived
         assert "v2" in empty_store.deleted
         assert "v3" in empty_store.deleted
+
+    def test_stop_on_error_halts_after_first_action_failure(self, empty_store, monkeypatch):
+        """P2-15: with stop_on_error=True, a failure halts the pipeline."""
+        from memory.curator import _run_curator
+        import memory.curator.actions as _actions_mod
+
+        empty_store.memories["expired"] = MockMemory(
+            "expired", "past valid_until", valid_until="2020-01-01T00:00:00Z"
+        )
+        empty_store.memories["v1"] = MockMemory("v1", "oldest", zone="core", supersedes=[])
+        empty_store.memories["v2"] = MockMemory("v2", "v2", zone="core", supersedes=["v1"])
+        empty_store.memories["v3"] = MockMemory("v3", "v3", zone="core", supersedes=["v2"])
+        empty_store.memories["v4"] = MockMemory("v4", "newest", zone="core", supersedes=["v3"])
+        empty_store._plugin_config_override = {"curator": {"stop_on_error": True}}
+
+        def _always_failing_archive(mem_store, mem, entry, context):
+            return False, "forced failure"
+
+        monkeypatch.setattr(_actions_mod, "archive_and_delete", _always_failing_archive)
+
+        result = _run_curator(None, empty_store)
+
+        assert result["stop_on_error"] is True
+        assert len(result["errors"]) >= 1
+        assert result["compacted"] == 0  # CompactChains should not have run
+        assert "v2" not in empty_store.deleted
+        assert "v3" not in empty_store.deleted
+
+
+class TestRecoveryJournal:
+    """Tests for the curator recovery journal (P2-15)."""
+
+    def test_recovery_journal_contains_mutation_entries(self, empty_store):
+        """Successful mutations are recorded in the recovery journal."""
+        from memory.curator import _run_curator
+        from memory.curator import _recovery_journal_path
+
+        empty_store.memories["expired"] = MockMemory(
+            "expired", "past valid_until", valid_until="2020-01-01T00:00:00Z"
+        )
+
+        result = _run_curator(None, empty_store)
+
+        journal_path = _recovery_journal_path(empty_store)
+        lines = journal_path.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == result["archived"] + result["compacted"] + result["superseded"] + result["merged"]
+        entries = [json.loads(line) for line in lines]
+        assert any(e.get("memory_id") == "expired" and e.get("action") == "archive" for e in entries)
+        assert all("recorded_at" in e for e in entries)
+
+    def test_recovery_journal_empty_when_no_mutations(self, empty_store):
+        """No mutations means no recovery journal entries."""
+        from memory.curator import _run_curator
+        from memory.curator import _recovery_journal_path
+
+        result = _run_curator(None, empty_store)
+
+        journal_path = _recovery_journal_path(empty_store)
+        assert not journal_path.exists() or journal_path.read_text(encoding="utf-8").strip() == ""
 
 
 class TestPipelineAggregation:

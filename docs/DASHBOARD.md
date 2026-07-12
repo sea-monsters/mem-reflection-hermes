@@ -23,17 +23,16 @@ Plugins do **not** implement their own auth layer — the host guarantees auth f
 ## API Endpoints
 
 FastAPI, mounted at `/api/plugins/mem-reflection-hermes/`.
-Current surface: 15 routes (v1.6).
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/memories` | List all active memories (optional `zone`, `query`, `user_id`, `agent_id`, `run_id`) |
-| `POST` | `/memories` | Create new memory (auto-associates in graph) |
-| `PUT` | `/memories/{id}` | **Atomic update** (write-then-delete swap, cache + index) |
+| `POST` | `/memories` | Create new memory (auto-associates with up to 20 most recent tag-overlapping memories) |
+| `PUT` | `/memories/{id}` | **Atomic update** (write-then-delete swap, cache + index); returns HTTP 404 if the ID does not exist |
 | `DELETE` | `/memories/{id}` | Delete memory + cleanup graph edges |
 | `POST` | `/memories/reorder` | **Atomic reorder** via explicit `rank` assignment |
 | `GET` | `/zones` | All zones with counts |
-| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes (optional `user_id`, `agent_id`, `run_id`) |
+| `GET` | `/graph` | Memory graph (nodes + edges) with real Hebbian edges, SUPERSEDES edges, PageRank scores, SkillStore nodes (optional `user_id`, `agent_id`, `run_id`); scope-filtered when any scope parameter is provided) |
 | `GET` | `/graph/neighbors/{id}` | Graph neighbors for a memory with metadata enrichment |
 | `GET` | `/graph/zones` | Cross-zone bridge analysis (includes `zone_degree`) |
 | `GET` | `/query` | Runtime memory/search/graph query API |
@@ -41,14 +40,15 @@ Current surface: 15 routes (v1.6).
 | `GET` | `/reflections` | Recent reflection outcomes (optional `mode` filter) |
 | `GET` | `/reflections/audit` | Flattened reflection audit entries (optional `decision` filter) |
 | `GET` | `/stats` | Aggregate statistics (optional `user_id`, `agent_id`, `run_id`) |
-| `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.2) |
+| `GET` | `/curator` | Memory curator status, config, cold-store stats, and latest run report (v1.6 scoped maintenance) |
 
-## Scope Filters (v1.6)
+## Scope Filters (v1.6/v1.7)
 
 The `/memories`, `/graph`, and `/stats` endpoints accept optional `user_id`,
 `agent_id`, and `run_id` query parameters. When provided, results are filtered
-to memories matching all supplied scope fields. Omitting them preserves the
-original global view.
+to memories matching all supplied scope fields. For `/graph`, the scope filter
+also bounds graph traversal (`allowed_nodes`) so neighbor/viz results do not
+cross tenant boundaries. Omitting them preserves the original global view.
 
 ```bash
 # Memories scoped to a specific user and run

@@ -16,6 +16,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ try:
         MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
         parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
     )
+    from .scope import build_scope_clauses, normalize_scope_value
     from .skill_store import SkillStore, _read_skill_file  # noqa: F401
     from .tokenization import (  # noqa: F401
         _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
@@ -79,6 +81,7 @@ except ImportError:
         MemoryStatEntry, SkillFrontmatter, _load_frontmatter_file,
         parse_frontmatter, read_memory, serialize_frontmatter, write_memory_atomic,
     )
+    from core.scope import build_scope_clauses, normalize_scope_value
     from core.skill_store import SkillStore, _read_skill_file  # noqa: F401
     from core.tokenization import (  # noqa: F401
         _CJK_STOPWORDS, _STOPWORDS, _bm25_search, _bm25_search_scored,
@@ -137,6 +140,7 @@ def _append_stat_entries(entries: List[Tuple[str, str]]) -> None:
 def record_memory_stat(memory_id: str, event: str) -> None:
     try:
         _append_stat_entries([(memory_id, event)])
+        _invalidate_effectiveness_cache()
     except Exception:
         logger.warning("Failed to record memory stat for %s", memory_id)
 
@@ -144,8 +148,20 @@ def record_memory_stat(memory_id: str, event: str) -> None:
 def batch_record_stats(entries: List[Tuple[str, str]]) -> None:
     try:
         _append_stat_entries(entries)
+        _invalidate_effectiveness_cache()
     except Exception:
         logger.warning("Stat sync write failed")
+
+
+def _invalidate_effectiveness_cache() -> None:
+    """Drop the effectiveness cache entirely so the next read re-scans disk.
+
+    Clears both the cached value and its timestamp: only zeroing the timestamp
+    leaves a stale value that a buggy read path could still return.
+    """
+    global _effectiveness_cache, _effectiveness_cache_at
+    _effectiveness_cache = None
+    _effectiveness_cache_at = 0.0
 
 
 _write_queue: "queue.Queue[Tuple[Path, str, int] | None]" = queue.Queue(maxsize=500)
@@ -153,6 +169,15 @@ _pending_writes: Set[Path] = set()
 _write_guard_lock = threading.Lock()
 _write_path_locks: Dict[str, threading.RLock] = {}
 _write_generations: Dict[str, int] = {}
+
+# --- effectiveness cache (backed by memory-stats.jsonl) ---------------------
+# load_effectiveness() does a full-file scan of memory-stats.jsonl on every
+# call. To avoid re-reading the (potentially large) file on each effectiveness()
+# lookup, we cache the parsed result with a short TTL and invalidate whenever
+# we append new stats in this process.
+_effectiveness_cache: Optional[Dict[str, "MemoryEffectiveness"]] = None
+_effectiveness_cache_at: float = 0.0
+_EFFECTIVENESS_CACHE_TTL: float = 30.0  # seconds
 
 
 def _write_path_key(path: Path) -> str:
@@ -227,9 +252,10 @@ def _frontmatter_to_data(fm: MemoryFrontmatter) -> Dict[str, Any]:
         "context_scope": fm.context_scope,
         "zone": fm.zone,
         "rank": fm.rank,
+        "version": fm.version,
     }
     for k in ("user_id", "agent_id", "run_id"):
-        v = getattr(fm, k, None)
+        v = normalize_scope_value(getattr(fm, k, None))
         if v is not None:
             d[k] = v
     return d
@@ -243,7 +269,10 @@ def _file_flush_worker() -> None:
     while True:
         try:
             item = _write_queue.get(timeout=1)
+        except queue.Empty:
+            continue
         except Exception:
+            logger.warning("Flush worker error", exc_info=True)
             continue
         if item is None:
             break
@@ -287,13 +316,111 @@ def async_write_memory(path: Path, fm: MemoryFrontmatter, body: str) -> None:
                     _safe_write(path, content)
         except Exception as e:
             logger.warning("Sync write fallback failed for %s: %s", path, e)
+            raise RuntimeError(f"Sync write fallback failed for {path}: {e}") from e
+
+
+def _effectiveness_index_path() -> Path:
+    """Aggregate snapshot file: one row per memory_id (post-compaction baseline)."""
+    return plugin_data_dir() / "effectiveness-index.jsonl"
+
+
+def _load_effectiveness_snapshot() -> Tuple[Dict[str, "MemoryEffectiveness"], Optional[str]]:
+    """Read the aggregate snapshot.
+
+    Returns (eff_map, folded_at) where folded_at is the ISO timestamp of the
+    last compaction (events with at <= folded_at are already folded in). If no
+    snapshot exists, returns ({}, None) so callers fall back to scanning the
+    whole event stream.
+    """
+    sp = _effectiveness_index_path()
+    if not sp.exists():
+        return {}, None
+    eff: Dict[str, MemoryEffectiveness] = {}
+    folded_at: Optional[str] = None
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mid = row.get("memory_id", "")
+                if not mid:
+                    continue
+                eff[mid] = MemoryEffectiveness(
+                    loaded=int(row.get("loaded", 0)),
+                    referenced=int(row.get("referenced", 0)),
+                    accessed=int(row.get("accessed", 0)),
+                    last_event_at=row.get("last_event_at"),
+                )
+                row_folded = row.get("folded_at")
+                if row_folded and (folded_at is None or row_folded > folded_at):
+                    folded_at = row_folded
+    except Exception as e:
+        logger.warning("Failed to load effectiveness snapshot from %s: %s", sp, e)
+    return eff, folded_at
+
+
+def _write_effectiveness_snapshot(
+    eff_map: Dict[str, "MemoryEffectiveness"], folded_at: str
+) -> None:
+    """Atomically rewrite the aggregate snapshot, one row per memory_id.
+
+    Uses _safe_write (tmp + fsync + os.replace) so a crash mid-write cannot
+    corrupt the snapshot. Rows that have no activity (all-zero counts and no
+    last_event_at) are skipped to keep the file compact.
+    """
+    sp = _effectiveness_index_path()
+    lines: List[str] = []
+    for mid, eff in eff_map.items():
+        if eff.loaded == 0 and eff.referenced == 0 and eff.accessed == 0 and not eff.last_event_at:
+            continue
+        row = {
+            "memory_id": mid,
+            "loaded": eff.loaded,
+            "referenced": eff.referenced,
+            "accessed": eff.accessed,
+            "last_event_at": eff.last_event_at,
+            "folded_at": folded_at,
+        }
+        lines.append(json.dumps(row, ensure_ascii=False))
+    content = ("\n".join(lines) + "\n") if lines else ""
+    _safe_write(sp, content)
+
+
+def _apply_stat_entry(eff_map: Dict[str, "MemoryEffectiveness"], entry: Dict[str, Any]) -> None:
+    """Fold one event-stream entry into an effectiveness map (in place)."""
+    mid = entry.get("memory_id", "")
+    if not mid:
+        return
+    e = eff_map.setdefault(mid, MemoryEffectiveness())
+    ev = entry.get("event", "")
+    if ev == "loaded":
+        e.loaded += 1
+    elif ev == "referenced":
+        e.referenced += 1
+    elif ev == "accessed":
+        e.accessed += 1
+    at = entry.get("at")
+    if at and (e.last_event_at is None or at > e.last_event_at):
+        e.last_event_at = at
 
 
 def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
+    """Load effectiveness stats via the dual-track path.
+
+    Reads the aggregate snapshot (O(memories)) as the baseline, then folds in
+    only the event-stream tail (entries with at > snapshot.folded_at). When no
+    snapshot exists (fresh install / pre-compaction), falls back to scanning
+    the entire event stream for backward compatibility.
+    """
+    eff, folded_at = _load_effectiveness_snapshot()
     sp = _stats_path()
     if not sp.exists():
-        return {}
-    eff: Dict[str, MemoryEffectiveness] = {}
+        return eff
     try:
         with open(sp, "r", encoding="utf-8") as f:
             for line in f:
@@ -304,20 +431,12 @@ def load_effectiveness() -> Dict[str, MemoryEffectiveness]:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                mid = entry.get("memory_id", "")
-                if not mid:
-                    continue
-                e = eff.setdefault(mid, MemoryEffectiveness())
-                ev = entry.get("event", "")
-                if ev == "loaded":
-                    e.loaded += 1
-                elif ev == "referenced":
-                    e.referenced += 1
-                elif ev == "accessed":
-                    e.accessed += 1
-                at = entry.get("at")
-                if at and (e.last_event_at is None or at > e.last_event_at):
-                    e.last_event_at = at
+                # Skip events already folded into the snapshot baseline.
+                if folded_at is not None:
+                    at = entry.get("at")
+                    if at and at <= folded_at:
+                        continue
+                _apply_stat_entry(eff, entry)
     except Exception as e:
         logger.warning("Failed to load effectiveness stats from %s: %s", sp, e)
     return eff
@@ -405,6 +524,7 @@ class MemoryStore:
         self.project_root = project_root
         self._lock = threading.RLock()
         self._local = threading.local()
+        self._connections: Set[sqlite3.Connection] = set()
         self._db_path = db_path if db_path is not None else plugin_data_dir() / "memories.db"
         self._search_index = None
         self._graph = None
@@ -432,13 +552,42 @@ class MemoryStore:
                     conn.close()
                 except Exception:
                     pass
+                with self._lock:
+                    self._connections.discard(conn)
+                self._local.conn = None
                 conn = None
-        conn = sqlite3.connect(str(self._db_path), timeout=10)
+        conn = sqlite3.connect(str(self._db_path), timeout=10, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
         self._local.conn = conn
+        with self._lock:
+            self._connections.add(conn)
         return conn
+
+    def close(self) -> None:
+        """Checkpoint WAL and close all thread-local SQLite connections."""
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if hasattr(self._local, "conn"):
+            self._local.conn = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for tests or hosts that drop the store without close()."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -538,9 +687,9 @@ class MemoryStore:
                 body_hash,
                 str(m.source_path),
                 m.body,
-                fm.user_id,
-                fm.agent_id,
-                fm.run_id,
+                normalize_scope_value(fm.user_id),
+                normalize_scope_value(fm.agent_id),
+                normalize_scope_value(fm.run_id),
             ),
         )
         conn.execute("DELETE FROM tags WHERE memory_id = ?", (fm.id,))
@@ -594,14 +743,30 @@ class MemoryStore:
     def _event_json(data: Optional[Dict[str, Any]]) -> Optional[str]:
         if not data:
             return None
+
         def _default(obj: Any) -> str:
             if isinstance(obj, datetime):
                 return obj.isoformat()
             raise TypeError
+
         result = json.dumps(data, ensure_ascii=False, default=_default)
         if len(result) > 8192:
-            result = json.dumps({"id": data.get("id", "")}, ensure_ascii=False)
-            logger.warning("Event frontmatter truncated for memory %s", data.get("id", "?"))
+            # P2-18: preserve a hash of the original frontmatter so the audit
+            # trail can still be correlated even after truncation.
+            original_hash = hashlib.sha256(result.encode("utf-8")).hexdigest()[:16]
+            result = json.dumps(
+                {
+                    "id": data.get("id", ""),
+                    "_truncated": True,
+                    "_original_frontmatter_hash": original_hash,
+                },
+                ensure_ascii=False,
+            )
+            logger.warning(
+                "Event frontmatter truncated for memory %s (hash %s)",
+                data.get("id", "?"),
+                original_hash,
+            )
         return result
 
     def _record_memory_event(
@@ -673,14 +838,42 @@ class MemoryStore:
             result["events"] = self.get_memory_events(memory_id)
         return result
 
-    def _validate_supersedes_targets(self, conn: sqlite3.Connection, fm: MemoryFrontmatter) -> None:
-        missing = [
-            old
-            for old in fm.supersedes or []
-            if conn.execute("SELECT 1 FROM memories WHERE id = ?", (old,)).fetchone() is None
-        ]
+    def _validate_supersedes_targets(self, conn: sqlite3.Connection, scope: str, fm: MemoryFrontmatter) -> None:
+        missing: List[str] = []
+        mismatched: List[str] = []
+        new_scope = (
+            normalize_scope_value(getattr(fm, "user_id", None)),
+            normalize_scope_value(getattr(fm, "agent_id", None)),
+            normalize_scope_value(getattr(fm, "run_id", None)),
+        )
+        for old in fm.supersedes or []:
+            row = conn.execute(
+                "SELECT scope, user_id, agent_id, run_id FROM memories WHERE id = ?",
+                (old,),
+            ).fetchone()
+            if row is None:
+                missing.append(old)
+                continue
+            old_scope = (
+                normalize_scope_value(row["user_id"]),
+                normalize_scope_value(row["agent_id"]),
+                normalize_scope_value(row["run_id"]),
+            )
+            if row["scope"] != scope or old_scope != new_scope:
+                mismatched.append(old)
         if missing:
             raise ValueError(f"Cannot supersede missing memory id(s): {', '.join(missing)}")
+        if mismatched:
+            raise ValueError(
+                f"Cannot supersede memory id(s) from a different scope: {', '.join(mismatched)}"
+            )
+        if not fm.supersedes:
+            return
+        # Preserve the existing cycle guard after the existence/scope checks.
+        for old in fm.supersedes:
+            cycle = _lineage_cycle_check(self, old)
+            if cycle is not None:
+                raise ValueError(f"supersedes would create a cycle: {' -> '.join(cycle)}")
 
     def _row_to_loaded(self, row: sqlite3.Row) -> Optional[LoadedMemory]:
         body = row["body"] or ""
@@ -745,7 +938,7 @@ class MemoryStore:
             was_in_transaction = conn.in_transaction
             if conn.execute("SELECT id FROM memories WHERE id = ?", (fm.id,)).fetchone():
                 raise ValueError(f"Duplicate memory id: {fm.id}")
-            self._validate_supersedes_targets(conn, fm)
+            self._validate_supersedes_targets(conn, scope, fm)
             root = self._root_for(scope)
             raw_date = fm.created[:10] if fm.created else datetime.now(timezone.utc).strftime("%Y-%m-%d")
             date_part = re.sub(r'[\\/]', '_', raw_date)
@@ -783,6 +976,15 @@ class MemoryStore:
         return self.get(mem_id)
 
     def delete(self, scope: str, mem_id: str) -> bool:
+        """Delete a memory by ID.
+
+        .. caution::
+
+           Deletion is **permanent**. There is no undo or rollback mechanism
+           for memory writes. The file is removed from disk and the SQLite
+           index entry is deleted. Consider archiving via the curator or
+           marking as superseded instead of hard-deleting production data.
+        """
         with self._lock:
             conn = self._get_conn()
             was_in_transaction = conn.in_transaction
@@ -940,18 +1142,26 @@ class MemoryStore:
     def list_active(self, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
         return self.list(active_only=True, filters=filters)
 
-    def list_pinned(self) -> List[LoadedMemory]:
+    def list_pinned(self, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        clauses = ["m.pinned = 1", "m.id NOT IN (SELECT old_id FROM supersedes)"]
+        params: List[Any] = []
+        if filters:
+            f_clauses, f_params = self._build_scope_clauses(filters)
+            clauses.extend(f"m.{clause}" for clause in f_clauses)
+            params.extend(f_params)
+        where = " AND ".join(clauses)
         rows = self._get_conn().execute(
-            "SELECT m.* FROM memories m WHERE m.pinned = 1 AND m.id NOT IN (SELECT old_id FROM supersedes) ORDER BY m.rank DESC, m.created DESC"
+            f"SELECT m.* FROM memories m WHERE {where} ORDER BY m.rank DESC, m.created DESC",
+            params,
         ).fetchall()
         return [m for r in rows if (m := self._row_to_loaded(r)) is not None]
 
-    def list_by_zone(self, zone: str) -> List[LoadedMemory]:
-        return self.list(zone=zone, active_only=True)
+    def list_by_zone(self, zone: str, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
+        return self.list(zone=zone, active_only=True, filters=filters)
 
-    def group_by_zone(self) -> Dict[str, List[LoadedMemory]]:
+    def group_by_zone(self, filters: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, List[LoadedMemory]]:
         groups: Dict[str, List[LoadedMemory]] = {}
-        for memory in self.list_active():
+        for memory in self.list_active(filters=filters):
             groups.setdefault(memory.frontmatter.zone, []).append(memory)
         return groups
 
@@ -962,29 +1172,27 @@ class MemoryStore:
         Returns (clauses, params). Callers must validate that clauses is non-empty
         if they require at least one filter.
         """
-        clauses: List[str] = []
-        params: List[Any] = []
-        allowed_keys = {"user_id", "agent_id", "run_id"}
-        unknown = set(filters.keys()) - allowed_keys
-        if unknown:
-            raise ValueError(f"Unknown filter keys: {unknown}")
-        for key in ("user_id", "agent_id", "run_id"):
-            if key in filters:
-                val = filters[key]
-                if val is None:
-                    clauses.append(f"{key} IS NULL")
-                else:
-                    clauses.append(f"{key} = ?")
-                    params.append(val)
-        return clauses, params
+        return build_scope_clauses(filters)
 
     def delete_by_filters(self, filters: Dict[str, Optional[str]]) -> int:
-        """Batch delete memories matching scope filters."""
+        """Batch delete memories matching scope filters.
+
+        An explicit ``"scope"`` key (``"user"`` or ``"project"``) can be passed
+        in *filters* to restrict deletion to one root. Regardless of whether a
+        scope is supplied, every selected file path is validated to lie under
+        the expected root before unlinking, preventing accidental cross-root
+        deletion when SQL scope columns alone are ambiguous.
+        """
         if not filters:
             raise ValueError("filters dict must not be empty")
         with self._lock:
             conn = self._get_conn()
-            clauses, params = self._build_scope_clauses(filters)
+            filters_copy = dict(filters)
+            explicit_scope = filters_copy.pop("scope", None)
+            clauses, params = self._build_scope_clauses(filters_copy)
+            if explicit_scope is not None:
+                clauses.append("scope = ?")
+                params.append(explicit_scope)
             if not clauses:
                 raise ValueError("filters dict must contain at least one scope key")
             where = " AND ".join(clauses)
@@ -995,6 +1203,22 @@ class MemoryStore:
                 mem_id = row["id"]
                 scope = row["scope"]
                 path = Path(row["path"])
+                # P2-6 root guard: only unlink files that live under the root
+                # that matches the memory's scope.
+                try:
+                    expected_root = self._root_for(scope).resolve()
+                    if not path.resolve().is_relative_to(expected_root):
+                        logger.warning(
+                            "Skipping delete of memory %s: path %s is outside expected root %s",
+                            mem_id, path, expected_root,
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        "Skipping delete of memory %s: root validation failed: %s",
+                        mem_id, e,
+                    )
+                    continue
                 old_body = row["body"] or ""
                 old_loaded = self._row_to_loaded(row) or read_memory(path, scope)
                 old_fm = old_loaded.frontmatter.to_dict() if old_loaded else {}
@@ -1052,11 +1276,11 @@ class MemoryStore:
             self._search_index._graph = graph
             self._search_index.invalidate_cache()
 
-    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None, filters: Optional[Dict[str, Optional[str]]] = None) -> List[LoadedMemory]:
-        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, filters=filters)
+    def search(self, query: str, k: int = 5, include_history: bool = False, zone: Optional[str] = None, filters: Optional[Dict[str, Optional[str]]] = None, **kwargs) -> List[LoadedMemory]:
+        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, filters=filters, **kwargs)
 
     def fusion_search(self, query: str, k: int = 5, zone: Optional[str] = None, include_history: bool = False, **kwargs) -> List[LoadedMemory]:
-        return self._get_search_index().search(query, k=k, zone=zone, include_history=include_history, **kwargs)
+        return self.search(query, k=k, zone=zone, include_history=include_history, **kwargs)
 
     def fusion_search_explain(self, query: str, k: int = 5, zone: Optional[str] = None, include_history: bool = False, **kwargs) -> Dict[str, Any]:
         return self._get_search_index().search_explain(query, k=k, zone=zone, include_history=include_history, **kwargs)
@@ -1102,12 +1326,48 @@ class MemoryStore:
         return _lineage_mod._calc_supersedes_depth(self, mem_id, visited, max_depth, depth)
 
     def record_stat(self, memory_id: str, event: str) -> None:
-        _sm = _load_related_module("store_methods")
-        return _sm.record_stat(self, memory_id, event)
+        """[DEPRECATED] Forward to the JSONL stats pipeline.
+
+        The SQLite ``stats`` table is no longer the source of truth; production
+        effectiveness is computed from ``memory-stats.jsonl``. This method now
+        writes to the JSONL event stream so that legacy callers do not silently
+        lose stats, and emits a DeprecationWarning. Prefer record_memory_stat().
+        """
+        import warnings
+
+        warnings.warn(
+            "MemoryStore.record_stat() is deprecated; use record_memory_stat() instead. "
+            "The SQLite stats table is no longer the source of truth.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        record_memory_stat(memory_id, event)
 
     def effectiveness(self, memory_id: Optional[str] = None) -> Dict[str, MemoryEffectiveness]:
-        _sm = _load_related_module("store_methods")
-        return _sm.effectiveness(self, memory_id)
+        """Effectiveness stats sourced from memory-stats.jsonl (the truth path).
+
+        Production stats are written by record_memory_stat() to the JSONL log;
+        this method reads them back via load_effectiveness(). The result is
+        cached briefly (TTL_EFFECTIVENESS_CACHE_SECS) to avoid re-reading the
+        whole file on every call.
+
+        Args:
+            memory_id: if given, returns {memory_id: MemoryEffectiveness} for
+                that one memory (or an empty dict if absent); if None, returns
+                the full {memory_id: MemoryEffectiveness} map.
+        """
+        global _effectiveness_cache, _effectiveness_cache_at
+        now = time.monotonic()
+        if (
+            _effectiveness_cache is None
+            or (now - _effectiveness_cache_at) > _EFFECTIVENESS_CACHE_TTL
+        ):
+            _effectiveness_cache = load_effectiveness()
+            _effectiveness_cache_at = now
+        if memory_id is not None:
+            eff = _effectiveness_cache.get(memory_id)
+            return {memory_id: eff} if eff is not None else {}
+        return dict(_effectiveness_cache)
 
     def health_metrics(self) -> Dict[str, Any]:
         _sh = _load_related_module("store_health")

@@ -1,8 +1,8 @@
 """mem-reflection-hermes plugin -- Self-evolving memory and reflection system.
 
-v1.5 Architecture (organized by functionality):
+v1.7 Architecture (organized by functionality):
 - core/: SQLite storage, search engine, graph index
-- reflection/: Reflection engine and runtime
+- reflection/: Reflection engine and runtime, including scope-aware reflection and compaction
 - memory/: Curation, bridge, context assembly
 - runtime/: Tools, schemas, hooks, registration, state
 - web/: FastAPI dashboard endpoints
@@ -14,6 +14,7 @@ runtime.registration.register().
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import types
 
@@ -33,6 +34,13 @@ if __name__ != "__main__" and __name__ not in sys.modules:
 if not __package__:
     __package__ = "mem_reflection_hermes"
 
+# Ensure the plugin directory is on sys.path so importlib.util-based loaders
+# (Hermes _load_directory_module) can resolve sub-packages (core/, reflection/,
+# etc.) even when __path__ propagation fails.
+_plugin_root = os.path.dirname(os.path.abspath(__file__))
+if _plugin_root not in sys.path:
+    sys.path.insert(0, _plugin_root)
+
 
 # ── Core exports ───────────────────────────────────────────────────────
 from .core.store import (  # noqa: F401
@@ -45,6 +53,9 @@ from .core.store import (  # noqa: F401
     SkillFrontmatter, LoadedSkill,
     parse_frontmatter, serialize_frontmatter, read_memory,
     async_write_memory, record_memory_stat, batch_record_stats, load_effectiveness,
+    _stats_path, _effectiveness_index_path,
+    _load_effectiveness_snapshot, _write_effectiveness_snapshot, _apply_stat_entry,
+    _invalidate_effectiveness_cache,
     is_cjk, cjk_ratio, adaptive_conflict_threshold, extract_entities,
     _tokenise, _memory_tokens, _bm25_search, _bm25_search_scored, _cosine_similarity,
     _ZONE_CORE, _ZONE_WORK, _ZONE_EPISODE, _ZONE_GENERAL,

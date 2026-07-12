@@ -19,6 +19,9 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
+
+from mem_reflection_hermes.reflection import runtime as _runtime
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -160,6 +163,19 @@ class TestMicroReflection:
         mems = engine.store.list_active()
         assert any(m.frontmatter.zone == "episode" for m in mems)
 
+    def test_raw_chunk_stores_scope_fields(self, temp_engine):
+        """P2-10: ReflectionEngine can stamp memories with scope filters."""
+        engine = temp_engine
+        engine._mode = "raw_chunk"
+        engine.scope_filters = {"user_id": "u-1", "agent_id": "a-1", "run_id": "r-1"}
+        result = engine.micro(None, "user msg", "assistant reply")
+        assert result is not None
+        mems = engine.store.list_active()
+        mem = next(m for m in mems if m.frontmatter.zone == "episode")
+        assert mem.frontmatter.user_id == "u-1"
+        assert mem.frontmatter.agent_id == "a-1"
+        assert mem.frontmatter.run_id == "r-1"
+
     def test_raw_chunk_skips_short_content(self, temp_engine):
         engine = temp_engine
         engine._mode = "raw_chunk"
@@ -257,3 +273,37 @@ class TestReflectLog:
         assert audit["decision"] == "accepted"
         assert audit["reason"] == "good quality"
         assert "timestamp" in audit
+
+
+def test_raw_chunk_reflection_per_session_cap(monkeypatch):
+    """P3-7: raw_chunk reflection must stop creating episode memories once the
+    per-session cap is reached."""
+    _runtime._reset_current_session_memory_ids()
+    created: list[str] = []
+
+    def _put(scope, fm, body):
+        created.append(fm.id)
+        return SimpleNamespace(path="/tmp/x.md")
+
+    store = SimpleNamespace(put=_put, _graph=None)
+    monkeypatch.setattr(_runtime, "_get_mem_store", lambda: store)
+    monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(_runtime, "_record_typed_fact_sidecar", lambda *_a, **_k: None)
+
+    messages = [
+        {
+            "role": "user",
+            "content": f"This is a long enough memorable message number {i:03d} with enough text.",
+        }
+        for i in range(70)
+    ]
+    result = _runtime._run_raw_chunk_reflection(messages)
+    assert result["chunks_created"] == 20
+    assert len(created) == 20
+
+    # A second call in the same session must not create additional chunks.
+    result2 = _runtime._run_raw_chunk_reflection(messages[:3])
+    assert result2["chunks_created"] == 0
+    assert result2.get("cap_reached") is True
+
+    _runtime._reset_current_session_memory_ids()

@@ -1,6 +1,6 @@
 # Tools Reference
 
-Current SRH tool surface: **13 registered tools** (v1.6).
+Current SRH tool surface: **13 registered tools** (v1.7).
 
 The 13 tools are registered in `__init__.py::register(ctx)` and declared in `plugin.yaml`.
 
@@ -48,10 +48,10 @@ Delete a memory by ID, or batch-delete by scope filters.
 
 ```python
 srh_memory_delete(id="mem_abc123", scope="user")
-srh_memory_delete(id="batch", filters={"run_id": "sess-001"})  # v1.6: batch delete
+srh_memory_delete(filters={"run_id": "sess-001"})  # v1.6: batch delete by scope
 ```
 
-**v1.6 batch delete**: When `filters` is provided, the tool deletes all memories matching the scope filter and returns `{deleted_count: N}`. The `id` field is still required in the schema for backward compatibility.
+**v1.6 batch delete**: When `filters` is provided, the tool deletes all memories matching the scope filter and ignores `id`. The response is `{success: true, deleted_count: N, id: null}`. For single-ID deletion the response is `{success: true|false, deleted_count: 1|0, id: "mem_abc123"}`. Both paths return the same key set.
 
 ### `srh_memory_history`
 
@@ -72,13 +72,16 @@ srh_memory_history(id="mem_abc123", include_events=True, session_id="sess-001")
 
 ### `srh_palace_navigate`
 
-Topic-based recall within the Memory Palace, optionally scoped to a zone. Under the hood this delegates to `srh_palace_recall`.
+Topic-based recall within the Memory Palace, optionally scoped to a zone and tenant scope. Under the hood this delegates to `srh_palace_recall`.
 
 ```python
 srh_palace_navigate(topic="editor preference", zone="work", limit=5)
+srh_palace_navigate(topic="editor preference", zone="work", limit=5, filters={"user_id": "u1"})
 ```
 
 > **Note**: Earlier versions exposed separate tools (`srh_palace_zones`, `srh_palace_read_zone`, `srh_palace_search`, `srh_palace_rebalance`, `srh_palace_recall`). These have been consolidated into the single `srh_palace_navigate` tool surface. The internal functions remain in `runtime/tools.py` for backward-compat dashboard routes.
+>
+> **Scope rule**: In hosted or multi-user/multi-agent scenarios, pass `filters={"user_id": ..., "agent_id": ..., "run_id": ...}` to keep palace recall tenant-safe. Leave filters empty only for local single-user compatibility or explicit admin-only inspection.
 
 ## Reflection & Profile (2)
 
@@ -87,10 +90,12 @@ srh_palace_navigate(topic="editor preference", zone="work", limit=5)
 Trigger reflection pipeline manually.
 
 ```python
-srh_reflect_now(messages=[...], mode="full")
+srh_reflect_now(messages=[...])
+srh_reflect_now(messages=[...], filters={"user_id": "u1"})
 ```
 
-Modes: `full` (session-end structured summary), `micro` (per-turn background), `embedding` (vector-only, zero LLM).
+The reflection mode is chosen by plugin configuration (`auto`, `llm`, `embedding`, `raw_chunk`, or `hybrid`), not by this tool. `raw_chunk` stores up to 20 episode chunks per session; `embedding` is vector-only and zero-LLM.
+Use `filters` when you want the reflection write path to stay tenant-safe in hosted or multi-agent sessions. The response schema is normalized across modes: `mode`, `summary`, `accepted_memories`, `skill_candidates`, `conflicts`, `chunks_created`, `error`.
 
 ### `srh_compile_profile`
 
@@ -100,7 +105,10 @@ Compile memories into a structured profile.
 srh_compile_profile(mode="profile")       # profile.md format
 srh_compile_profile(mode="palace_index")  # compiled palace index
 srh_compile_profile(mode="zone")          # per-zone summaries
+srh_compile_profile(mode="profile", filters={"user_id": "u1"})  # scoped profile
 ```
+
+**v1.6 curator policy**: Curator is scoped by default in hosted/multi-user/multi-agent runs. Pass `user_id` / `agent_id` / `run_id` filters for tenant-safe maintenance. Use explicit `admin_global=True` only when you intend a full-store maintenance pass. No-filter mode remains global for single-user compatibility.
 
 ## Skills (1)
 
@@ -129,8 +137,11 @@ srh_associate(memory_ids=["mem_a", "mem_b"], relation="co_occurs")
 Retrieve associative neighbors (Hebbian co-activation propagation).
 
 ```python
-srh_graph_retrieve(seed_ids=["mem_a"], max_results=10, tier="rank")
+srh_graph_retrieve(memory_ids=["mem_a"], max_results=10, tier="rank")
+srh_graph_retrieve(memory_ids=["mem_a"], max_results=10, filters={"user_id": "u1"})  # v1.7: scope boundary
 ```
+
+> **Note**: `seed_ids` is deprecated and accepted only for backward compatibility. Use `memory_ids`. When `filters` is provided, graph traversal is restricted to memories matching the scope (tenant-safe retrieval).
 
 ### `srh_graph_stats`
 
@@ -146,7 +157,10 @@ Generate graph visualization data.
 
 ```python
 srh_graph_viz(format="adjacency", depth=2)
+srh_graph_viz(format="adjacency", depth=2, filters={"user_id": "u1"})  # v1.7: scope boundary
 ```
+
+> **v1.7 scope boundary**: `srh_graph_viz` also accepts optional `filters` to restrict returned nodes/edges to the active scope.
 
 ## Health Metrics (1)
 
@@ -174,12 +188,12 @@ Returns:
 | `srh_memory_write` | Memory | `runtime/tools.py` | v1.6: `user_id`/`agent_id`/`run_id` |
 | `srh_memory_delete` | Memory | `runtime/tools.py` | v1.6: `filters` for batch delete |
 | `srh_memory_history` | Memory | `runtime/tools.py` | v1.6: `include_events` + event filtering |
-| `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall` |
-| `srh_reflect_now` | Reflection | `runtime/tools.py` | |
+| `srh_palace_navigate` | Palace | `runtime/tools.py` | Delegates to `_tool_srh_palace_recall`; supports zone + scope filters |
+| `srh_reflect_now` | Reflection | `runtime/tools.py` | v1.7: optional scope filters for scoped reflection runs |
 | `srh_skill_query` | Skills | `runtime/tools.py` | Delegates to `_tool_srh_skill_search` |
-| `srh_compile_profile` | Profile | `runtime/tools.py` | |
+| `srh_compile_profile` | Profile | `runtime/tools.py` | v1.6: optional scope filters for per-tenant profile/palace/zone compilation |
 | `srh_associate` | Graph | `runtime/graph.py` | |
-| `srh_graph_retrieve` | Graph | `runtime/graph.py` | |
+| `srh_graph_retrieve` | Graph | `runtime/graph.py` | Use `memory_ids`; `seed_ids` is deprecated |
 | `srh_graph_stats` | Graph | `runtime/graph.py` | |
 | `srh_graph_viz` | Graph | `runtime/graph.py` | |
 | `srh_memory_health` | Health | `runtime/graph.py` | |

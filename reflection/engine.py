@@ -25,7 +25,7 @@ try:
         _tokenise,
     )
     from ..core.search import _embed_single, _cosine_sim, _extract_keywords, _bm25_search_scored
-    from .runtime import _memory_tokens as estimate_tokens
+    from .extraction import extract_refined_memory_candidates
 except ImportError:
     import sys
     from pathlib import Path
@@ -42,7 +42,6 @@ except ImportError:
     MemoryFrontmatter = _store_mod.MemoryFrontmatter
     plugin_data_dir = _store_mod.plugin_data_dir
     _tokenise = _store_mod._tokenise
-    estimate_tokens = _store_mod._memory_tokens
 
     # Load core.search
     _search_spec = importlib.util.spec_from_file_location("_search", str(_repo / "core" / "search.py"))
@@ -54,6 +53,11 @@ except ImportError:
     _cosine_sim = _search_mod._cosine_sim
     _extract_keywords = _search_mod._extract_keywords
     _bm25_search_scored = _search_mod._bm25_search_scored
+    _extraction_spec = importlib.util.spec_from_file_location("_extraction", str(_repo / "reflection" / "extraction.py"))
+    _extraction_mod = importlib.util.module_from_spec(_extraction_spec)
+    sys.modules["_extraction"] = _extraction_mod
+    _extraction_spec.loader.exec_module(_extraction_mod)
+    extract_refined_memory_candidates = _extraction_mod.extract_refined_memory_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -123,54 +127,8 @@ def _is_correction(text: str) -> bool:
 
 
 def _extract_facts_from_turn(user_msg: str, assistant_msg: str) -> List[Dict[str, Any]]:
-    """Extract potential facts using heuristics."""
-    facts = []
-    combined = f"{user_msg} {assistant_msg}"
-
-    # Explicit memory intent
-    if _is_explicit_memory_intent(user_msg):
-        for s in re.split(r"[。！？.!?\n]+", user_msg):
-            if _is_explicit_memory_intent(s):
-                s = s.strip()
-                if len(s) > 10 and _is_memorable_content(s):
-                    facts.append({
-                        "text": s, "confidence": "high",
-                        "rationale": "User explicitly requested to remember",
-                        "source": "explicit_intent",
-                    })
-
-    # Corrections
-    if _is_correction(user_msg):
-        for s in re.split(r"[。！？.!?\n]+", user_msg):
-            if _is_correction(s) and len(s) > 10 and _is_memorable_content(s):
-                facts.append({
-                    "text": s.strip(), "confidence": "medium",
-                    "rationale": "User corrected a previous statement",
-                    "source": "correction",
-                })
-
-    # Preferences
-    _NOT_END = r"[^\n。！？.!?]"
-    prefs = [
-        (rf"(?:我|i)\s*(?:喜欢|prefer|like|want|想|要)\s*({_NOT_END}{{5,80}})", "preference"),
-        (rf"(?:用|use)\s*({_NOT_END}{{3,40}})\s*(?:因为|because)", "preference"),
-    ]
-    for pat, src in prefs:
-        for m in re.finditer(pat, combined, re.IGNORECASE):
-            t = m.group(0).strip()
-            if len(t) > 10 and _is_memorable_content(t):
-                facts.append({"text": t, "confidence": "medium", "rationale": "Preference", "source": src})
-
-    # Deduplicate + filter noise
-    deduped = []
-    seen = []
-    for f in facts:
-        if _is_noise_text(f["text"]):
-            continue
-        if all(len(set(_tokenise(f["text"])) & set(_tokenise(s))) / max(len(_tokenise(f["text"])), len(_tokenise(s)), 1) < 0.8 for s in seen):
-            seen.append(f["text"])
-            deduped.append(f)
-    return deduped
+    """Extract refined fact candidates using the shared refinement helper."""
+    return extract_refined_memory_candidates(user_msg, assistant_msg)
 
 
 def _is_noise_text(text: str) -> bool:
@@ -297,14 +255,38 @@ def _read_reflect_log(n: int = 10, log_path: Optional[Path] = None) -> List[Dict
 # ---------------------------------------------------------------------------
 
 class ReflectionEngine:
-    """Simplified reflection with dependency injection."""
+    """Simplified reflection with dependency injection.
 
-    def __init__(self, store, search, graph, log_path: Optional[Path] = None):
+    .. note::
+       This class is a legacy/simplified surface. The canonical reflection
+       pipeline in ``reflection.runtime`` is scope-aware; this class accepts
+       optional ``scope_filters`` so direct callers can also produce scoped
+       memories. If ``scope_filters`` is omitted, memories are written without
+       scope fields (the pre-v1.7 behavior).
+    """
+
+    def __init__(
+        self,
+        store,
+        search,
+        graph,
+        log_path: Optional[Path] = None,
+        scope_filters: Optional[Dict[str, Optional[str]]] = None,
+    ):
         self.store = store
         self.search = search
         self.graph = graph
         self._log_path = log_path
         self._mode = os.environ.get("MEM_REFLECTION_MODE", "raw_chunk")
+        self.scope_filters = scope_filters or {}
+
+    def _scope_kwargs(self) -> Dict[str, Optional[str]]:
+        """Return scope fields for MemoryFrontmatter.new()."""
+        return {
+            "user_id": self.scope_filters.get("user_id"),
+            "agent_id": self.scope_filters.get("agent_id"),
+            "run_id": self.scope_filters.get("run_id"),
+        }
 
     # -- micro reflection ----------------------------------------------------
 
@@ -322,6 +304,7 @@ class ReflectionEngine:
         fm = MemoryFrontmatter.new(
             source="raw_chunk", confidence="low",
             tags=["episode", "raw_chunk"], zone="episode",
+            **self._scope_kwargs(),
         )
         self.store.put("user", fm, combined)
         return {"id": fm.id, "type": "raw_chunk", "preview": combined[:120]}
@@ -336,6 +319,7 @@ class ReflectionEngine:
         fm = MemoryFrontmatter.new(
             source="micro_reflection", confidence=best["confidence"],
             tags=_extract_keywords(best["text"], top_k=3), zone="general",
+            **self._scope_kwargs(),
         )
         self.store.put("user", fm, best["text"])
         return {"id": fm.id, "type": "fact", "text": best["text"]}
@@ -368,6 +352,7 @@ class ReflectionEngine:
             fm = MemoryFrontmatter.new(
                 source="raw_chunk", confidence="low",
                 tags=["episode", "raw_chunk"], zone="episode",
+                **self._scope_kwargs(),
             )
             self.store.put("user", fm, content.strip())
             accepted.append({"id": fm.id, "preview": content[:120]})
@@ -422,6 +407,7 @@ class ReflectionEngine:
                 confidence=mem.get("confidence", "medium"),
                 tags=mem.get("tags", []),
                 zone=mem.get("zone", "general"),
+                **self._scope_kwargs(),
             )
             self.store.put("user", fm, text)
             accepted.append({"id": fm.id, "text": text})
@@ -489,33 +475,31 @@ def _delegate_runtime_reflection(name: str):
 
 
 def _get_mem_store():
-    from mem_reflection_hermes import _get_mem_store as _root_get_mem_store
-
-    return _root_get_mem_store()
+    from ..runtime.state import _get_mem_store as _impl
+    return _impl()
 
 
 def _get_skill_store():
-    from mem_reflection_hermes import _get_skill_store as _root_get_skill_store
-
-    return _root_get_skill_store()
+    from ..runtime.state import _get_skill_store as _impl
+    return _impl()
 
 
 def _reflection_mode() -> str:
-    from mem_reflection_hermes import _reflection_mode as _root_reflection_mode
-
-    return _root_reflection_mode()
+    from ..core.store import plugin_config
+    cfg = plugin_config().get("reflection", {})
+    if isinstance(cfg, dict):
+        return str(cfg.get("mode", "auto"))
+    return "auto"
 
 
 def _build_context_block(query: str = ""):
-    from mem_reflection_hermes import _build_context_block as _root_build_context_block
-
-    return _root_build_context_block(query)
+    from ..runtime.helpers import _build_context_block as _impl
+    return _impl(query)
 
 
 def _auto_rebalance_zones():
-    from mem_reflection_hermes import _auto_rebalance_zones as _root_auto_rebalance_zones
-
-    return _root_auto_rebalance_zones()
+    from ..runtime.tools import _auto_rebalance_zones as _impl
+    return _impl()
 
 
 def _parse_reflect_output(text: str) -> Optional[Dict[str, Any]]:
@@ -550,17 +534,26 @@ def _reset_current_session_memory_ids() -> None:
     return _delegate_runtime_reflection("_reset_current_session_memory_ids")()
 
 
-def _run_full_reflection(ctx, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return _delegate_runtime_reflection("_run_full_reflection")(ctx, messages)
+def _run_full_reflection(ctx, messages: List[Dict[str, Any]], scope_filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_full_reflection")(ctx, messages, scope_filters=scope_filters)
 
 
-def _run_micro_reflection(ctx, user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    return _delegate_runtime_reflection("_run_micro_reflection")(ctx, user_msg, assistant_msg)
+def _run_micro_reflection(
+    ctx,
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_micro_reflection")(ctx, user_msg, assistant_msg, scope_filters=scope_filters)
 
 
-def _run_embedding_reflection(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return _delegate_runtime_reflection("_run_embedding_reflection")(messages)
+def _run_embedding_reflection(messages: List[Dict[str, Any]], scope_filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _delegate_runtime_reflection("_run_embedding_reflection")(messages, scope_filters=scope_filters)
 
 
-def _run_embedding_micro_reflection(user_msg: str, assistant_msg: str) -> Optional[Dict[str, Any]]:
-    return _delegate_runtime_reflection("_run_embedding_micro_reflection")(user_msg, assistant_msg)
+def _run_embedding_micro_reflection(
+    user_msg: str,
+    assistant_msg: str,
+    scope_filters: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    return _delegate_runtime_reflection("_run_embedding_micro_reflection")(user_msg, assistant_msg, scope_filters=scope_filters)

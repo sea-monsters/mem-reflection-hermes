@@ -17,6 +17,7 @@ if str(_REPO) not in sys.path:
 # Use store.py dataclasses directly (leaf module, no relative imports).
 # core.py's MemoryFrontmatter lacks to_dict() needed by store.py's write_memory_atomic.
 from core.store import LoadedMemory, MemoryFrontmatter, MemoryEffectiveness
+from core.scope import filter_memories_by_scope
 
 
 def make_memory(
@@ -156,18 +157,21 @@ class MockStore:
         self._cold_store: list[dict[str, Any]] = []
         self._plugin_config_override: dict[str, Any] = {}
 
-    def list_active(self) -> list[MockMemory]:
-        return list(self.memories.values())
+    def list_active(self, filters=None) -> list[MockMemory]:
+        return self.list(active_only=True, filters=filters)
 
     def get(self, mid: str):
         return self.memories.get(mid)
 
     def put(self, scope: str, fm, body: str):
-        self.memories[fm.id] = MockMemory(
+        mem = MockMemory(
             fm.id, body,
             zone=getattr(fm, "zone", "general"),
             tags=getattr(fm, "tags", []),
         )
+        for key in ("user_id", "agent_id", "run_id"):
+            setattr(mem.frontmatter, key, getattr(fm, key, None))
+        self.memories[fm.id] = mem
 
     def list(self, *, zone=None, active_only: bool = False, sort: str = "rank", limit=None,
              filters=None):
@@ -175,8 +179,7 @@ class MockStore:
         if zone:
             mems = [m for m in mems if m.frontmatter.zone == zone]
         if filters:
-            for key, val in filters.items():
-                mems = [m for m in mems if getattr(m.frontmatter, key, None) == val]
+            mems = filter_memories_by_scope(mems, filters)
         if limit is not None:
             mems = mems[:limit]
         return mems
@@ -189,7 +192,47 @@ class MockStore:
         return False
 
     def list_active_effectiveness(self) -> dict[str, dict[str, Any]]:
+        # Legacy hook retained for older callers; real stores no longer expose
+        # this. Prefer effectiveness(memory_id).
         return self.eff_data
+
+    def effectiveness(self, memory_id: str | None = None) -> dict[str, MemoryEffectiveness]:
+        """Mirror the real MemoryStore.efficiency() contract.
+
+        Tests populate self.eff_data with raw dicts like
+        {"last_accessed": <epoch>, "effectiveness": <0..1>}; we adapt those into
+        MemoryEffectiveness records so curator code can use the dataclass API
+        (eff.factor(), eff.last_event_at) just like production.
+        """
+        result: dict[str, MemoryEffectiveness] = {}
+        for mid, raw in self.eff_data.items():
+            raw = raw or {}
+            score = float(raw.get("effectiveness", 0.5))
+            # Reverse-engineer loaded/referenced so factor() reproduces score:
+            # factor() = 0.5 + 0.5*(referenced/loaded); pick loaded=2 so the
+            # ratio is exact when score is in (0.5, 1.0], else loaded large.
+            if score >= 0.5:
+                referenced = max(1, round((score - 0.5) * 2 * 2))
+                loaded = 2
+            else:
+                referenced = 0
+                loaded = 1
+            last_accessed = raw.get("last_accessed")
+            last_event_at = None
+            if last_accessed:
+                try:
+                    last_event_at = datetime.fromtimestamp(
+                        float(last_accessed), tz=timezone.utc
+                    ).isoformat()
+                except (TypeError, ValueError):
+                    last_event_at = None
+            result[mid] = MemoryEffectiveness(
+                loaded=loaded, referenced=referenced, accessed=0,
+                last_event_at=last_event_at,
+            )
+        if memory_id is not None:
+            return {memory_id: result.get(memory_id)} if memory_id in result else {}
+        return result
 
     def update(self, mem_id, body=None, zone=None, confidence=None,
                tags=None, pinned=None, supersedes=None):

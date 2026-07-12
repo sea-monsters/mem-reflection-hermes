@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from types import SimpleNamespace
@@ -209,13 +211,14 @@ class _RecordingMemStore:
         self.check_conflict_calls = []
         self.put_calls = []
 
-    def list_active(self):
+    def list_active(self, filters=None):
         return []
 
-    def check_conflict(self, body: str, exclude_ids=None):
+    def check_conflict(self, body: str, exclude_ids=None, filters=None):
         self.check_conflict_calls.append({
             "body": body,
             "exclude_ids": list(exclude_ids or []),
+            "filters": filters,
         })
         return None
 
@@ -409,7 +412,7 @@ class TestHookReflectionCadence:
         monkeypatch.setattr(_lifecycle_mod, "_context_timeout_ms", lambda: 10)
         monkeypatch.setattr(_lifecycle_mod, "_estimate_tokens", lambda _text: 1)
 
-        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             if stable_only:
                 return SimpleNamespace(
                     append_system_context="## Pinned Memories\n- [core] stable",
@@ -447,7 +450,7 @@ class TestHookReflectionCadence:
 
         call_count = {"n": 0}
 
-        def _fake_slow_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_slow_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             call_count["n"] += 1
             if stable_only:
                 return SimpleNamespace(
@@ -513,7 +516,7 @@ class TestHookReflectionCadence:
 
         call_log = []
 
-        def _fake_bundle(_query, max_tokens=4000, stable_only=False):
+        def _fake_bundle(_query, max_tokens=4000, stable_only=False, filters=None):
             call_log.append(("stable" if stable_only else "full"))
             if stable_only:
                 return SimpleNamespace(
@@ -543,6 +546,68 @@ class TestHookReflectionCadence:
 
 @skip_no_engine
 class TestReflectionSupersedesRegression:
+    def test_full_reflection_excludes_current_session_ids_from_conflict_check(self, monkeypatch):
+        """P2-9: LLM full reflection must exclude current session memory IDs from conflict check."""
+        mem_store = _RecordingMemStore()
+        monkeypatch.setattr(_runtime, "_reflection_mode", lambda: "llm")
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_get_skill_store", lambda: _EmptySkillStore())
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_save_pending_skill_candidates", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.9)
+        _runtime._current_session_memory_ids.ids = {"mem-session"}
+
+        ctx = types.SimpleNamespace(llm=_FakeLLM({
+            "summary": "ok",
+            "memory_candidates": [{
+                "fact": "Updated deployment preference",
+                "scope": "user",
+                "confidence": "high",
+                "tags": ["deploy"],
+                "supersedes": ["mem-old"],
+            }],
+            "skill_candidates": [],
+            "conflicts": [],
+        }))
+
+        result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "Update my deployment preference."}])
+
+        assert result["accepted_memories"]
+        excluded = set(mem_store.check_conflict_calls[0]["exclude_ids"])
+        assert excluded == {"mem-old", "mem-session"}
+        _runtime._reset_current_session_memory_ids()
+
+    def test_micro_reflection_excludes_current_session_ids_from_conflict_check(self, monkeypatch):
+        """P2-9: LLM micro reflection must exclude current session memory IDs from conflict check."""
+        mem_store = _RecordingMemStore()
+        monkeypatch.setattr(_runtime, "_reflection_mode", lambda: "llm")
+        monkeypatch.setattr(_runtime, "_get_mem_store", lambda: mem_store)
+        monkeypatch.setattr(_runtime, "_validate_supersedes_targets", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_append_reflect_log", lambda *_: None)
+        monkeypatch.setattr(_runtime, "_compute_novelty_score", lambda *_args, **_kwargs: 0.8)
+        _runtime._current_session_memory_ids.ids = {"mem-micro-session"}
+
+        ctx = types.SimpleNamespace(llm=_FakeLLM({
+            "summary": "ok",
+            "memory_candidates": [{
+                "fact": "Updated editor preference",
+                "scope": "user",
+                "confidence": "medium",
+                "tags": ["editor"],
+                "supersedes": ["mem-editor-old"],
+            }],
+            "skill_candidates": [],
+            "conflicts": [],
+        }))
+
+        parsed = _engine._run_micro_reflection(ctx, "Actually, I was wrong about my editor preference", "noted")
+
+        assert parsed is not None
+        excluded = set(mem_store.check_conflict_calls[0]["exclude_ids"])
+        assert excluded == {"mem-editor-old", "mem-micro-session"}
+        _runtime._reset_current_session_memory_ids()
+
     def test_full_reflection_excludes_superseded_ids_from_conflict_check(self, monkeypatch):
         mem_store = _RecordingMemStore()
         # These functions are called from runtime, so patch runtime module
@@ -568,7 +633,7 @@ class TestReflectionSupersedesRegression:
             "conflicts": [],
         }))
 
-        result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "remember this"}])
+        result = _engine._run_full_reflection(ctx, [{"role": "user", "content": "Actually, I was wrong. Update my deployment preference."}])
 
         assert result["accepted_memories"]
         assert mem_store.check_conflict_calls[0]["exclude_ids"] == ["mem-old"]
@@ -625,7 +690,7 @@ class TestReflectionSupersedesRegression:
             "conflicts": [],
         }))
 
-        parsed = _engine._run_micro_reflection(ctx, "remember my new editor", "noted")
+        parsed = _engine._run_micro_reflection(ctx, "Actually, I was wrong about my editor preference", "noted")
 
         assert parsed is not None
         assert mem_store.check_conflict_calls[0]["exclude_ids"] == ["mem-editor-old"]
@@ -705,3 +770,42 @@ class TestReflectionSupersedesRegression:
         assert result["accepted_memories"]
         assert mem_store.check_conflict_calls[-1]["exclude_ids"] == ["mem-old", "mem-session"] or mem_store.check_conflict_calls[-1]["exclude_ids"] == ["mem-session", "mem-old"]
         assert mem_store.put_calls[0]["frontmatter"].supersedes == ["mem-old"]
+
+
+def test_pending_skills_archive_cleanup(monkeypatch, tmp_path):
+    """P3-6: pending-skills archive files are pruned by age and by count."""
+    pending_path = tmp_path / "pending-skills.json"
+    monkeypatch.setattr(_runtime, "PENDING_SKILLS_PATH", pending_path)
+
+    now = datetime.now(timezone.utc).timestamp()
+    old_time = now - 31 * 86400
+
+    # Pre-create 12 recent archives with staggered mtimes.
+    recent_archives = []
+    for i in range(12):
+        p = pending_path.with_suffix(f".202501{i + 1:02d}-000000.json")
+        p.write_text("[]")
+        recent_archives.append(p)
+    for idx, p in enumerate(recent_archives):
+        t = now - (11 - idx) * 60
+        os.utime(p, (t, t))
+
+    # Pre-create 2 old archives (>30 days).
+    for i in range(2):
+        p = pending_path.with_suffix(f".202410{i + 1:02d}-000000.json")
+        p.write_text("[]")
+        os.utime(p, (old_time, old_time))
+
+    # Trigger an archive by writing more than the max pending items.
+    pending_path.write_text(json.dumps([{"name": f"skill{i}"} for i in range(201)]))
+    _runtime._save_pending_skill_candidates([])
+
+    remaining = sorted(
+        pending_path.parent.glob("pending-skills.*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    # Old archives must be removed regardless of count.
+    assert all("202410" not in a.name for a in remaining)
+    # Most-recent-10 cap must be enforced.
+    assert len(remaining) == 10

@@ -37,7 +37,7 @@
 │    ├── Graph decay                                    │
 │    ├── Generate skill candidates                      │
 │    ├── Write session summary + episode compaction     │
-│    ├── Memory curator (v1.2) — stale/similar/archive  │
+│    ├── Memory curator (v1.7) — scoped maintenance, scope-aware reflection │
 │    └── Session checkpoint (v1.4) — pending recovery   │
 ├──────────────────────────────────────────────────────┤
 │  Background Tasks                                     │
@@ -53,50 +53,52 @@ see [DESIGN_EVALUATION.md](DESIGN_EVALUATION.md).
 For the historical follow-up implementation plan targeting the v0.9.2 design gaps,
 see [PLAN_0_9_2_BETA2.md](PLAN_0_9_2_BETA2.md).
 
-## Module Layout (v1.6)
+## Module Layout (v1.7)
 
 | Module | Lines | Responsibility | Imports From |
 |--------|-------|----------------|-------------|
+| `core/scope.py` | canonical (v1.7) | ScopeIntent enum, `scope_from_context()`, `global_only_scope()`, `normalize_scope_filters()`, `build_scope_clauses()` — shared scope helpers for user_id/agent_id/run_id resolution | store |
 | `core/store.py` | canonical | MemoryStore, SkillStore, frontmatter, config, paths, lineage, BM25 helpers, memory_events ledger | — |
-| `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain, scope-filtered recall | store |
-| `core/graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation | store |
+| `core/search.py` | canonical | SearchIndex, BM25/embedding fusion, query templates, result cache, intent helpers, explain, scope-filtered recall; search-time Hebbian boost calls graph spread with `increment_step=False` | store |
+| `core/graph.py` | canonical | GraphIndex, Hebbian edges, PageRank, cross-zone analysis, spreading activation with optional `increment_step` and `allowed_nodes` guards | store |
 | `core/config.py` | canonical | Typed config models, diagnostics, validation | store |
 | `core/backend.py` | canonical | Backend capability abstraction (SearchBackendLike) | — |
-| `reflection/engine.py` | canonical | ReflectionEngine, raw_chunk default, fact extraction | store |
-| `reflection/runtime.py` | canonical | _run_full_reflection, _run_micro_reflection, audit logging, compaction | store, search, reflection/engine |
-| `memory/curator/` | canonical (v1.5) | Composable action pipeline: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport | store, memory/bridge |
+| `reflection/engine.py` | canonical (legacy API) | ReflectionEngine, raw_chunk default, fact extraction; now accepts optional `scope_filters` | store |
+| `reflection/runtime.py` | canonical | _run_full_reflection, _run_micro_reflection, scope-aware reflection writes, audit logging, compaction | store, search, reflection/engine |
+| `memory/curator/` | canonical (v1.7) | Composable action pipeline with scoped-by-default maintenance: ArchiveStale, CompactChains, ArchiveSuperseded, MergeSimilar, CleanOrphanEdges, GenerateReport; `admin_global` is explicit opt-in for full-store runs; `stop_on_error` + recovery journal added in round-5 | store, memory/bridge |
 | `memory/bridge.py` | canonical | Bidirectional sync between plugin MemoryStore and host builtin memory | store |
 | `memory/context.py` | canonical | Context assembly: stable/dynamic split, token budget, skill matching, graded compression | store, search |
-| `runtime/tools.py` | canonical | 8 base SRH tool handlers (write, search, delete, history, palace, reflect, skill, compile) | store, search, reflection |
-| `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands | store, reflection, search, memory |
-| `runtime/graph.py` | canonical | 5 graph/health tools + graph manager singleton | core/graph, store |
+| `runtime/tools.py` | canonical | 8 base SRH tool handlers (write, search, delete, history, palace, reflect, skill, compile); reflects normalized `srh_reflect_now` and unified `srh_memory_delete`/`srh_palace_read_zone` response shapes | store, search, reflection |
+| `runtime/hooks.py` | canonical | Session hooks (start/end/pre_llm/post_tool/reset/api_error/subagent) and slash commands; scope propagation into reflection/context/compaction; legacy bare scope kwargs emit DeprecationWarning | store, reflection, search, memory |
+| `runtime/graph.py` | canonical | 5 graph/health tools + graph manager singleton; `register_graph_features()` is called from `runtime/registration.py` to wire the `/graph` slash command, graph hook, and getter; supports optional `filters` for scope boundary | core/graph, store |
 | `runtime/checkpoint.py` | canonical | Atomic session checkpoint, pending-stage recovery, corrupt backup | store |
-| `runtime/registration.py` | canonical | Plugin registration entrypoint: wires hooks, commands, tools, post-delete callbacks | hooks, schemas, tools, graph |
-| `runtime/schemas.py` | canonical | Canonical JSON schemas for all 13 registered Hermes tools | — |
+| `runtime/registration.py` | canonical | Plugin registration entrypoint: wires hooks, commands, tools, post-delete callbacks, and calls `register_graph_features()` | hooks, schemas, tools, graph |
+| `runtime/schemas.py` | canonical | Canonical JSON schemas for all 13 registered Hermes tools; `srh_graph_retrieve` accepts either `memory_ids` or deprecated `seed_ids` | — |
 | `web/api.py` | canonical | FastAPI dashboard routes (15 endpoints) backed by store/search/runtime graph/curator APIs | package runtime services |
 | `tools/handlers.py`, `hooks/lifecycle.py`, `graph/compat.py`, `reflection/engine.py` | deprecated compat | Explicit old import paths forwarding to runtime modules | runtime/* |
 
-**Tool split**: 8 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py`. All 13 tools are declared in `plugin.yaml` and registered through the package `register(ctx)` path, which delegates to `runtime/registration.py` using schemas from `runtime/schemas.py`.
+**Tool split**: 8 base tools live in `runtime/tools.py`; 5 graph/health tools (`srh_associate`, `srh_graph_retrieve`, `srh_graph_stats`, `srh_graph_viz`, `srh_memory_health`) are registered by `runtime/graph.py`. All 13 tools are declared in `plugin.yaml` and registered through the package `register(ctx)` path, which delegates to `runtime/registration.py` using schemas from `runtime/schemas.py`. `register_graph_features()` is invoked explicitly during registration with idempotency protection.
 
-### Import Order Rules (v1.5)
+### Import Order Rules (v1.7)
 
 When adding new functionality, respect the module boundaries:
 
 1. **`core/store.py`**: Data models, store logic, config, paths — no Hermes dependencies
-2. **`core/search.py`**: Search and embedding helpers — imports `core/store` only
-3. **`core/graph.py`**: GraphIndex — imports `core/store` only where cross-zone analysis needs memory metadata
-4. **`core/config.py`** / **`core/backend.py`**: Typed config and backend abstraction — imports `core/store`
-5. **`reflection/engine.py`** / **`reflection/runtime.py`**: Reflection pipelines — import `core/store` + `core/search`
+2. **`core/scope.py`**: Shared scope helper; resolves `user_id` / `agent_id` / `run_id` from host context — imports `core/store` (TYPE_CHECKING) only
+3. **`core/search.py`**: Search and embedding helpers — imports `core/store` + `core/tokenization` + `core/models` + `core/scope`
+4. **`core/graph.py`**: GraphIndex — imports `core/store` only where cross-zone analysis needs memory metadata
+5. **`core/config.py`** / **`core/backend.py`**: Typed config and backend abstraction — imports `core/store`
+5. **`reflection/extraction.py`** / **`reflection/supersedes_resolver.py`** / **`reflection/engine.py`** / **`reflection/runtime.py`**: Reflection pipelines — import `core/store` + `core/search`
 6. **`memory/curator/`**: Composable action pipeline — imports `core/store` + `memory/bridge`; `memory/bridge.py` imports `core/store` only
 7. **`memory/context.py`**: Context assembly — imports `core/store` + `core/search` + `core/config`
-8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features
+8. **`runtime/tools.py`** / **`runtime/hooks.py`** / **`runtime/graph.py`** / **`runtime/checkpoint.py`**: Host-facing runtime features — depend on canonical services
 9. **`runtime/registration.py`**, **`runtime/schemas.py`**, **`runtime/state.py`**, **`runtime/helpers.py`**, **`runtime/_lb.py`**: Registration, schemas, singletons, late-binding
 10. **`web/api.py`**: Dashboard — imports package runtime services via `sys.modules` fallback
 11. **`__init__.py`**: Exports public API, backward-compat aliases, delegates `register()` to `runtime/registration`
 
 Avoid circular dependencies. Deprecated compatibility files should forward to runtime modules and not regain implementation logic.
 
-### Thread Safety (v1.5)
+### Thread Safety (v1.7)
 
 Key concurrency protections present in v1.5:
 
@@ -110,11 +112,12 @@ Key concurrency protections present in v1.5:
 | `_build_adjacency` | mtime check + DB query + cache update inside `self._lock` |
 | `get_cache()` singleton | Double-checked locking |
 | Cold store writes | `threading.Lock` (`_cold_store_lock`) guards JSONL append/rewrite |
+| Stats stream writes | `threading.Lock` (`_stat_write_lock`) guards JSONL append and compaction truncate |
 | Runtime late binding | Package-level explicit runtime delegates; legacy `late_binding.py` is retired |
 
 ## Slash Commands
 
-Registered in `runtime_hooks.py` via `register_commands(ctx)`:
+Registered in `runtime_hooks.py` via `register_commands(ctx)` and in `runtime/graph.py` via `register_graph_features(ctx)`:
 
 | Command | Purpose |
 |---------|---------|
@@ -125,16 +128,22 @@ Registered in `runtime_hooks.py` via `register_commands(ctx)`:
 | `/reject` | Reject a pending skill candidate |
 | `/memories` | List recent memories with zone/confidence filter |
 | `/compile` | Compile profile from current memory set |
+| `/graph` | Graph maintenance / info (v1.7: wired through `register_graph_features`) |
 
 ## Context Layering
 
-The `pre_llm_call` hook injects context in this priority order:
+The `pre_llm_call` hook injects context in two sections. The **stable**
+section is preserved across turns to keep prompt caches warm; the
+**dynamic** section varies per turn and is compressed under token pressure.
 
 ```
+Stable section:
 1. Pinned memories (always included)
-2. Active index (zone-based relevance)
-3. Triggered skills (per-turn matching)
-4. Always-active skills (user-configured)
+2. Always-active skills (user-configured)
+
+Dynamic section:
+3. Active index (zone-based relevance)
+4. Triggered skills (per-turn matching)
 ```
 
 Each layer respects the `max_context_token_preference` budget. Token estimation

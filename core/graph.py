@@ -12,9 +12,15 @@ import math
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    from .entities import extract_entities
+except ImportError:
+    from core.entities import extract_entities
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,32 @@ CREATE TABLE IF NOT EXISTS graph_meta (
     strength REAL NOT NULL DEFAULT 1.0,
     status TEXT NOT NULL DEFAULT 'active'
 );
+
+CREATE TABLE IF NOT EXISTS typed_facts (
+    fact_id TEXT PRIMARY KEY,
+    source_memory_id TEXT NOT NULL,
+    target_memory_id TEXT,
+    episode_id TEXT,
+    relation TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'fact',
+    subject TEXT,
+    object TEXT,
+    fact TEXT NOT NULL,
+    zone TEXT NOT NULL DEFAULT 'general',
+    source TEXT NOT NULL DEFAULT 'reflection',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    valid_from TEXT,
+    valid_until TEXT,
+    invalidated_by TEXT,
+    created_at TEXT NOT NULL
+    -- Retention/GC is handled by :meth:`compact_typed_facts`, invoked from the
+    -- curator pipeline; invalidated rows older than the configured retention
+    -- are pruned while active rows are preserved.
+);
+CREATE INDEX IF NOT EXISTS idx_typed_facts_source ON typed_facts(source_memory_id);
+CREATE INDEX IF NOT EXISTS idx_typed_facts_target ON typed_facts(target_memory_id);
+CREATE INDEX IF NOT EXISTS idx_typed_facts_relation ON typed_facts(relation);
+CREATE INDEX IF NOT EXISTS idx_typed_facts_episode ON typed_facts(episode_id);
 """
 
 
@@ -57,6 +89,7 @@ class GraphIndex:
         self._db_path = db_path
         self._local = threading.local()
         self._lock = threading.RLock()
+        self._connections: Set[sqlite3.Connection] = set()
         self._step_counter = 0  # total spreading activation steps
         self._last_decay_step = 0
         self._init_db()
@@ -72,8 +105,11 @@ class GraphIndex:
                 try:
                     conn.close()
                 except Exception as e:
+                    # Resource cleanup failure is safe to ignore; keep debug level.
                     logger.debug("Failed to close stale SQLite connection: %s", e)
                     pass
+                with self._lock:
+                    self._connections.discard(conn)
                 self._local.conn = None
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
@@ -81,6 +117,8 @@ class GraphIndex:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
+            with self._lock:
+                self._connections.add(conn)
         return self._local.conn
 
     def _init_db(self) -> None:
@@ -108,6 +146,185 @@ class GraphIndex:
                 (memory_id, normalized_zone, "active"),
             )
             conn.commit()
+
+    # -- typed sidecar -----------------------------------------------------
+
+    def record_typed_fact(
+        self,
+        source_memory_id: str,
+        fact: str,
+        *,
+        relation: str = "describes",
+        kind: str = "fact",
+        subject: Optional[str] = None,
+        object: Optional[str] = None,
+        target_memory_id: Optional[str] = None,
+        episode_id: Optional[str] = None,
+        zone: str = "general",
+        source: str = "reflection",
+        confidence: float = 0.5,
+        valid_from: Optional[str] = None,
+        valid_until: Optional[str] = None,
+        invalidated_by: Optional[str] = None,
+    ) -> str:
+        """Record a typed fact/edge in the sidecar table."""
+        fact_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        normalized_zone = (zone or "general").lower().strip() or "general"
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO typed_facts (
+                       fact_id, source_memory_id, target_memory_id, episode_id,
+                       relation, kind, subject, object, fact, zone, source,
+                       confidence, valid_from, valid_until, invalidated_by, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fact_id,
+                    source_memory_id,
+                    target_memory_id,
+                    episode_id,
+                    relation,
+                    kind,
+                    subject,
+                    object,
+                    fact,
+                    normalized_zone,
+                    source,
+                    float(confidence),
+                    valid_from,
+                    valid_until,
+                    invalidated_by,
+                    now,
+                ),
+            )
+            conn.commit()
+        return fact_id
+
+    def record_entity_mentions(
+        self,
+        source_memory_id: str,
+        text: str,
+        *,
+        episode_id: Optional[str] = None,
+        zone: str = "general",
+        source: str = "reflection",
+        target_memory_id: Optional[str] = None,
+        confidence: float = 0.6,
+    ) -> List[str]:
+        """Record entity mention rows derived from ``text``."""
+        mentions = extract_entities(text or "")
+        fact_ids: List[str] = []
+        for entity in mentions:
+            fact_ids.append(
+                self.record_typed_fact(
+                    source_memory_id,
+                    entity["text"],
+                    relation="mentions",
+                    kind="entity",
+                    subject=source_memory_id,
+                    object=entity["normalized"],
+                    target_memory_id=target_memory_id or source_memory_id,
+                    episode_id=episode_id or source_memory_id,
+                    zone=zone,
+                    source=source,
+                    confidence=float(entity.get("weight", confidence)),
+                )
+            )
+        return fact_ids
+
+    def invalidate_typed_fact(self, fact_id: str, invalidated_by: str, valid_until: Optional[str] = None) -> bool:
+        """Mark a typed fact as invalidated by a newer memory or fact."""
+        now = valid_until or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT fact_id FROM typed_facts WHERE fact_id = ?",
+                (fact_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "UPDATE typed_facts SET invalidated_by = ?, valid_until = ? WHERE fact_id = ?",
+                (invalidated_by, now, fact_id),
+            )
+            conn.commit()
+        return True
+
+    def invalidate_facts_for_memories(
+        self,
+        memory_ids: List[str],
+        invalidated_by: str,
+        valid_until: Optional[str] = None,
+    ) -> int:
+        """Invalidate every active typed fact owned by the given memories.
+
+        A fact is "owned" by a memory when it is the ``source_memory_id`` (the
+        memory that produced the fact). Facts that merely reference the memory
+        as ``target_memory_id`` (e.g. membership/mention edges from another
+        source) are left intact so the relation graph is not silently pruned.
+
+        This is the batch counterpart to :meth:`invalidate_typed_fact` and is
+        what the reflection/compaction supersede paths call when a new memory
+        replaces one or more older ones. Returns the number of rows updated.
+        """
+        memory_ids = [mid for mid in (memory_ids or []) if mid]
+        if not memory_ids:
+            return 0
+        now = valid_until or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            placeholders = ",".join("?" * len(memory_ids))
+            cursor = conn.execute(
+                f"""UPDATE typed_facts
+                    SET invalidated_by = ?, valid_until = ?
+                    WHERE source_memory_id IN ({placeholders})
+                      AND invalidated_by IS NULL""",
+                [invalidated_by, now, *memory_ids],
+            )
+            updated = cursor.rowcount or 0
+            conn.commit()
+        return updated
+
+    def typed_facts(
+        self,
+        *,
+        source_memory_id: Optional[str] = None,
+        target_memory_id: Optional[str] = None,
+        relation: Optional[str] = None,
+        episode_id: Optional[str] = None,
+        include_invalidated: bool = True,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return typed fact rows from the sidecar."""
+        conn = self._get_conn()
+        clauses: List[str] = ["1=1"]
+        params: List[Any] = []
+        if source_memory_id is not None:
+            clauses.append("source_memory_id = ?")
+            params.append(source_memory_id)
+        if target_memory_id is not None:
+            clauses.append("target_memory_id = ?")
+            params.append(target_memory_id)
+        if relation is not None:
+            clauses.append("relation = ?")
+            params.append(relation)
+        if episode_id is not None:
+            clauses.append("episode_id = ?")
+            params.append(episode_id)
+        if not include_invalidated:
+            clauses.append("invalidated_by IS NULL")
+        sql = (
+            "SELECT fact_id, source_memory_id, target_memory_id, episode_id, relation, kind, "
+            "subject, object, fact, zone, source, confidence, valid_from, valid_until, "
+            "invalidated_by, created_at FROM typed_facts WHERE " + " AND ".join(clauses) +
+            " ORDER BY created_at DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     # -- edges ---------------------------------------------------------------
 
@@ -180,45 +397,112 @@ class GraphIndex:
             for r in rows
         ]
 
-    def _neighbors_raw(self, memory_id: str) -> List[Dict[str, Any]]:
-        """Unfiltered neighbor list for spreading activation."""
+    def _neighbors_for_spread(
+        self, memory_id: str, min_weight: float = 0.0, undirected: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Get neighbors for activation spreading.
+
+        Args:
+            memory_id: The source memory ID.
+            min_weight: Minimum edge weight to traverse.
+            undirected: If True, traverse edges in both directions.
+
+        Returns list of {target_id, weight, relation}.
+        """
         conn = self._get_conn()
+        if undirected:
+            rows = conn.execute(
+                """SELECT source_id, target_id, weight,
+                          COALESCE(relation, 'co_occurs') AS relation
+                   FROM edges
+                   WHERE (source_id = ? OR target_id = ?) AND weight >= ?""",
+                (memory_id, memory_id, min_weight),
+            ).fetchall()
+            result = []
+            for r in rows:
+                if r["source_id"] == memory_id:
+                    result.append(
+                        {"target_id": r["target_id"], "weight": r["weight"], "relation": r["relation"]}
+                    )
+                else:
+                    result.append(
+                        {"target_id": r["source_id"], "weight": r["weight"], "relation": r["relation"]}
+                    )
+            return result
         rows = conn.execute(
-            "SELECT target_id, weight FROM edges WHERE source_id = ?",
-            (memory_id,),
+            "SELECT target_id, weight, COALESCE(relation, 'co_occurs') AS relation "
+            "FROM edges WHERE source_id = ? AND weight >= ?",
+            (memory_id, min_weight),
         ).fetchall()
-        return [{"target_id": r["target_id"], "weight": r["weight"]} for r in rows]
+        return [{"target_id": r["target_id"], "weight": r["weight"], "relation": r["relation"]} for r in rows]
 
     # -- spreading activation (HeLa-Mem §3.4) --------------------------------
 
     def spread(
-        self, seed_ids: List[str], decay: float = 0.7, max_iter: int = 50, max_nodes: int = 1000
+        self,
+        seed_ids: List[str],
+        decay: float = 0.7,
+        max_iter: int = 50,
+        max_nodes: int = 1000,
+        min_weight: float = 0.0,
+        exclude_relations: Optional[Set[str]] = None,
+        undirected: bool = False,
+        increment_step: bool = True,
+        allowed_nodes: Optional[Set[str]] = None,
     ) -> Dict[str, float]:
         """Fixed-point activation spreading from seed nodes.
 
-        Returns {node_id: activation_score} for all reached nodes.
-        Also increments the internal step counter for per-step decay.
+        Returns ``{node_id: activation_score}`` for all reached nodes.
+
+        Args:
+            seed_ids: Starting nodes.
+            decay: Propagation decay factor (0-1).
+            max_iter: Maximum iterations.
+            max_nodes: Cap on total activated nodes.
+            min_weight: Minimum edge weight to traverse.
+            exclude_relations: Set of relation types to skip (e.g. ``{"SUPERSEDES"}``).
+            undirected: If True, traverse edges in both directions.
+            increment_step: If False, do not advance the internal step counter.
+                Read-only callers (e.g. search-time Hebbian boost) should pass
+                ``False`` so per-step graph decay is only driven by deliberate
+                graph mutations, not by retrieval.
+            allowed_nodes: Optional set of node IDs to restrict propagation to.
+                Only allowed targets are added to the activation map. Search
+                callers should pass their in-scope candidate set so spreading
+                activation does not walk cross-scope edges.
         """
-        activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
+        excluded = exclude_relations or set()
+        activation: Dict[str, float] = {
+            sid: 1.0 for sid in seed_ids if allowed_nodes is None or sid in allowed_nodes
+        }
         for _ in range(max_iter):
             if len(activation) > max_nodes:
                 break
             new_act: Dict[str, float] = {}
+            delta = 0.0
             for nid, act in activation.items():
                 if act < 0.01:
                     continue
-                for neighbor in self._neighbors_raw(nid):
-                    propagated = act * decay * neighbor["weight"]
+                for neighbor in self._neighbors_for_spread(
+                    nid, min_weight=min_weight, undirected=undirected
+                ):
+                    if neighbor["relation"] in excluded:
+                        continue
                     tid = neighbor["target_id"]
+                    if allowed_nodes is not None and tid not in allowed_nodes:
+                        continue
+                    propagated = act * decay * neighbor["weight"]
                     new_act[tid] = max(new_act.get(tid, 0.0), propagated)
-            activation.update(new_act)
-            delta = sum(
-                abs(new_act.get(nid, 0.0) - activation.get(nid, 0.0))
-                for nid in set(new_act) | set(activation)
-            )
+            for nid, score in new_act.items():
+                prev = activation.get(nid, 0.0)
+                new_val = max(prev, score)
+                if new_val != prev:
+                    delta += new_val - prev
+                activation[nid] = new_val
             if delta < 1e-4:
                 break
-        self._step_counter += 1
+        if increment_step:
+            self._step_counter += 1
         return activation
 
     # -- decay ---------------------------------------------------------------
@@ -467,6 +751,34 @@ class GraphIndex:
             )
             try:
                 store.put("user", fm, summary)
+                # Sidecar records preserve the semantic lineage of the distilled cluster.
+                self.record_typed_fact(
+                    fm.id,
+                    summary,
+                    relation="summarizes",
+                    kind="semantic_cluster",
+                    subject=hub_id,
+                    object=",".join(member_ids[:5]),
+                    target_memory_id=fm.id,
+                    episode_id=hub_id,
+                    zone="semantic",
+                    source="distill",
+                    confidence=hub_score,
+                )
+                for mid in member_ids:
+                    self.record_typed_fact(
+                        mid,
+                        f"{mid} contributes to semantic cluster {fm.id}",
+                        relation="member_of",
+                        kind="membership",
+                        subject=mid,
+                        object=fm.id,
+                        target_memory_id=fm.id,
+                        episode_id=hub_id,
+                        zone="semantic",
+                        source="distill",
+                        confidence=hub_score,
+                    )
                 distilled.append({
                     "hub_id": hub_id,
                     "member_ids": member_ids,
@@ -535,22 +847,63 @@ class GraphIndex:
                 "DELETE FROM graph_meta WHERE memory_id = ?",
                 (memory_id,),
             )
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """UPDATE typed_facts
+                   SET invalidated_by = COALESCE(invalidated_by, ?), valid_until = COALESCE(valid_until, ?)
+                   WHERE source_memory_id = ? OR target_memory_id = ?""",
+                (memory_id, now, memory_id, memory_id),
+            )
             conn.commit()
+
+    def compact_typed_facts(self, retention_days: int = 30) -> int:
+        """Remove invalidated typed facts older than *retention_days*.
+
+        Invalidated facts (``invalidated_by`` set) accumulate indefinitely because
+        the sidecar is append-only. This pass prunes stale rows to keep the table
+        bounded while preserving recently invalidated facts for audit/history.
+        """
+        if retention_days < 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        with self._lock:
+            try:
+                conn = self._get_conn()
+                cur = conn.execute(
+                    """DELETE FROM typed_facts
+                       WHERE invalidated_by IS NOT NULL
+                         AND COALESCE(valid_until, created_at) < ?""",
+                    (cutoff,),
+                )
+                conn.commit()
+                deleted = cur.rowcount
+                if deleted:
+                    logger.debug("compact_typed_facts removed %d rows older than %s", deleted, cutoff)
+                return deleted
+            except Exception as e:
+                logger.warning("compact_typed_facts failed: %s", e)
+                return 0
 
     def clean_orphan_edges(self, valid_ids: Set[str]) -> int:
         """Delete edges + meta where memory no longer exists in *valid_ids*.
 
         Returns total count of rows deleted (edges + graph_meta).
         Fail-open: on SQL error, logs warning and returns 0.
+
+        An empty *valid_ids* set is treated as a caller error and does NOT
+        delete anything. This prevents a curator run on an empty active-memory
+        set from wiping the entire graph.
         """
         deleted = 0
         try:
             with self._lock:
                 conn = self._get_conn()
                 if not valid_ids:
-                    # Empty set means all rows are orphaned
-                    deleted += conn.execute("DELETE FROM edges").rowcount
-                    deleted += conn.execute("DELETE FROM graph_meta").rowcount
+                    # Empty set is a caller error, not "everything is orphaned".
+                    logger.warning(
+                        "clean_orphan_edges called with empty valid_ids — refusing to delete graph data"
+                    )
+                    return 0
                 else:
                     placeholders = ",".join("?" * len(valid_ids))
                     ids_list = list(valid_ids)
@@ -562,14 +915,36 @@ class GraphIndex:
                         f"DELETE FROM graph_meta WHERE memory_id NOT IN ({placeholders})",
                         ids_list,
                     ).rowcount
+                    deleted += conn.execute(
+                        "DELETE FROM typed_facts WHERE source_memory_id NOT IN "
+                        f"({placeholders})",
+                        ids_list,
+                    ).rowcount
                 conn.commit()
         except Exception as e:
             logger.warning("Graph orphan edge cleanup failed: %s", e)
         return deleted
 
     def close(self) -> None:
-        """Checkpoint WAL and close connection."""
-        if hasattr(self._local, "conn") and self._local.conn is not None:
-            self._local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._local.conn.close()
+        """Checkpoint WAL and close all thread-local connections."""
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as e:
+                logger.debug("Failed to checkpoint graph SQLite connection: %s", e)
+            try:
+                conn.close()
+            except Exception as e:
+                logger.debug("Failed to close graph SQLite connection: %s", e)
+        if hasattr(self._local, "conn"):
             self._local.conn = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for tests or hosts that drop the graph without close()."""
+        try:
+            self.close()
+        except Exception:
+            pass

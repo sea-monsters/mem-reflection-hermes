@@ -123,42 +123,36 @@ def effectiveness(
     store: "MemoryStore",
     memory_id: Optional[str] = None,
 ) -> Dict[str, "MemoryEffectiveness"]:
-    from .models import MemoryEffectiveness
-    conn = store._get_conn()
-    if memory_id is not None:
-        rows = conn.execute("SELECT event, at FROM stats WHERE memory_id = ?", (memory_id,)).fetchall()
-        eff = MemoryEffectiveness()
-        for r in rows:
-            ev, at = r["event"], r["at"]
-            if ev == "loaded":
-                eff.loaded += 1
-            elif ev == "referenced":
-                eff.referenced += 1
-            elif ev == "accessed":
-                eff.accessed += 1
-            if at and (eff.last_event_at is None or at > eff.last_event_at):
-                eff.last_event_at = at
-        return {memory_id: eff}
-    rows = conn.execute("SELECT memory_id, event, at FROM stats").fetchall()
-    result: Dict[str, MemoryEffectiveness] = {}
-    for r in rows:
-        mid, ev, at = r["memory_id"], r["event"], r["at"]
-        e = result.setdefault(mid, MemoryEffectiveness())
-        if ev == "loaded":
-            e.loaded += 1
-        elif ev == "referenced":
-            e.referenced += 1
-        elif ev == "accessed":
-            e.accessed += 1
-        if at and (e.last_event_at is None or at > e.last_event_at):
-            e.last_event_at = at
-    return result
+    """[DEPRECATED] Read effectiveness from the JSONL truth path.
+
+    The SQLite ``stats`` table is no longer maintained; this wrapper forwards
+    to ``MemoryStore.effectiveness()`` so legacy callers read the same data as
+    the rest of the plugin and do not silently see empty/zero stats.
+    """
+    import warnings
+
+    warnings.warn(
+        "store_methods.effectiveness() is deprecated; use MemoryStore.effectiveness() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return store.effectiveness(memory_id=memory_id)
 
 
 def record_stat(store: "MemoryStore", memory_id: str, event: str) -> None:
-    with store._lock:
-        conn = store._get_conn()
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("INSERT INTO stats (memory_id, event, at) VALUES (?, ?, ?)",
-                     (memory_id, event, now))
-        conn.commit()
+    """[DEPRECATED] Forward to the JSONL stats pipeline.
+
+    Writes to ``memory-stats.jsonl`` so that legacy callers do not silently
+    lose stats; emits a DeprecationWarning. Prefer ``record_memory_stat()``.
+    """
+    import warnings
+
+    warnings.warn(
+        "store_methods.record_stat() is deprecated; use record_memory_stat() instead. "
+        "The SQLite stats table is no longer the source of truth.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from .store import record_memory_stat
+
+    record_memory_stat(memory_id, event)

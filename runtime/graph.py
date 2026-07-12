@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from ..core.scope import SCOPE_FILTER_SCHEMA
+except ImportError:
+    from mem_reflection_hermes.core.scope import SCOPE_FILTER_SCHEMA
+
 
 def _as_dict(row):
     """Convert sqlite3.Row or any mapping to a plain dict."""
@@ -89,6 +94,21 @@ class _GraphStoreShim:
             (min_weight,),
         ).fetchall()
         return [(r["source_id"], r["target_id"], r["weight"]) for r in rows]
+
+    def record_typed_fact(self, *args, **kwargs):
+        return self._gi.record_typed_fact(*args, **kwargs)
+
+    def record_entity_mentions(self, *args, **kwargs):
+        return self._gi.record_entity_mentions(*args, **kwargs)
+
+    def invalidate_typed_fact(self, *args, **kwargs):
+        return self._gi.invalidate_typed_fact(*args, **kwargs)
+
+    def invalidate_facts_for_memories(self, *args, **kwargs):
+        return self._gi.invalidate_facts_for_memories(*args, **kwargs)
+
+    def typed_facts(self, *args, **kwargs):
+        return self._gi.typed_facts(*args, **kwargs)
 
     def upsert_edge(
         self,
@@ -239,6 +259,7 @@ class _GraphStoreShim:
         decay_factor: float = 0.5,
         min_weight: float = 0.1,
         limit: int = 10,
+        allowed_nodes: Optional[Set[str]] = None,
     ) -> List[dict]:
         activation = self.spread_activation(
             seed_ids,
@@ -246,6 +267,7 @@ class _GraphStoreShim:
             decay=decay_factor,
             min_weight=min_weight,
             limit=limit,
+            allowed_nodes=allowed_nodes,
         )
         return [
             {"memory_id": nid, "weight": act, "relation": "co_occurs"}
@@ -259,41 +281,31 @@ class _GraphStoreShim:
         decay: float = 0.5,
         min_weight: float = 0.1,
         limit: int = 10,
+        allowed_nodes: Optional[Set[str]] = None,
         threshold: float = 1e-4,
         max_iter: Optional[int] = None,
     ) -> Dict[str, float]:
-        conn = self._conn()
+        """Activation spreading delegated to :meth:`GraphIndex.spread`.
+
+        The runtime layer adds BFS-style default iteration (max_depth × 10),
+        SUPERSEDES-relation exclusion, undirected traversal, seed filtering,
+        threshold gating, and capped results — all via optional parameters
+        on the core method.
+        """
         steps = max_iter if max_iter is not None else max_depth * 10
-        activation: Dict[str, float] = {sid: 1.0 for sid in seed_ids}
-        for _ in range(max(1, steps)):
-            new_act: Dict[str, float] = {}
-            for nid, act in list(activation.items()):
-                if act < threshold:
-                    continue
-                rows = conn.execute(
-                    """SELECT source_id, target_id, relation, weight
-                       FROM edges
-                       WHERE (source_id = ? OR target_id = ?) AND weight >= ?""",
-                    (nid, nid, min_weight),
-                ).fetchall()
-                for r in rows:
-                    relation = r["relation"] or "co_occurs"
-                    if relation == "SUPERSEDES":
-                        continue
-                    neighbor = r["target_id"] if r["source_id"] == nid else r["source_id"]
-                    if neighbor in seed_ids:
-                        continue
-                    propagated = act * decay * float(r["weight"])
-                    new_act[neighbor] = max(new_act.get(neighbor, 0.0), propagated)
-            if not new_act:
-                break
-            delta = sum(new_act.values())
-            for nid, score in new_act.items():
-                activation[nid] = max(activation.get(nid, 0.0), score)
-            if delta < threshold:
-                break
+        raw = self._gi.spread(
+            seed_ids,
+            decay=decay,
+            max_iter=max(1, steps),
+            min_weight=min_weight,
+            exclude_relations={"SUPERSEDES"},
+            undirected=True,
+            increment_step=False,
+            allowed_nodes=allowed_nodes,
+        )
+        # Remove seeds, sort desc, apply threshold + limit
         results: Dict[str, float] = {}
-        for nid, act in sorted(activation.items(), key=lambda x: -x[1]):
+        for nid, act in sorted(raw.items(), key=lambda x: -x[1]):
             if nid in seed_ids:
                 continue
             if act < threshold:
@@ -306,10 +318,8 @@ class _GraphStoreShim:
     def stats(self) -> dict:
         stats = self._gi.stats()
         stats["healthy"] = True
-        stats["nodes"] = stats.get("nodes", 0)
-        stats["edges"] = stats.get("edges", 0)
-        stats["node_count"] = stats["nodes"]
-        stats["edge_count"] = stats["edges"]
+        stats["node_count"] = stats.get("nodes", 0)
+        stats["edge_count"] = stats.get("edges", 0)
         return stats
 
     def _connect(self):
@@ -373,14 +383,21 @@ class GraphManagerCompat:
             "context": context[:100] if context else "",
         }
 
-    def retrieve_related(self, memory_ids: List[str], task_type: str = "reasoning",
-                         max_results: int = 10, tier: str = "list") -> List[dict]:
+    def retrieve_related(
+        self,
+        memory_ids: List[str],
+        task_type: str = "reasoning",
+        max_results: int = 10,
+        tier: str = "list",
+        allowed_nodes: Optional[Set[str]] = None,
+    ) -> List[dict]:
         results = self.store.propagate_activation(
             memory_ids,
             max_depth=2,
             decay_factor=0.5,
             min_weight=0.1,
             limit=max_results,
+            allowed_nodes=allowed_nodes,
         )
         if tier == "count":
             return [{"memory_id": r["memory_id"]} for r in results[:max_results]]
@@ -392,8 +409,15 @@ class GraphManagerCompat:
             ]
         return results[:max_results]
 
-    def propagate_activation(self, seed_ids: List[str], **kwargs) -> List[dict]:
-        return self.store.propagate_activation(seed_ids, **kwargs)
+    def propagate_activation(
+        self,
+        seed_ids: List[str],
+        allowed_nodes: Optional[Set[str]] = None,
+        **kwargs,
+    ) -> List[dict]:
+        return self.store.propagate_activation(
+            seed_ids, allowed_nodes=allowed_nodes, **kwargs
+        )
 
     def get_neighbors(
         self,
@@ -443,6 +467,12 @@ GraphStore = GraphManagerCompat
 _graph_manager_compat: Optional[GraphManagerCompat] = None
 _gm_compat_lock = __import__("threading").Lock()
 
+# Idempotency guard for register_graph_features(). Tracks contexts that have
+# already been registered so that the same process can register multiple
+# distinct host contexts (e.g., tests) without duplicating tools/hooks on any
+# single context.
+_REGISTERED_CONTEXT_IDS: set = set()
+
 
 def get_graph_manager_compat(db_path: Optional[Path] = None) -> GraphManagerCompat:
     """Get or create the singleton compat manager (thread-safe)."""
@@ -451,7 +481,7 @@ def get_graph_manager_compat(db_path: Optional[Path] = None) -> GraphManagerComp
         with _gm_compat_lock:
             if _graph_manager_compat is None:
                 if db_path is None:
-                    from .store import plugin_data_dir
+                    from ..core.store import plugin_data_dir
                     db_path = plugin_data_dir() / "graph.db"
                 _graph_manager_compat = GraphManagerCompat(db_path)
     return _graph_manager_compat
@@ -476,20 +506,26 @@ def _health_recommendations(metrics: Dict[str, Any]) -> List[str]:
 
 def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path] = None) -> Dict[str, Any]:
     """Register graph tools, graph maintenance hook, health tool, and /graph command."""
+    ctx_id = id(ctx)
+    if ctx_id in _REGISTERED_CONTEXT_IDS:
+        logger.debug("register_graph_features() already called for this context; skipping")
+        return {"registered": False, "reason": "already_registered"}
+    _REGISTERED_CONTEXT_IDS.add(ctx_id)
+
     if graph_db_path is None:
         try:
-            from .store import plugin_data_dir
+            from ..core.store import plugin_data_dir
         except ImportError:
-            from store import plugin_data_dir
+            from core.store import plugin_data_dir
         graph_db_path = plugin_data_dir() / "graph.db"
 
     try:
-        from . import runtime_hooks as _hooks_mod
+        from . import hooks as _hooks_mod
     except ImportError:
         try:
-            from mem_reflection_hermes import runtime_hooks as _hooks_mod
+            from mem_reflection_hermes.runtime import hooks as _hooks_mod
         except ImportError:
-            import runtime_hooks as _hooks_mod
+            import runtime.hooks as _hooks_mod
 
     _hooks_mod._gm_getter_func = get_graph_manager_compat
     _hooks_mod._gm_getter_path = graph_db_path
@@ -540,7 +576,10 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
 
     def _graph_retrieve_h(args: dict, **kwargs) -> str:
         gm = _ensure_gm()
-        mids = args.get("memory_ids", [])[:20]
+        # P1-2: schema deprecates seed_ids in favor of memory_ids. Keep backward
+        # compatibility for clients that still pass seed_ids only.
+        mids = args.get("memory_ids") or args.get("seed_ids") or []
+        mids = list(mids)[:20]
         task_type = args.get("task_type", "reasoning")
         max_res = min(args.get("max_results", 10), 100)
         tier = args.get("tier", "list")
@@ -564,8 +603,29 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
                         break
             except Exception:
                 pass
-        results = gm.retrieve_related(mids, task_type, max_res, tier=tier)
-        return json.dumps({"results": results, "count": len(results), "seed_ids": mids, "tier": tier, "strategy": task_type})
+
+        # P2-5: short-term scope boundary filter. The graph DB predates v1.6
+        # scope columns, so we compute the allowed node set from the memory
+        # store at query time and let GraphIndex.spread enforce it.
+        allowed_nodes = None
+        filters = args.get("filters")
+        if filters and get_mem_store:
+            try:
+                allowed_nodes = {
+                    m.id() for m in get_mem_store().list_active(filters=filters)
+                }
+            except Exception:
+                logger.warning(
+                    "srh_graph_retrieve failed to build scope allowed_nodes",
+                    exc_info=True,
+                )
+
+        results = gm.retrieve_related(
+            mids, task_type, max_res, tier=tier, allowed_nodes=allowed_nodes
+        )
+        return json.dumps(
+            {"results": results, "count": len(results), "seed_ids": mids, "tier": tier, "strategy": task_type}
+        )
 
     ctx.register_tool(
         name="srh_graph_retrieve",
@@ -580,6 +640,7 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
                     "task_type": {"type": "string", "enum": ["factual", "reasoning", "skill", "recent", "exploration", "personalized"], "default": "reasoning"},
                     "max_results": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100},
                     "tier": {"type": "string", "enum": ["count", "list", "detail"], "default": "list"},
+                    "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."},
                 },
                 "required": ["memory_ids"],
             },
@@ -608,6 +669,21 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
         stats = gm.get_stats(tier="detail")
         if stats.get("node_count", 0) == 0:
             return json.dumps({"nodes": [], "edges": [], "stats": stats})
+
+        # P2-5: optional scope boundary filter for graph visualization.
+        allowed_nodes = None
+        filters = args.get("filters")
+        if filters and get_mem_store:
+            try:
+                allowed_nodes = {
+                    m.id() for m in get_mem_store().list_active(filters=filters)
+                }
+            except Exception:
+                logger.warning(
+                    "srh_graph_viz failed to build scope allowed_nodes",
+                    exc_info=True,
+                )
+
         try:
             with gm.store._connect() as conn:
                 nodes = conn.execute(
@@ -619,8 +695,15 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
                     "WHERE weight >= 0.1 ORDER BY weight DESC LIMIT 500"
                 ).fetchall()
                 return json.dumps({
-                    "nodes": [dict(r) for r in nodes],
-                    "edges": [dict(r) for r in edges],
+                    "nodes": [
+                        dict(r) for r in nodes
+                        if allowed_nodes is None or r["memory_id"] in allowed_nodes
+                    ],
+                    "edges": [
+                        dict(r) for r in edges
+                        if allowed_nodes is None
+                        or (r["source_id"] in allowed_nodes and r["target_id"] in allowed_nodes)
+                    ],
                     "stats": {**stats, "graph_semantics": "associative_coactivation"},
                 })
         except Exception as exc:
@@ -629,7 +712,7 @@ def register_graph_features(ctx, *, get_mem_store, graph_db_path: Optional[Path]
     ctx.register_tool(
         name="srh_graph_viz",
         toolset="mem_reflection_hermes",
-        schema={"name": "srh_graph_viz", "description": "Get graph visualization data.", "parameters": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["summary", "detail"], "default": "summary"}}}},
+        schema={"name": "srh_graph_viz", "description": "Get graph visualization data.", "parameters": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["summary", "detail"], "default": "summary"}, "filters": {**SCOPE_FILTER_SCHEMA, "description": "Optional scope filters (user_id, agent_id, run_id). Null means IS NULL."}}}},
         handler=_graph_viz_h,
         description="Graph viz data for dashboard",
         emoji="🕸️",
@@ -735,31 +818,53 @@ def srh_associate(args: dict, **kwargs) -> str:
     gm = _get_graph_mgr()
     mids = args.get("memory_ids", [])[:20]
     mem_store = _get_mem_store()
-    valid_mids = [mid for mid in mids if mem_store.get(mid) is not None]
-    if len(valid_mids) < 2:
-        return json.dumps({"error": "At least 2 valid memory IDs required", "valid_ids": valid_mids})
     result = gm.associate_memories(valid_mids, args.get("context", ""), args.get("relation", "co_occurs"))
     return json.dumps({**result, "validated_ids": valid_mids})
 
 
 def srh_graph_retrieve(args: dict, **kwargs) -> str:
     try:
-        from .. import _get_graph_mgr
+        from .. import _get_graph_mgr, _get_mem_store
     except ImportError:
-        from mem_reflection_hermes import _get_graph_mgr
+        from mem_reflection_hermes import _get_graph_mgr, _get_mem_store
     gm = _get_graph_mgr()
-    seed_ids = args.get("memory_ids", [])
-    max_results = int(args.get("max_results", 10))
+    # P1-2 hotfix: accept both the documented `memory_ids` and the legacy
+    # `seed_ids` name. `seed_ids` is deprecated and will be removed in v1.8.
+    seed_ids = args.get("memory_ids") or args.get("seed_ids", [])
+    if args.get("seed_ids") and not args.get("memory_ids"):
+        logger.warning(
+            "srh_graph_retrieve received deprecated 'seed_ids'; use 'memory_ids' instead"
+        )
+    try:
+        max_results = max(1, min(int(args.get("max_results", 10)), 100))
+    except (TypeError, ValueError):
+        max_results = 10
     tier = args.get("tier", "list")
     if tier == "all":
         tier = "detail"
+
+    # P2-5: runtime scope boundary filter for graph retrieval.
+    allowed_nodes = None
+    filters = args.get("filters")
+    if filters:
+        try:
+            allowed_nodes = {
+                m.id() for m in _get_mem_store().list_active(filters=filters)
+            }
+        except Exception:
+            logger.warning(
+                "srh_graph_retrieve failed to build scope allowed_nodes",
+                exc_info=True,
+            )
+
     results = gm.retrieve_related(
         seed_ids,
         task_type="reasoning",
         max_results=max_results,
         tier=tier,
+        allowed_nodes=allowed_nodes,
     )
-    return json.dumps({"results": results}, ensure_ascii=False)
+    return json.dumps({"results": results, "seed_ids": seed_ids}, ensure_ascii=False)
 
 
 def srh_graph_stats(args: dict, **kwargs) -> str:
@@ -774,21 +879,39 @@ def srh_graph_stats(args: dict, **kwargs) -> str:
 
 def srh_graph_viz(args: dict, **kwargs) -> str:
     try:
-        from .. import _get_graph_mgr
+        from .. import _get_graph_mgr, _get_mem_store
     except ImportError:
-        from mem_reflection_hermes import _get_graph_mgr
+        from mem_reflection_hermes import _get_graph_mgr, _get_mem_store
     gm = _get_graph_mgr()
     stats = gm.get_stats(tier="detail")
     if stats.get("node_count", 0) == 0:
         return json.dumps({"nodes": [], "edges": [], "stats": stats})
+
+    # P2-5: optional scope boundary filter for graph visualization.
+    allowed_nodes = None
+    filters = args.get("filters")
+    if filters:
+        try:
+            allowed_nodes = {
+                m.id() for m in _get_mem_store().list_active(filters=filters)
+            }
+        except Exception:
+            logger.warning(
+                "srh_graph_viz failed to build scope allowed_nodes",
+                exc_info=True,
+            )
+
     try:
         nodes = [
             {"id": n["memory_id"], "zone": n.get("zone")}
             for n in gm.store.get_all_nodes()
+            if allowed_nodes is None or n["memory_id"] in allowed_nodes
         ]
         edges = [
             {"source": src, "target": tgt, "weight": w}
             for src, tgt, w in gm.store.get_all_edges(min_weight=0.1)
+            if allowed_nodes is None
+            or (src in allowed_nodes and tgt in allowed_nodes)
         ]
         return json.dumps(
             {

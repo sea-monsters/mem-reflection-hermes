@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _COLD_STORE_FILENAME = "cold_store.jsonl"
-_cold_store_lock = threading.Lock()
+_cold_store_lock = threading.RLock()
 
 # Resolve the shared late-binding helper safely for both package and standalone
 # module loading.
@@ -69,6 +70,10 @@ def _cold_store_path(mem_store) -> Path:
     """Path to the cold storage JSONL file."""
     if hasattr(mem_store, '_cold_store_path_override'):
         p = Path(mem_store._cold_store_path_override)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    if hasattr(mem_store, "_test_data_dir"):
+        p = Path(mem_store._test_data_dir) / "memory" / _COLD_STORE_FILENAME
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
     base = _resolve_plugin_data_dir()
@@ -166,43 +171,54 @@ def _append_to_cold_store(mem_store, entry: Dict[str, Any]) -> bool:
 
 def _prune_cold_store(mem_store, cap_mb: int) -> int:
     """Prune oldest entries from cold store when over cap. Returns count removed."""
-    entries = _load_cold_store(mem_store)
-    if not entries:
-        return 0
-    cap_bytes = cap_mb * 1024 * 1024
+    with _cold_store_lock:
+        entries = _load_cold_store(mem_store)
+        if not entries:
+            return 0
+        cap_bytes = cap_mb * 1024 * 1024
 
-    entries_with_size = []
-    for e in entries:
+        entries_with_size = []
+        for e in entries:
+            try:
+                serialized = json.dumps(e, ensure_ascii=False, default=str)
+                size = len(serialized.encode("utf-8"))
+                entries_with_size.append((e, size))
+            except Exception:
+                logger.debug("Cold store JSON serialization failed for entry %s",
+                              e.get("memory_id", "<unknown>"))
+                continue
+
+        entries_with_size.sort(key=lambda x: x[0].get("archived_at", ""))
+        total_size = sum(size for _, size in entries_with_size)
+        if total_size <= cap_bytes:
+            return 0
+
+        pruned = 0
+        remaining_entries = []
+        current_size = total_size
+        for entry, size in entries_with_size:
+            if current_size <= cap_bytes:
+                remaining_entries.append(entry)
+            else:
+                current_size -= size
+                pruned += 1
+
+        path = _cold_store_path(mem_store)
+        tmp_path = path.with_suffix(".tmp")
         try:
-            serialized = json.dumps(e, ensure_ascii=False, default=str)
-            size = len(serialized.encode("utf-8"))
-            entries_with_size.append((e, size))
-        except Exception:
-            continue
-
-    entries_with_size.sort(key=lambda x: x[0].get("archived_at", ""))
-    total_size = sum(size for _, size in entries_with_size)
-    if total_size <= cap_bytes:
-        return 0
-
-    pruned = 0
-    remaining_entries = []
-    current_size = total_size
-    for entry, size in entries_with_size:
-        if current_size <= cap_bytes:
-            remaining_entries.append(entry)
-        else:
-            current_size -= size
-            pruned += 1
-
-    path = _cold_store_path(mem_store)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            for entry in remaining_entries:
-                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-    except OSError as e:
-        logger.warning("Cold store prune failed to write pruned file: %s — %s", path, e)
-    return pruned
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for entry in remaining_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning("Cold store prune failed to write pruned file: %s — %s", path, e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return pruned
 
 
 def _restore_from_cold(mem_store, memory_id: str) -> bool:

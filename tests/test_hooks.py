@@ -205,7 +205,7 @@ class TestContextTimeoutFallback:
 
         calls = {"full": 0, "stable": 0}
 
-        def _build_context_bundle(query, max_tokens, stable_only):
+        def _build_context_bundle(query, max_tokens, stable_only, filters=None):
             calls["full"] += 1
             if stable_only:
                 calls["stable"] += 1
@@ -236,7 +236,7 @@ class TestContextTimeoutFallback:
 
         calls = {"full": 0, "stable": 0}
 
-        def _build_context_bundle(query, max_tokens, stable_only):
+        def _build_context_bundle(query, max_tokens, stable_only, filters=None):
             calls["full"] += 1
             if stable_only:
                 calls["stable"] += 1
@@ -258,7 +258,7 @@ class TestContextTimeoutFallback:
 
         calls = {"full": 0, "stable": 0}
 
-        def _build_context_bundle(query, max_tokens, stable_only):
+        def _build_context_bundle(query, max_tokens, stable_only, filters=None):
             calls["full"] += 1
             if stable_only:
                 calls["stable"] += 1
@@ -315,7 +315,7 @@ class TestPreLlmCallTokenBudgetFallback:
         budget = 10
         long_context = "x" * 500  # far exceeds budget
 
-        def _build_context_with_timeout(query, b):
+        def _build_context_with_timeout(query, b, filters=None):
             return long_context
 
         def _estimate_tokens(text):
@@ -341,7 +341,7 @@ class TestPreLlmCallTokenBudgetFallback:
         budget = 1000
         short_context = "short context"
 
-        def _build_context_with_timeout(query, b):
+        def _build_context_with_timeout(query, b, filters=None):
             return short_context
 
         def _estimate_tokens(text):
@@ -364,7 +364,7 @@ class TestPreLlmCallTokenBudgetFallback:
         budget = 10
         long_context = "a" * 500
 
-        def _build_context_with_timeout(query, b):
+        def _build_context_with_timeout(query, b, filters=None):
             return long_context
 
         def _estimate_tokens(text):
